@@ -5,9 +5,10 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use pure::{
-    CPU_SYSFS_ROOT, GapSchedule, RESULT_SCHEMA_VERSION, WaiterStartup,
-    capture_generation_before_start, correct_latency, json_escape, latency_rank_key,
+    CPU_SYSFS_ROOT, DEFAULT_SMOKE_MAX_SAMPLES, GapSchedule, RESULT_SCHEMA_VERSION, SampleSetError,
+    WaiterStartup, capture_generation_before_start, correct_latency, json_escape, latency_rank_key,
     median_latency_json_fields, parse_cpu_list, percentile_sorted, resolve_cpu_sysfs_root,
+    validate_sample_set,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +19,29 @@ const BURSTY_SEED: u64 = 0x5a17_9d3c_e821_4b6f;
 #[test]
 fn benchmark_schema_is_v2() {
     assert_eq!(RESULT_SCHEMA_VERSION, "snoozer-wake-latency-v2");
+}
+
+#[test]
+fn smoke_sample_cap_has_a_named_two_million_default() {
+    assert_eq!(DEFAULT_SMOKE_MAX_SAMPLES, 2_000_000);
+}
+
+#[test]
+fn sample_cap_exhaustion_is_a_distinct_typed_error() {
+    assert_eq!(
+        validate_sample_set(true, DEFAULT_SMOKE_MAX_SAMPLES, DEFAULT_SMOKE_MAX_SAMPLES),
+        Err(SampleSetError::SampleCapExhausted {
+            max_samples: DEFAULT_SMOKE_MAX_SAMPLES,
+        })
+    );
+}
+
+#[test]
+fn nonempty_sample_set_below_the_cap_remains_valid() {
+    assert_eq!(
+        validate_sample_set(false, 1, DEFAULT_SMOKE_MAX_SAMPLES),
+        Ok(())
+    );
 }
 
 #[test]

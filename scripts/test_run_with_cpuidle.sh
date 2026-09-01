@@ -2,7 +2,21 @@
 set -eu
 
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/snoozer-cpuidle-test.XXXXXX")
-trap 'rm -rf "$test_root"' EXIT HUP INT TERM
+cleanup_test_root() {
+    cleanup_status=$?
+    trap - EXIT HUP INT TERM
+    rm -rf "$test_root"
+    exit "$cleanup_status"
+}
+
+handle_test_signal() {
+    exit "$1"
+}
+
+trap cleanup_test_root EXIT
+trap 'handle_test_signal 129' HUP
+trap 'handle_test_signal 130' INT
+trap 'handle_test_signal 143' TERM
 sysfs_root=$test_root/sysfs
 state_root=$test_root/state
 write_helper=$test_root/write-helper

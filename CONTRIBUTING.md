@@ -8,7 +8,8 @@ measurement.
 
 The repository pins Rust in [`rust-toolchain.toml`](rust-toolchain.toml). Install
 [cargo-nextest](https://nexte.st/) at the minimum version required by
-[`.config/nextest.toml`](.config/nextest.toml), and install
+[`.config/nextest.toml`](.config/nextest.toml), install the `just` version pinned by
+[CI](.github/workflows/ci.yml), and install
 [cargo-mutants](https://mutants.rs/):
 
 ```console
@@ -18,27 +19,14 @@ cargo install cargo-mutants --locked --version 27.1.0
 
 ## Before sending a change
 
-The optional [`Justfile`](Justfile) is the quickest command index. Run `just` or `just --list` to
-see documented recipes; the underlying Cargo commands and scripts remain usable directly. In
-particular, `just ci` runs the complete unprivileged pull-request gate, while benchmark and
+The [`Justfile`](Justfile) is the single owner of the unprivileged pull-request gate and the
+development command index. Run `just` or `just --list` to see documented recipes. Benchmark and
 hardware recipes remain explicit separate operations.
 
 Run the same unprivileged checks as CI:
 
 ```console
-cargo fmt --all -- --check
-cargo check --workspace --all-targets --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo nextest run --workspace --all-features
-cargo test --workspace --all-features --doc
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
-syntax_status=0
-for script in scripts/run_with_cpuidle.sh scripts/test_run_with_cpuidle.sh scripts/build_benchmark.sh scripts/test_build_benchmark.sh; do
-  sh -n "$script" || syntax_status=1
-done
-[ "$syntax_status" -eq 0 ]
-timeout --kill-after=5s 30s sh scripts/test_build_benchmark.sh
-timeout --kill-after=5s 240s sh scripts/test_run_with_cpuidle.sh
+just ci
 ```
 
 The shell suites use only disposable fixtures and fake CPU sysfs trees. They do not invoke the

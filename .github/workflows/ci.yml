@@ -38,43 +38,10 @@ jobs:
         with:
           tool: nextest@0.9.140
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.57.0
 
-      - name: Check all targets
-        run: cargo check --workspace --all-targets --all-features
-
-      - name: Check unsupported-target boundary
-        run: cargo check --workspace --all-features --target aarch64-unknown-linux-gnu
-
-      - name: Lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Check benchmark shell syntax
-        run: |
-          syntax_status=0
-          for script in \
-            scripts/run_with_cpuidle.sh \
-            scripts/test_run_with_cpuidle.sh \
-            scripts/build_benchmark.sh \
-            scripts/test_build_benchmark.sh; do
-            sh -n "$script" || syntax_status=1
-          done
-          [ "$syntax_status" -eq 0 ]
-
-      - name: Test benchmark build provenance
-        run: timeout --kill-after=5s 30s sh scripts/test_build_benchmark.sh
-
-      - name: Test CPU-idle runner recovery
-        run: timeout --kill-after=5s 240s sh scripts/test_run_with_cpuidle.sh
-
-      - name: Run tests
-        run: cargo nextest run --workspace --all-features --profile ci
-
-      - name: Run doctests
-        run: cargo test --workspace --all-features --doc
-
-      - name: Build documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --all-features --no-deps
+      - name: Run the normative repository gate
+        run: just ci

@@ -1,10 +1,49 @@
 use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub(crate) const RESULT_SCHEMA_VERSION: &str = "snoozer-wake-latency-v2";
 pub(crate) const CPU_SYSFS_ROOT: &str = "/sys/devices/system/cpu";
+pub(crate) const DEFAULT_SMOKE_MAX_SAMPLES: usize = 2_000_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SampleSetError {
+    SampleCapExhausted { max_samples: usize },
+    Empty,
+}
+
+impl fmt::Display for SampleSetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SampleCapExhausted { max_samples } => write!(
+                formatter,
+                "latency sample cap of {max_samples} reached; partial distributions are not emitted; rerun with a larger --max-samples"
+            ),
+            Self::Empty => {
+                formatter.write_str("timed trial produced no post-warmup latency samples")
+            }
+        }
+    }
+}
+
+impl Error for SampleSetError {}
+
+pub(crate) fn validate_sample_set(
+    sample_limit_reached: bool,
+    sample_count: usize,
+    max_samples: usize,
+) -> Result<(), SampleSetError> {
+    if sample_limit_reached {
+        return Err(SampleSetError::SampleCapExhausted { max_samples });
+    }
+    if sample_count == 0 {
+        return Err(SampleSetError::Empty);
+    }
+    Ok(())
+}
 
 pub(crate) struct GapSchedule {
     state: u64,

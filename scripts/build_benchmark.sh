@@ -3,13 +3,14 @@
 set -eu
 
 BUILD_TIMEOUT_SECONDS=${SNOOZER_BUILD_TIMEOUT_SECONDS:-300}
+BUILD_KILL_GRACE_POLLS=100
 case "$BUILD_TIMEOUT_SECONDS" in
     ''|*[!0-9]*|0)
         echo "benchmark build timeout must be a positive integer" >&2
         exit 2
         ;;
 esac
-for required in awk cargo env git python3 realpath rustc timeout; do
+for required in awk cargo env git ps python3 realpath rustc setsid sleep timeout; do
     command -v "$required" >/dev/null 2>&1 || {
         echo "required command is unavailable: $required" >&2
         exit 2
@@ -153,12 +154,103 @@ case "$SNOOZER_BENCHMARK_RUSTC" in
         ;;
 esac
 export SNOOZER_BENCHMARK_RUSTC
-build_log=$(mktemp "${TMPDIR:-/tmp}/snoozer-benchmark-build.XXXXXX")
-trap 'rm -f "$build_log"' EXIT HUP INT TERM
+build_state=$(mktemp -d "${TMPDIR:-/tmp}/snoozer-benchmark-build.XXXXXX")
+build_log=$build_state/cargo.jsonl
+build_status_file=$build_state/status
+build_release_file=$build_state/release
+build_group=
 
-if ! timeout --foreground --signal=TERM --kill-after=5s "$BUILD_TIMEOUT_SECONDS" \
+group_has_other_live_members() {
+    ps -eo pid=,pgid=,stat= | awk -v group="$build_group" '
+        $2 == group && $1 != group && $3 !~ /^Z/ { found = 1 }
+        END { exit !found }
+    '
+}
+
+cleanup() {
+    cleanup_status=$?
+    trap - EXIT HUP INT TERM
+    if [ -n "$build_group" ]; then
+        # The anchor pins the PGID until every member is drained. Linux models
+        # PID, PGID, and SID identities with the same refcounted struct pid:
+        # https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/pid.h
+        kill -s TERM -- "-$build_group" 2>/dev/null || :
+        cleanup_poll=0
+        while group_has_other_live_members \
+            && [ "$cleanup_poll" -lt "$BUILD_KILL_GRACE_POLLS" ]; do
+            sleep 0.05
+            cleanup_poll=$((cleanup_poll + 1))
+        done
+        if group_has_other_live_members; then
+            kill -s KILL -- "-$build_group" 2>/dev/null || :
+        else
+            : >"$build_release_file"
+        fi
+        if wait "$build_group" 2>/dev/null; then
+            :
+        else
+            :
+        fi
+    fi
+    rm -rf "$build_state"
+    exit "$cleanup_status"
+}
+
+handle_signal() {
+    exit "$1"
+}
+
+trap cleanup EXIT
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+
+# `timeout --foreground` remains in the anchored session so it cannot create a
+# nested process group outside the helper's TERM/KILL ownership boundary.
+setsid sh -c '
+    status_file=$1
+    release_file=$2
+    shift 2
+    trap ":" HUP INT TERM
+    "$@" &
+    worker_pid=$!
+    if wait "$worker_pid"; then
+        worker_status=0
+    else
+        worker_status=$?
+    fi
+    printf "%s\n" "$worker_status" >"$status_file"
+    while [ ! -e "$release_file" ]; do
+        sleep 0.05
+    done
+    exit "$worker_status"
+' sh "$build_status_file" "$build_release_file" \
+    timeout --foreground --signal=TERM --kill-after=5s "$BUILD_TIMEOUT_SECONDS" \
     cargo bench --manifest-path "$repository/Cargo.toml" --bench wake_latency \
-    --features benchmark-only --no-run --locked --message-format=json >"$build_log"; then
+    --features benchmark-only --no-run --locked --message-format=json >"$build_log" &
+build_group=$!
+
+while [ ! -s "$build_status_file" ]; do
+    if ! kill -0 "$build_group" 2>/dev/null; then
+        if wait "$build_group" 2>/dev/null; then
+            :
+        else
+            :
+        fi
+        build_group=
+        echo "optimized benchmark build supervisor exited before reporting status" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+IFS= read -r build_status <"$build_status_file"
+case "$build_status" in
+    ''|*[!0-9]*)
+        echo "optimized benchmark build supervisor reported an invalid status" >&2
+        exit 1
+        ;;
+esac
+if [ "$build_status" -ne 0 ]; then
     echo "optimized benchmark build failed or timed out" >&2
     exit 1
 fi

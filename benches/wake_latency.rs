@@ -37,9 +37,10 @@ mod linux {
         pin_current, stamp,
     };
     use crate::pure::{
-        GapSchedule, RESULT_SCHEMA_VERSION, WaiterStartup, capture_generation_before_start,
-        correct_latency, json_escape, latency_rank_key, median_latency_json_fields,
-        percentile_sorted, resolve_cpu_sysfs_root,
+        DEFAULT_SMOKE_MAX_SAMPLES, GapSchedule, RESULT_SCHEMA_VERSION, SampleSetError,
+        WaiterStartup, capture_generation_before_start, correct_latency, json_escape,
+        latency_rank_key, median_latency_json_fields, percentile_sorted, resolve_cpu_sysfs_root,
+        validate_sample_set,
     };
     use crate::snoozer_api::{
         Observation, wait_direct_filtered, wait_direct_raw, wait_parker_filtered, wait_parker_raw,
@@ -173,17 +174,16 @@ mod linux {
                     let pair_result = if control_first {
                         let control =
                             run_victim_control(arguments.trial_duration, topology.victim, clock)?;
-                        match run_case_with_smoke_retry(
-                            *case, workload, &arguments, &topology, clock,
-                        ) {
+                        match run_case(*case, workload, &arguments, &topology, clock) {
                             Ok(contender) => Ok((control, contender)),
                             Err(RunCaseError::Unsupported(reason)) => Err(reason),
+                            Err(RunCaseError::SampleCapExhausted(error)) => {
+                                return Err(error.into());
+                            }
                             Err(RunCaseError::Failed(error)) => return Err(error),
                         }
                     } else {
-                        match run_case_with_smoke_retry(
-                            *case, workload, &arguments, &topology, clock,
-                        ) {
+                        match run_case(*case, workload, &arguments, &topology, clock) {
                             Ok(contender) => {
                                 let control = run_victim_control(
                                     arguments.trial_duration,
@@ -193,6 +193,9 @@ mod linux {
                                 Ok((control, contender))
                             }
                             Err(RunCaseError::Unsupported(reason)) => Err(reason),
+                            Err(RunCaseError::SampleCapExhausted(error)) => {
+                                return Err(error.into());
+                            }
                             Err(RunCaseError::Failed(error)) => return Err(error),
                         }
                     };
@@ -368,7 +371,7 @@ mod linux {
             }
             let mode = mode.unwrap_or(Mode::Smoke);
             let defaults = match mode {
-                Mode::Smoke => (40_u64, 1_usize, 128_usize, 250_000_usize),
+                Mode::Smoke => (40_u64, 1_usize, 128_usize, DEFAULT_SMOKE_MAX_SAMPLES),
                 Mode::Official => (250_u64, 7_usize, 1_024_usize, 5_000_000_usize),
             };
             let duration_ms = duration_ms.unwrap_or(defaults.0);
@@ -703,12 +706,21 @@ mod linux {
 
     enum RunCaseError {
         Unsupported(String),
+        SampleCapExhausted(SampleSetError),
         Failed(AnyError),
     }
 
-    impl From<AnyError> for RunCaseError {
-        fn from(error: AnyError) -> Self {
-            Self::Failed(error)
+    impl RunCaseError {
+        fn from_trial(error: AnyError) -> Self {
+            match error.downcast::<SampleSetError>() {
+                Ok(error) => match *error {
+                    cap @ SampleSetError::SampleCapExhausted { .. } => {
+                        Self::SampleCapExhausted(cap)
+                    }
+                    empty @ SampleSetError::Empty => Self::Failed(Box::new(empty)),
+                },
+                Err(error) => Self::Failed(error),
+            }
         }
     }
 
@@ -743,30 +755,7 @@ mod linux {
             }
             StrategyKind::AmdMwaitxC1 => run_c1(case, workload, arguments, topology, clock),
             StrategyKind::StdPark => run_std_park(case, workload, arguments, topology, clock)
-                .map_err(RunCaseError::Failed),
-        }
-    }
-
-    fn run_case_with_smoke_retry(
-        case: Case,
-        workload: Workload,
-        arguments: &Arguments,
-        topology: &Topology,
-        clock: TscClock,
-    ) -> Result<ContenderTrial, RunCaseError> {
-        let mut retry = 0_u8;
-        loop {
-            match run_case(case, workload, arguments, topology, clock) {
-                Err(RunCaseError::Failed(error)) if arguments.mode == Mode::Smoke && retry < 2 => {
-                    retry += 1;
-                    eprintln!(
-                        "SMOKE RETRY {retry}/2 {} {} after transient trial failure: {error}",
-                        workload.as_str(),
-                        case.name()
-                    );
-                }
-                result => return result,
-            }
+                .map_err(RunCaseError::from_trial),
         }
     }
 
@@ -790,7 +779,7 @@ mod linux {
                 topology,
                 clock,
             )
-            .map_err(RunCaseError::Failed),
+            .map_err(RunCaseError::from_trial),
             Surface::Parker => run_parker(
                 strategy,
                 case.filtering,
@@ -799,7 +788,7 @@ mod linux {
                 topology,
                 clock,
             )
-            .map_err(RunCaseError::Failed),
+            .map_err(RunCaseError::from_trial),
             Surface::StdPark => Err(RunCaseError::Failed(
                 "library strategy cannot use the std-park surface".into(),
             )),
@@ -911,7 +900,11 @@ mod linux {
         let waiter_metrics = waiter_result?;
         producer_result?;
         let victim_metrics = victim_result?;
-        validate_sample_set(&waiter_metrics)?;
+        validate_sample_set(
+            waiter_metrics.sample_limit_reached,
+            waiter_metrics.latencies_cycles.len(),
+            max_samples,
+        )?;
         Ok(ContenderTrial {
             waiter: waiter_metrics,
             victim: victim_metrics,
@@ -996,7 +989,11 @@ mod linux {
         let waiter_metrics = waiter_result?;
         producer_result?;
         let victim_metrics = victim_result?;
-        validate_sample_set(&waiter_metrics)?;
+        validate_sample_set(
+            waiter_metrics.sample_limit_reached,
+            waiter_metrics.latencies_cycles.len(),
+            max_samples,
+        )?;
         Ok(ContenderTrial {
             waiter: waiter_metrics,
             victim: victim_metrics,
@@ -1077,7 +1074,11 @@ mod linux {
         let waiter_metrics = waiter_result?;
         producer_result?;
         let victim_metrics = victim_result?;
-        validate_sample_set(&waiter_metrics)?;
+        validate_sample_set(
+            waiter_metrics.sample_limit_reached,
+            waiter_metrics.latencies_cycles.len(),
+            max_samples,
+        )?;
         Ok(ContenderTrial {
             waiter: waiter_metrics,
             victim: victim_metrics,
@@ -1319,16 +1320,6 @@ mod linux {
             Ok(result) => result,
             Err(_) => Err(format!("{role} panicked").into()),
         }
-    }
-
-    fn validate_sample_set(metrics: &WaiterMetrics) -> AnyResult<()> {
-        if metrics.sample_limit_reached {
-            return Err("latency sample limit reached; partial distributions are not emitted; rerun with a larger --max-samples".into());
-        }
-        if metrics.latencies_cycles.is_empty() {
-            return Err("timed trial produced no post-warmup latency samples".into());
-        }
-        Ok(())
     }
 
     #[derive(Clone, Debug)]

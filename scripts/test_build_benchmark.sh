@@ -25,7 +25,21 @@ if has_ancestor_cargo_config "$fixture_parent"; then
     exit 1
 fi
 test_root=$(mktemp -d "$fixture_parent/snoozer-build-benchmark-test.XXXXXX")
-trap 'rm -rf "$test_root"' EXIT HUP INT TERM
+cleanup() {
+    cleanup_status=$?
+    trap - EXIT HUP INT TERM
+    rm -rf "$test_root"
+    exit "$cleanup_status"
+}
+
+handle_signal() {
+    exit "$1"
+}
+
+trap cleanup EXIT
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 repository=$test_root/repository
 fake_bin=$test_root/bin
 test_home=$test_root/home
@@ -45,6 +59,19 @@ chmod +x "$fake_bin/rustc"
 
 cat >"$fake_bin/cargo" <<'EOF'
 #!/bin/sh
+if [ -n "${SNOOZER_TEST_BUILD_READY:-}" ]; then
+    (
+        if [ "${SNOOZER_TEST_IGNORE_TERM:-0}" = 1 ]; then
+            trap '' TERM
+        fi
+        while :; do sleep 1; done
+    ) &
+    descendant_pid=$!
+    printf '%s\n' "$descendant_pid" >"$SNOOZER_TEST_DESCENDANT_PID"
+    : >"$SNOOZER_TEST_BUILD_READY"
+    wait "$descendant_pid"
+    exit $?
+fi
 printf '%s\n' '{"reason":"compiler-artifact","target":{"name":"wake_latency","kind":["bench"]},"executable":"/tmp/fake-wake-latency"}'
 EOF
 chmod +x "$fake_bin/cargo"
@@ -183,4 +210,68 @@ printf '%s\n' "$status_failure_output" \
     | grep -q 'cannot verify that the benchmark working tree is clean'
 rm "$fake_bin/git"
 
-echo "benchmark build provenance preflight tests: PASS"
+process_is_live() {
+    inspected_pid=$1
+    inspected_state=$(ps -o stat= -p "$inspected_pid" 2>/dev/null) || return 1
+    case "$inspected_state" in Z*) return 1 ;; *) return 0 ;; esac
+}
+
+assert_signal_cleanup() {
+    tested_signal=$1
+    expected_status=$2
+    ignore_term=$3
+    signal_root=$test_root/signal-$tested_signal
+    helper_tmp=$signal_root/tmp
+    ready_file=$signal_root/ready
+    descendant_file=$signal_root/descendant
+    mkdir -p "$helper_tmp"
+    env -i HOME="$test_home" PATH="$fake_bin:$PATH" \
+        TMPDIR="$helper_tmp" SNOOZER_BUILD_TIMEOUT_SECONDS=60 \
+        SNOOZER_TEST_BUILD_READY="$ready_file" \
+        SNOOZER_TEST_DESCENDANT_PID="$descendant_file" \
+        SNOOZER_TEST_IGNORE_TERM="$ignore_term" \
+        python3 -c '
+import os
+import signal
+import sys
+
+for caught_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(caught_signal, signal.SIG_DFL)
+os.execv(sys.argv[1], sys.argv[1:])
+' "$repository/scripts/build_benchmark.sh" \
+        >"$signal_root/output" 2>&1 &
+    helper_pid=$!
+    ready_attempt=0
+    while [ ! -e "$ready_file" ] && [ "$ready_attempt" -lt 200 ]; do
+        if ! kill -0 "$helper_pid" 2>/dev/null; then
+            wait "$helper_pid" || :
+            echo "build helper exited before $tested_signal fixture became ready" >&2
+            exit 1
+        fi
+        sleep 0.05
+        ready_attempt=$((ready_attempt + 1))
+    done
+    [ -e "$ready_file" ] && [ -s "$descendant_file" ]
+    descendant_pid=$(tr -d '[:space:]' <"$descendant_file")
+    kill -"$tested_signal" "$helper_pid"
+    set +e
+    wait "$helper_pid"
+    helper_status=$?
+    set -e
+    [ "$helper_status" -eq "$expected_status" ]
+    descendant_attempt=0
+    while process_is_live "$descendant_pid" \
+        && [ "$descendant_attempt" -lt 200 ]; do
+        sleep 0.05
+        descendant_attempt=$((descendant_attempt + 1))
+    done
+    ! process_is_live "$descendant_pid"
+    [ -z "$(find "$helper_tmp" -mindepth 1 -print -quit)" ]
+}
+
+assert_signal_cleanup HUP 129 0
+assert_signal_cleanup INT 130 0
+# This descendant ignores TERM, so the helper must take the bounded KILL path.
+assert_signal_cleanup TERM 143 1
+
+echo "benchmark build provenance, signal, descendant, and temp cleanup tests: PASS"

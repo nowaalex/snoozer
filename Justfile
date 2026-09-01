@@ -12,28 +12,33 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
-# Type-check every target and feature on the host.
+# Type-check every target with both the default and complete feature sets.
 check:
+    cargo check --workspace --all-targets
     cargo check --workspace --all-targets --all-features
 
 # Cross-check the unsupported-target boundary for future Arm support.
 check-arm:
     cargo check --workspace --all-features --target aarch64-unknown-linux-gnu
 
-# Run Clippy with warnings treated as errors.
+# Run Clippy for both feature sets with warnings treated as errors.
 clippy:
+    cargo clippy --workspace --all-targets -- -D warnings
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Run the ordinary nextest suite.
+# Run the ordinary nextest suite for both feature sets.
 test:
+    cargo nextest run --workspace
     cargo nextest run --workspace --all-features
 
-# Run nextest with the bounded CI profile.
+# Run both nextest feature sets with the bounded CI profile.
 test-ci:
+    cargo nextest run --workspace --profile ci
     cargo nextest run --workspace --all-features --profile ci
 
-# Run Rust documentation tests.
+# Run Rust documentation tests for both feature sets.
 doctest:
+    cargo test --workspace --doc
     cargo test --workspace --all-features --doc
 
 # Build public API documentation with warnings denied.
@@ -56,7 +61,7 @@ shell-check:
 
 # Exercise build provenance and CPU-idle recovery against disposable fixtures.
 shell-test: shell-check
-    timeout --kill-after=5s 30s sh scripts/test_build_benchmark.sh
+    timeout --kill-after=5s 60s sh scripts/test_build_benchmark.sh
     timeout --kill-after=5s 240s sh scripts/test_run_with_cpuidle.sh
 
 # Run the complete unprivileged pull-request gate.
