@@ -92,7 +92,8 @@ warning. It does not disable C2/C3 or deeper states and cannot produce a publish
 For an official run, build the exact feature-enabled artifact, select four logical CPUs that
 satisfy the topology contract in [Benchmarking](docs/benchmarking.md), and use the
 state-preserving runner. Run the script as your normal user; it invokes `sudo` only for the
-required sysfs writes.
+required sysfs writes and for the root-owned global lock and dirty-owner recovery metadata under
+`/run/lock`.
 
 ```sh
 SNOOZER_BENCH_BINARY=$(scripts/build_benchmark.sh)
@@ -117,9 +118,11 @@ C1 diagnostic comparison is present and prints the exact executable path. The ru
 Official results are valid only when the runner and benchmark complete topology checks, disable
 C2/C3 and deeper states on assigned CPUs, verify the new state, and restore the original state.
 
-If a prior process was killed before restoration, do not start another run. Recover the manifest
-as the same user and with the same `SNOOZER_STATE_DIR` and `SNOOZER_SYSFS_ROOT` values, if
-you overrode them:
+If a prior process was killed before restoration, do not start another run. Recover as the same
+user and with the same `SNOOZER_SYSFS_ROOT` value if you overrode it. The global dirty-owner record
+selects the authoritative private state directory, even when recovery is invoked with a different
+`SNOOZER_STATE_DIR`. A custom integration must also provide the trusted write helper needed to
+restore its selected sysfs tree if the original run set `SNOOZER_WRITE_HELPER`:
 
 ```console
 scripts/run_with_cpuidle.sh --recover

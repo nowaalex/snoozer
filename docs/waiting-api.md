@@ -8,10 +8,10 @@ safe belong in [Safety](safety.md).
 
 Snoozer deliberately exposes two levels:
 
-| Contract | Direct atomic operation | Parker operation      | Meaning of return                                                                                         |
-| -------- | ----------------------- | --------------------- | --------------------------------------------------------------------------------------------------------- |
-| Raw      | `wait_if_equal`         | `park`                | The value differed before sleeping, or one hardware wait ended for any reason. Recheck application state. |
-| Filtered | `wait_until_different`  | `park_until_notified` | The required state was observed with Acquire ordering.                                                    |
+| Contract | Direct atomic operation | Parker operation      | Meaning of return                                                                                                             |
+| -------- | ----------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Raw      | `wait_if_equal`         | `park`                | One strategy-specific attempt finished. `Unclassified` means it did not confirm the condition; recheck application state.    |
+| Filtered | `wait_until_different`  | `park_until_notified` | The required state was observed with Acquire ordering.                                                                        |
 
 The sealed `WaitableAtomic` trait is implemented for `AtomicU32` and `AtomicU64`.
 Operations are methods on a concrete `WaitStrategy`:
@@ -23,10 +23,12 @@ strategy.wait_if_equal_timeout(&atomic, expected, timeout)
 strategy.wait_until_different_timeout(&atomic, expected, timeout)
 ```
 
-An **unclassified wake** means only that the processor stopped waiting. It may have been caused by
-the monitored store, the hardware safety timer, an interrupt, a context switch, a hypervisor,
-another write in the monitored granule, or another platform event. The hardware does not provide a
-portable, reliable reason.
+An **unclassified result** means that a strategy-specific attempt ended without an Acquire
+operation confirming the requested condition. For a yielding strategy, the scheduler may simply
+have returned control while the value was still equal. For a hardware-assisted strategy, a
+monitored store, the safety timer, an interrupt, a context switch, a hypervisor, another write in
+the monitored granule, or another platform event may have ended the wait. There is no portable,
+reliable reason that the caller can treat as proof of readiness.
 
 The raw contract is useful when the caller already has a cheap condition check, or when an
 occasional extra pass through its event loop is harmless. The filtered contract is easier to use
@@ -37,7 +39,16 @@ when returning early would only make the caller repeat the same check.
 Direct waits observe a caller-owned atomic. A producer's ordinary state update can therefore be
 the wake-producing store; no separate notification write is needed.
 
-`wait_if_equal(atomic, expected)` follows this sequence:
+`wait_if_equal(atomic, expected)` returns `Changed` only after an Acquire load observes a value
+other than `expected`. What it does while the value remains equal depends on the selected strategy:
+
+- `BusySpin` keeps polling with a processor spin hint, so an unbounded call normally returns only
+  after observing a change;
+- `SpinThenYield` polls for its configured prefix, yields at most once, then classifies its Acquire
+  recheck;
+- AMD and hybrid AMD strategies use the address-monitoring protocol below after any spin prefix.
+
+An address-monitoring attempt follows this sequence:
 
 1. Load the atomic with Acquire ordering. Return immediately if it is not `expected`.
 2. Arm the architecture's address monitor.
@@ -45,9 +56,11 @@ the wake-producing store; no separate notification write is needed.
    armed.
 4. Perform at most one hardware wait and return when that wait ends.
 
-Returning from step 4 does **not** prove that the atomic changed and does not, on its own,
-establish synchronization with a producer. Load the published condition with Acquire ordering
-before consuming associated data.
+If the final Acquire recheck still observes `expected`, the raw operation returns `Unclassified`.
+That result does **not** prove that the atomic changed and does not, on its own, establish
+synchronization with a producer. Load the published condition with Acquire ordering before
+consuming associated data. Callers must handle `Unclassified` even when a selected strategy's
+current implementation normally waits until it observes a change.
 
 `wait_until_different(atomic, expected)` repeats the raw operation and the Acquire load until
 it observes a different value, then returns that value. Its timed form returns either the changed
@@ -84,8 +97,10 @@ the publications of every producer represented by that token, even though the no
 themselves collapse to one.
 
 `park` is the raw operation. It consumes a token if one is already available; otherwise it
-performs at most one conditional hardware wait, tries once more to consume the token, and may
-return without one after an unclassified wake.
+delegates one `wait_if_equal` attempt on the internal token to the selected strategy, then tries
+once more to consume the token. A strategy that can finish its attempt while the token is still
+empty lets `park` return `Unclassified`; `BusySpin` instead keeps polling until it can observe the
+token change.
 
 `park_until_notified` is filtered. It absorbs unclassified wakes until it consumes a token.
 Timed variants preserve the same raw/filtered distinction and report public timeout separately

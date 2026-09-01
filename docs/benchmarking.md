@@ -46,6 +46,14 @@ the benchmark's `--help` output is the option reference. The
 [build helper](../scripts/build_benchmark.sh) enables the repository-only feature required for the
 C1 diagnostic and prints the exact official-run artifact path.
 
+The build helper fails unless tracked files and non-ignored untracked files are clean. It uses the
+repository-pinned Rust toolchain and a locked dependency graph, and stamps the artifact with its
+commit, compiler, and toolchain provenance. At startup, official mode verifies that the stamped
+commit is still checked out with the same clean-tree conditions. It also requires readable CPU
+governor and energy-performance preference values for the waiter, victim, producer, and controller
+CPUs. Any failed check rejects the official run. Smoke mode records `unknown` for an unreadable
+power-policy value instead of claiming official evidence.
+
 ## Compared strategies
 
 The comparison includes:
@@ -140,9 +148,23 @@ refuses official timing if a deeper state is enabled on an assigned CPU, even if
 without the runner. `SNOOZER_SYSFS_ROOT` is accepted only by non-official smoke runs; official mode
 rejects the override instead of trusting a custom tree.
 
-`SIGKILL`, power loss, and a kernel crash cannot be handled in-process. Before another run,
-inspect the recorded manifest and use the runner's explicit recovery command. Never guess the
-original values.
+Before authorizing the benchmark, the runner starts a separate crash guardian that inherits the
+private `active-run.lock`. The benchmark process group does not inherit that lock or the mutation
+locks. Once the runner has published a verified benchmark process group, the guardian sends that
+group `SIGKILL` if the runner disappears, including after `SIGKILL`. It repeatedly inspects the
+group until it proves that no live non-zombie process remains and only then releases the active
+lock. If process inspection fails or the group cannot be proved empty, the guardian keeps the
+active lock and waits instead of allowing recovery to write while a benchmark process may still be
+running.
+
+The guardian does not restore CPU-idle policy. After runner `SIGKILL`, the assigned CPUs may remain
+in the benchmark policy and the local and global dirty-owner records remain authoritative. Before
+another run, use the runner's explicit recovery command. Recovery waits for the active lock,
+validates the global dirty-owner record and its private manifest, and restores only the recorded
+values. The global record identifies the authoritative private state directory even when recovery
+starts with a different `SNOOZER_STATE_DIR`; recovery still requires the recorded user and selected
+sysfs root. Power loss and a kernel crash cannot run either in-process cleanup or the guardian, so
+never infer restoration or guess original values when a recovery record remains.
 
 The path checks assume the real CPU sysfs tree remains kernel-owned and cannot be renamed by an
 unprivileged process while the runner is operating. `SNOOZER_SYSFS_ROOT` exists for smoke tests and
@@ -198,10 +220,15 @@ Console output begins with the mode-appropriate CPU-idle warning.
 
 ## Interpreting a winner
 
-Only strategies within the configured SMT-neighbor interference limits are eligible. Eligible
-strategies are ranked by median p99 corrected TSC cycles first, then median p99.9 cycles, then
-median p50 cycles. A failed preflight, an unsupported strategy, an invalid topology, or an
-incomplete state restoration invalidates the run rather than selecting a fallback.
+For each strategy and workload, eligibility compares the median victim-throughput loss and median
+victim-p99 chunk-latency degradation with the code-owned limits emitted in metadata. Eligibility
+also requires zero invalid samples, zero migrated samples, and no repetition that reached the
+sample cap.
+
+Eligible strategies are ranked lexicographically by median p99 corrected TSC cycles, then median
+p99.9 cycles, then median p50 cycles. Cycle counts, rather than rounded nanoseconds, own the
+selection. A failed preflight, an unsupported strategy, an invalid topology, or an incomplete
+state restoration invalidates the run rather than selecting a fallback.
 
 Conclusions apply only to the recorded environment. Intel and Arm implementations require fresh
 platform-specific measurements; AMD results cannot be used as their evidence.

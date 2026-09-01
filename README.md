@@ -41,21 +41,22 @@ must earn support through their own correctness and interference measurements.
 Use a direct atomic wait when the state change itself can wake the consumer:
 
 ```rust
-use snoozer::{BusySpin, WaitResult, WaitStrategy as _};
+use snoozer::{SpinThenYield, WaitResult, WaitStrategy as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 let generation = AtomicU64::new(1);
 let observed = 0;
+let strategy = SpinThenYield::new(0);
 
-// May return even if generation is still equal to observed.
-let next = match BusySpin.wait_if_equal(&generation, observed) {
+// One raw strategy attempt may finish while the value is still equal.
+let next = match strategy.wait_if_equal(&generation, observed) {
     WaitResult::Changed(next) => next,
     WaitResult::Unclassified => generation.load(Ordering::Acquire),
 };
 assert_eq!(next, 1);
 
 // Filters unclassified wakes and returns the newly observed value.
-assert_eq!(BusySpin.wait_until_different(&generation, observed), 1);
+assert_eq!(strategy.wait_until_different(&generation, observed), 1);
 ```
 
 Use `Parker`/`Unparker` when an owned, coalescing notification token is a better fit:
