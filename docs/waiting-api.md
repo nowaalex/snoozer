@@ -130,7 +130,10 @@ silent fallback: changing the wait mechanism would invalidate performance expect
 Use `capabilities()` to report detected platform support without constructing a hardware
 strategy. `UnsupportedStrategy::strategy` identifies the requested strategy and
 `UnsupportedStrategy::reason` identifies the failed requirement; do not branch on display
-text.
+text. `Capabilities`, `Strategy`, and `UnsupportedReason` are non-exhaustive because planned
+architecture backends may add fields, strategies, and failure reasons. Match the enums with a
+wildcard arm and inspect capability fields without constructing or exhaustively destructuring the
+snapshot.
 
 ## Choosing quickly
 

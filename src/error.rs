@@ -3,7 +3,10 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-/// A closed name for a built-in wait strategy.
+/// Identifies a built-in wait strategy.
+///
+/// New architecture backends may add variants in later releases.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Strategy {
     /// Continuously poll the observed atomic.
@@ -17,6 +20,9 @@ pub enum Strategy {
 }
 
 /// Why a requested hardware strategy cannot run on this process.
+///
+/// New architecture backends may add failure reasons in later releases.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedReason {
     /// The operating system or target architecture is not supported.

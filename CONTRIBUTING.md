@@ -49,14 +49,18 @@ cross-compiled by CI.
 ## Hardware smoke tests
 
 The AMD hardware tests perform bounded real `MONITORX/MWAITX` waits when the host supports
-them and report an unsupported host without executing the instructions:
+them. Ordinary test runs report an unsupported host without executing the instructions. To cite
+the command as target-hardware evidence, enable the strict gate so unsupported hardware is a test
+failure:
 
 ```console
-cargo test --test amd_mwaitx
+SNOOZER_REQUIRE_AMD_MWAITX=1 cargo test --test amd_mwaitx
 ```
 
-These tests establish basic notification and timer progress. They are not latency benchmarks.
-Record the CPU model, kernel, and test output when reporting a hardware-only failure.
+`SNOOZER_REQUIRE_AMD_MWAITX` must be unset or exactly `1`; other values fail visibly so a typo
+cannot silently disable the gate. These tests establish basic notification and timer progress.
+They are not latency benchmarks. Record the CPU model, kernel, and test output when reporting a
+hardware-only failure.
 
 ## Benchmarks
 

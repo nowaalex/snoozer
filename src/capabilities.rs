@@ -5,6 +5,10 @@ use std::sync::OnceLock;
 use crate::arch;
 
 /// Cached hardware facts used to guard the AMD strategy.
+///
+/// This structure is non-exhaustive so later Intel and Arm backends can add
+/// capability fields without breaking callers that inspect this snapshot.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Capabilities {
     /// The process is running on the supported Linux x86-64 target.
