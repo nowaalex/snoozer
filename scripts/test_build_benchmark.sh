@@ -1,7 +1,30 @@
 #!/bin/sh
 set -eu
 
-test_root=$(mktemp -d "${TMPDIR:-/tmp}/snoozer-build-benchmark-test.XXXXXX")
+has_ancestor_cargo_config() {
+    inspected_directory=$1
+    while :; do
+        if [ -e "$inspected_directory/.cargo/config" ] \
+            || [ -e "$inspected_directory/.cargo/config.toml" ]; then
+            return 0
+        fi
+        [ "$inspected_directory" != / ] || return 1
+        inspected_directory=${inspected_directory%/*}
+        [ -n "$inspected_directory" ] || inspected_directory=/
+    done
+}
+
+fixture_parent=${TMPDIR:-/tmp}
+fixture_parent=$(CDPATH= cd -- "$fixture_parent" && pwd -P) \
+    || { echo "benchmark build test cannot resolve TMPDIR" >&2; exit 1; }
+if has_ancestor_cargo_config "$fixture_parent"; then
+    fixture_parent=/tmp
+fi
+if has_ancestor_cargo_config "$fixture_parent"; then
+    echo "benchmark build test needs a temporary directory without an ancestor Cargo config" >&2
+    exit 1
+fi
+test_root=$(mktemp -d "$fixture_parent/snoozer-build-benchmark-test.XXXXXX")
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 repository=$test_root/repository
 fake_bin=$test_root/bin

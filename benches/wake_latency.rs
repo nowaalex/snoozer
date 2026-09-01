@@ -38,7 +38,8 @@ mod linux {
     };
     use crate::pure::{
         GapSchedule, RESULT_SCHEMA_VERSION, WaiterStartup, capture_generation_before_start,
-        correct_latency, json_escape, latency_rank_key, percentile_sorted, resolve_cpu_sysfs_root,
+        correct_latency, json_escape, latency_rank_key, median_latency_json_fields,
+        percentile_sorted, resolve_cpu_sysfs_root,
     };
     use crate::snoozer_api::{
         Observation, wait_direct_filtered, wait_direct_raw, wait_parker_filtered, wait_parker_raw,
@@ -1718,15 +1719,21 @@ mod linux {
         }
 
         fn summary(&mut self, summary: &Summary) -> AnyResult<()> {
-            writeln!(
-                self.writer,
-                "{{\"type\":\"summary\",\"case\":\"{}\",\"workload\":\"{}\",\"repetitions\":{},\"median_p50_ns\":{},\"median_p99_ns\":{},\"median_p999_ns\":{},\"median_victim_throughput_loss_percent\":{:.6},\"median_victim_p99_degradation_percent\":{:.6},\"invalid_samples\":{},\"migrated_samples\":{},\"sample_limit_reached\":{},\"eligible\":{}}}",
-                json_escape(&summary.case.name()),
-                summary.workload.as_str(),
-                summary.repetitions,
+            let latency_fields = median_latency_json_fields(
+                summary.p50_cycles,
+                summary.p99_cycles,
+                summary.p999_cycles,
                 summary.p50_ns,
                 summary.p99_ns,
                 summary.p999_ns,
+            );
+            writeln!(
+                self.writer,
+                "{{\"type\":\"summary\",\"case\":\"{}\",\"workload\":\"{}\",\"repetitions\":{},{},\"median_victim_throughput_loss_percent\":{:.6},\"median_victim_p99_degradation_percent\":{:.6},\"invalid_samples\":{},\"migrated_samples\":{},\"sample_limit_reached\":{},\"eligible\":{}}}",
+                json_escape(&summary.case.name()),
+                summary.workload.as_str(),
+                summary.repetitions,
+                latency_fields,
                 summary.throughput_loss_percent,
                 summary.victim_p99_degradation_percent,
                 summary.invalid_samples,
@@ -1749,14 +1756,20 @@ mod linux {
         }
 
         fn winner(&mut self, winner: &Summary) -> AnyResult<()> {
-            writeln!(
-                self.writer,
-                "{{\"type\":\"winner\",\"workload\":\"{}\",\"case\":\"{}\",\"median_p99_ns\":{},\"median_p999_ns\":{},\"median_p50_ns\":{}}}",
-                winner.workload.as_str(),
-                json_escape(&winner.case.name()),
+            let latency_fields = median_latency_json_fields(
+                winner.p50_cycles,
+                winner.p99_cycles,
+                winner.p999_cycles,
+                winner.p50_ns,
                 winner.p99_ns,
                 winner.p999_ns,
-                winner.p50_ns
+            );
+            writeln!(
+                self.writer,
+                "{{\"type\":\"winner\",\"workload\":\"{}\",\"case\":\"{}\",{}}}",
+                winner.workload.as_str(),
+                json_escape(&winner.case.name()),
+                latency_fields
             )?;
             Ok(())
         }

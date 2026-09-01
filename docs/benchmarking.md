@@ -186,7 +186,9 @@ the requested output path. A failed run leaves any existing published result unt
 `snoozer-wake-latency-v2` reports tracked and non-ignored untracked changes through
 `compiled_working_tree_dirty` and `checkout_working_tree_dirty`, adds `rustup_toolchain`, and
 reports every assigned CPU through `power_policy` entries containing `cpu`, `governor`, and
-`energy_preference`.
+`energy_preference`. Its `summary` and non-null `winner` records expose median p50, p99, and p99.9
+in both corrected TSC cycles and calibrated nanoseconds. The cycle fields are the authoritative
+ranking values; nanoseconds are the rounded reporting view.
 
 A reader supporting both versions must preserve these different meanings. In particular, it must
 not present a v1 tracked-only flag as proof of a completely clean working tree. Writers emit only
@@ -197,9 +199,9 @@ Console output begins with the mode-appropriate CPU-idle warning.
 ## Interpreting a winner
 
 Only strategies within the configured SMT-neighbor interference limits are eligible. Eligible
-strategies are ranked by wake-latency tail first, then deeper tail, then median. A failed preflight,
-an unsupported strategy, an invalid topology, or an incomplete state restoration invalidates the
-run rather than selecting a fallback.
+strategies are ranked by median p99 corrected TSC cycles first, then median p99.9 cycles, then
+median p50 cycles. A failed preflight, an unsupported strategy, an invalid topology, or an
+incomplete state restoration invalidates the run rather than selecting a fallback.
 
 Conclusions apply only to the recorded environment. Intel and Arm implementations require fresh
 platform-specific measurements; AMD results cannot be used as their evidence.

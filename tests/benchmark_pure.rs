@@ -7,7 +7,7 @@ use std::time::Duration;
 use pure::{
     CPU_SYSFS_ROOT, GapSchedule, RESULT_SCHEMA_VERSION, WaiterStartup,
     capture_generation_before_start, correct_latency, json_escape, latency_rank_key,
-    parse_cpu_list, percentile_sorted, resolve_cpu_sysfs_root,
+    median_latency_json_fields, parse_cpu_list, percentile_sorted, resolve_cpu_sysfs_root,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,6 +93,14 @@ fn latency_ranking_preserves_cycle_precision_when_nanoseconds_tie() {
     let left = latency_rank_key(80, left_p99_cycles, 400);
     let right = latency_rank_key(40, right_p99_cycles, 200);
     assert!(left < right);
+}
+
+#[test]
+fn summary_json_exposes_the_cycle_values_used_for_ranking() {
+    assert_eq!(
+        median_latency_json_fields(80, 100, 400, 20, 25, 100),
+        "\"median_p50_cycles\":80,\"median_p99_cycles\":100,\"median_p999_cycles\":400,\"median_p50_ns\":20,\"median_p99_ns\":25,\"median_p999_ns\":100"
+    );
 }
 
 #[test]

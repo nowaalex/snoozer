@@ -27,7 +27,13 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace --all-features
 cargo test --workspace --all-features --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+sh -n scripts/run_with_cpuidle.sh scripts/test_run_with_cpuidle.sh scripts/build_benchmark.sh scripts/test_build_benchmark.sh
+timeout 30s sh scripts/test_build_benchmark.sh
+timeout 240s sh scripts/test_run_with_cpuidle.sh
 ```
+
+The shell suites use only disposable fixtures and fake CPU sysfs trees. They do not invoke the
+privileged runner against the machine's real CPU-idle controls.
 
 Run mutation testing for changes to protocol and strategy logic:
 

@@ -85,6 +85,19 @@ pub(crate) fn latency_rank_key(
     (p99_cycles, p999_cycles, p50_cycles)
 }
 
+pub(crate) fn median_latency_json_fields(
+    p50_cycles: u64,
+    p99_cycles: u64,
+    p999_cycles: u64,
+    p50_ns: u64,
+    p99_ns: u64,
+    p999_ns: u64,
+) -> String {
+    format!(
+        "\"median_p50_cycles\":{p50_cycles},\"median_p99_cycles\":{p99_cycles},\"median_p999_cycles\":{p999_cycles},\"median_p50_ns\":{p50_ns},\"median_p99_ns\":{p99_ns},\"median_p999_ns\":{p999_ns}"
+    )
+}
+
 pub(crate) fn percentile_sorted(values: &[u64], quantile: f64) -> u64 {
     let rank = (quantile * values.len() as f64).ceil() as usize;
     values[rank.saturating_sub(1).min(values.len() - 1)]
