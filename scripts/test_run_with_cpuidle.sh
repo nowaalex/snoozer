@@ -40,6 +40,12 @@ if [ "${SNOOZER_TEST_FAIL_VALUE:-}" = "$value" ] \
     && [ "${SNOOZER_TEST_FAIL_PATH_SUFFIX:-}" = "${target##*/cpuidle/}" ]; then
     exit 1
 fi
+if [ "${SNOOZER_TEST_MISMATCH_VALUE:-}" = "$value" ] \
+    && [ "${SNOOZER_TEST_MISMATCH_PATH_SUFFIX:-}" = "${target##*/cpuidle/}" ]; then
+    if [ "$value" = 1 ]; then unexpected=0; else unexpected=1; fi
+    printf '%s\n' "$unexpected" >"$target"
+    exit 0
+fi
 printf '%s\n' "$value" >"$target"
 EOF
 chmod +x "$write_helper"
@@ -108,6 +114,10 @@ assert_clean() {
     for supervisor_status in "$state_root"/supervisor-status.*; do
         [ ! -e "$supervisor_status" ] || return 1
     done
+    for supervisor_handshake in "$state_root"/supervisor-ready.* \
+        "$state_root"/supervisor-go.*; do
+        [ ! -e "$supervisor_handshake" ] || return 1
+    done
 }
 
 # First apply enables exact POLL/C1, disables every other state, then restores.
@@ -123,6 +133,55 @@ grep -q '|.*/state4/disable$' "$write_log"
 ! grep -q '/cpu4/' "$write_log"
 [ "$(tr -d '[:space:]' <"$sysfs_root/cpu4/cpuidle/state0/disable")" = 0 ]
 
+# Normal benchmark completion still drains a TERM-resistant descendant within
+# one bounded grace period before cpuidle restoration.
+normal_descendant_ready=$test_root/normal-descendant-ready
+normal_descendant_release=$test_root/normal-descendant-release
+normal_descendant_pid_file=$test_root/normal-descendant-pid
+: >"$normal_descendant_release"
+normal_descendant_start_epoch=$(date +%s)
+SNOOZER_TEST_READY=$normal_descendant_ready \
+    SNOOZER_TEST_RELEASE=$normal_descendant_release \
+    SNOOZER_TEST_DESCENDANT_PID=$normal_descendant_pid_file \
+    SNOOZER_TEST_DESCENDANT_IGNORE_TERM=1 run_benchmark >/dev/null
+normal_descendant_elapsed=$(($(date +%s) - normal_descendant_start_epoch))
+[ "$normal_descendant_elapsed" -ge "$MIN_KILL_PATH_SECONDS" ]
+[ "$normal_descendant_elapsed" -le "$MAX_KILL_PATH_SECONDS" ]
+[ -s "$normal_descendant_pid_file" ]
+normal_descendant_pid=$(tr -d '[:space:]' <"$normal_descendant_pid_file")
+! kill -0 "$normal_descendant_pid" 2>/dev/null
+assert_original
+assert_clean
+
+# A successful helper call that leaves an unexpected value exercises the
+# read-back verification path, then restores and clears both recovery records.
+set +e
+SNOOZER_TEST_MISMATCH_VALUE=1 SNOOZER_TEST_MISMATCH_PATH_SUFFIX=state2/disable \
+    run_benchmark >"$test_root/apply-mismatch.out" 2>&1
+apply_mismatch_status=$?
+set -e
+[ "$apply_mismatch_status" -ne 0 ]
+grep -q 'failed to apply' "$test_root/apply-mismatch.out"
+assert_original
+assert_clean
+
+# A symlink in the CPU ancestry cannot redirect a manifest write outside the
+# canonical sysfs root.
+mv "$sysfs_root/cpu0" "$test_root/escaped-cpu0"
+ln -s "$test_root/escaped-cpu0" "$sysfs_root/cpu0"
+: >"$write_log"
+set +e
+symlink_output=$(run_benchmark 2>&1)
+symlink_status=$?
+set -e
+[ "$symlink_status" -ne 0 ]
+printf '%s\n' "$symlink_output" | grep -q 'invalid state entry'
+[ ! -s "$write_log" ]
+assert_clean
+rm "$sysfs_root/cpu0"
+mv "$test_root/escaped-cpu0" "$sysfs_root/cpu0"
+assert_original
+
 # TERM after apply follows the same exact restore path.
 : >"$write_log"
 set +e
@@ -132,6 +191,45 @@ SNOOZER_TEST_SIGNAL_AFTER_APPLY=TERM runner_env "$runner" --binary "$benchmark" 
 signal_status=$?
 set -e
 [ "$signal_status" -eq 143 ]
+assert_original
+assert_clean
+
+# Supervisor setup failure occurs before the benchmark go-ahead, is reaped
+# without signaling an unverified numeric PID, and restores exact state.
+set +e
+SNOOZER_TEST_SUPERVISOR_EXIT_BEFORE_READY=1 \
+    run_benchmark >"$test_root/supervisor-before-ready.out" 2>&1
+supervisor_before_ready_status=$?
+set -e
+[ "$supervisor_before_ready_status" -ne 0 ]
+grep -q 'exited before its startup handshake' \
+    "$test_root/supervisor-before-ready.out"
+assert_original
+assert_clean
+
+# A status-write failure leaves the verified supervisor as the stopped PGID
+# anchor until the runner drains and reaps it.
+set +e
+SNOOZER_TEST_SUPERVISOR_SKIP_STATUS=1 \
+    run_benchmark >"$test_root/supervisor-status-failure.out" 2>&1
+supervisor_status_failure=$?
+set -e
+[ "$supervisor_status_failure" -ne 0 ]
+grep -q 'stopped without reporting benchmark status' \
+    "$test_root/supervisor-status-failure.out"
+assert_original
+assert_clean
+
+# A failure immediately after the global link is published still restores and
+# removes the authoritative global record without dangling its manifest.
+set +e
+SNOOZER_TEST_FAIL_AFTER_GLOBAL_LINK=1 \
+    run_benchmark >"$test_root/post-global-link-failure.out" 2>&1
+post_link_status=$?
+set -e
+[ "$post_link_status" -ne 0 ]
+grep -q 'failed to publish the global dirty-owner record' \
+    "$test_root/post-global-link-failure.out"
 assert_original
 assert_clean
 
@@ -249,15 +347,20 @@ ready=$test_root/timeout-ready
 never_release=$test_root/timeout-never-release
 timeout_benchmark_pid_file=$test_root/timeout-benchmark-pid
 timeout_descendant_pid_file=$test_root/timeout-descendant-pid
+timeout_start_epoch=$(date +%s)
 set +e
 SNOOZER_TEST_READY=$ready SNOOZER_TEST_RELEASE=$never_release \
+    SNOOZER_TEST_IGNORE_TERM=1 SNOOZER_TEST_DESCENDANT_IGNORE_TERM=1 \
     SNOOZER_TEST_BENCHMARK_PID=$timeout_benchmark_pid_file \
     SNOOZER_TEST_DESCENDANT_PID=$timeout_descendant_pid_file runner_env "$runner" \
     --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 --producer-cpu 2 \
     --controller-cpu 3 --timeout-seconds 1 >/dev/null 2>&1
 timeout_status=$?
 set -e
-[ "$timeout_status" -eq 124 ]
+[ "$timeout_status" -eq 137 ]
+timeout_elapsed_seconds=$(($(date +%s) - timeout_start_epoch))
+[ "$timeout_elapsed_seconds" -ge "$MIN_KILL_PATH_SECONDS" ]
+[ "$timeout_elapsed_seconds" -le "$MAX_KILL_PATH_SECONDS" ]
 [ -e "$timeout_benchmark_pid_file" ]
 [ -e "$timeout_descendant_pid_file" ]
 timeout_benchmark_pid=$(tr -d '[:space:]' <"$timeout_benchmark_pid_file")
@@ -337,6 +440,21 @@ set -e
 printf '%s\n' "$traversal_output" | grep -q 'not a direct child'
 [ ! -s "$write_log" ]
 printf '%s\n' "$manifest" >"$state_root/dirty"
+
+# Recovery also rejects a symlinked CPU ancestor before its first restore write
+# and retains the authoritative files for a later safe retry.
+mv "$sysfs_root/cpu0" "$test_root/recovery-escaped-cpu0"
+ln -s "$test_root/recovery-escaped-cpu0" "$sysfs_root/cpu0"
+set +e
+recovery_symlink_output=$(runner_env "$runner" --recover 2>&1)
+recovery_symlink_status=$?
+set -e
+[ "$recovery_symlink_status" -ne 0 ]
+printf '%s\n' "$recovery_symlink_output" | grep -q 'invalid state entry'
+[ ! -s "$write_log" ]
+[ -f "$state_root/dirty" ]
+rm "$sysfs_root/cpu0"
+mv "$test_root/recovery-escaped-cpu0" "$sysfs_root/cpu0"
 
 set +e
 retry_output=$(run_benchmark 2>&1)
@@ -444,4 +562,4 @@ printf '%s\n' "$version_output" | grep -q 'unsupported recovery manifest version
 [ ! -s "$write_log" ]
 rm -f "$state_root/dirty" "$manifest"
 
-echo "cpuidle runner first-apply, retry, signal, restore-failure, and concurrency tests: PASS"
+echo "cpuidle runner publication, process-group, symlink, recovery, and concurrency tests: PASS"

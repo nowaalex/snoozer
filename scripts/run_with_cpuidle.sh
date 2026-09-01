@@ -26,6 +26,8 @@ MANIFEST_VERSION=SNOOZER_CPUIDLE_V2
 GLOBAL_DIRTY_VERSION=SNOOZER_GLOBAL_DIRTY_V1
 DEFAULT_TIMEOUT_SECONDS=900
 KILL_GRACE_SECONDS=5
+KILL_GRACE_POLLS=$((KILL_GRACE_SECONDS * 20))
+SUPERVISOR_STARTUP_POLLS=500
 
 sysfs_root=${SNOOZER_SYSFS_ROOT:-/sys/devices/system/cpu}
 command -v id >/dev/null 2>&1 || {
@@ -336,6 +338,13 @@ validate_manifest_entry() {
     [ "$entry_path" = "$expected_path" ] || return 1
     case "$entry_name" in ''|*'|'*|*"$newline"*) return 1 ;; esac
     state_directory=${entry_path%/disable}
+    canonical_state_directory=$(realpath "$state_directory") || return 1
+    canonical_state_name=$(realpath "$state_directory/name") || return 1
+    canonical_disable=$(realpath "$entry_path") || return 1
+    [ "$canonical_state_directory" = "$state_directory" ] \
+        && [ "$canonical_state_name" = "$state_directory/name" ] \
+        && [ "$canonical_disable" = "$entry_path" ] \
+        || return 1
     reject_symlink "$state_directory" "cpuidle state directory"
     reject_symlink "$state_directory/name" "cpuidle state name"
     reject_symlink "$entry_path" "cpuidle disable file"
@@ -495,15 +504,23 @@ boot_id=$boot_id"
         sync -f "$global_marker_candidate" || return 1
         ln "$global_marker_candidate" "$global_dirty_marker" || return 1
     fi
+    # From the instant the atomic link succeeds, cleanup must treat the global
+    # record as authoritative even if candidate removal, sync, or read-back
+    # fails. Keeping the trusted in-memory record prevents a dangling global
+    # pointer to a manifest that cleanup mistakenly deletes.
+    global_record=$published_record
+    validate_global_dirty_record "$global_record"
+    if [ "${SNOOZER_TEST_FAIL_AFTER_GLOBAL_LINK:-}" = 1 ]; then
+        return 1
+    fi
     remove_global_marker_candidate || return 1
     if [ "$global_marker_privileged" -eq 1 ]; then
         sudo sync -f "$global_marker_directory" || return 1
     else
         sync -f "$global_marker_directory" || return 1
     fi
-    global_record=$(read_global_dirty_record) || return 1
-    [ "$global_record" = "$published_record" ] || return 1
-    validate_global_dirty_record "$global_record"
+    readback_global_record=$(read_global_dirty_record) || return 1
+    [ "$readback_global_record" = "$global_record" ] || return 1
 }
 
 clear_global_dirty_record() {
@@ -601,19 +618,49 @@ manifest=$(mktemp "$state_root/manifest.XXXXXX")
 cleanup_manifest=1
 restored=0
 child_pid=
+child_group_verified=0
 supervisor_status_file=
+supervisor_ready_file=
+supervisor_go_file=
+supervisor_launching=0
 signal_status=
 
 cleanup() {
     original_status=$?
     trap - EXIT HUP INT TERM
     if [ -n "$child_pid" ]; then
-        terminate_child "$child_pid"
+        if [ "$child_group_verified" -eq 1 ]; then
+            terminate_child "$child_pid"
+        else
+            # Before the go-ahead handshake the supervisor cannot launch the
+            # benchmark and exits on its own after a fixed polling bound.
+            wait "$child_pid" 2>/dev/null || true
+        fi
         child_pid=
     fi
-    if [ -n "$supervisor_status_file" ]; then
-        rm -f "$supervisor_status_file"
-        supervisor_status_file=
+    rm -f "${supervisor_status_file:-}" "${supervisor_ready_file:-}" \
+        "${supervisor_go_file:-}" 2>/dev/null || true
+    supervisor_status_file=
+    supervisor_ready_file=
+    supervisor_go_file=
+    if [ -e "$global_dirty_marker" ] && [ -z "$global_record" ]; then
+        # A handled signal may arrive after ln(2) published the marker but
+        # before the next shell assignment. Re-adopt only the exact record this
+        # invocation prepared; otherwise retain every recovery file fail-closed.
+        [ -n "${published_record:-}" ] || {
+            echo "cpuidle runner: global dirty-owner record appeared without an expected record; recovery files are retained" >&2
+            exit 1
+        }
+        cleanup_global_record=$(read_global_dirty_record) || {
+            echo "cpuidle runner: cannot adopt the published global dirty-owner record; recovery files are retained" >&2
+            exit 1
+        }
+        [ "$cleanup_global_record" = "$published_record" ] || {
+            echo "cpuidle runner: published global dirty-owner record changed; recovery files are retained" >&2
+            exit 1
+        }
+        global_record=$cleanup_global_record
+        validate_global_dirty_record "$global_record"
     fi
     if [ -n "$global_marker_candidate" ]; then
         remove_global_marker_candidate \
@@ -651,6 +698,9 @@ cleanup() {
 
 handle_signal() {
     signal_status=$1
+    if [ "$supervisor_launching" -eq 1 ]; then
+        return
+    fi
     if [ -n "$child_pid" ]; then
         terminate_child "$child_pid"
         child_pid=
@@ -670,28 +720,58 @@ process_group_has_live_descendants() {
     '
 }
 
-signal_child_tree() {
+supervisor_is_stopped() {
+    inspected_pid=$1
+    supervisor_state=$(ps -o stat= -p "$inspected_pid" 2>/dev/null | tr -d '[:space:]') \
+        || return 1
+    case "$supervisor_state" in
+        T*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+signal_child_group() {
     child_signal=$1
     inspected_pid=$2
-    kill -"$child_signal" -- "-$inspected_pid" 2>/dev/null \
-        || kill -"$child_signal" "$inspected_pid" 2>/dev/null \
-        || true
+    [ "$child_group_verified" -eq 1 ] || return 1
+    # The verified, unreaped supervisor remains the group leader until this
+    # function reaps it. Therefore this negative PGID cannot be recycled.
+    kill -"$child_signal" -- "-$inspected_pid" 2>/dev/null
 }
 
 terminate_child() {
     inspected_pid=$1
-    signal_child_tree TERM "$inspected_pid"
-    termination_deadline=$(($(date +%s) + KILL_GRACE_SECONDS))
-    while process_group_has_live_descendants "$inspected_pid" \
-        && [ "$(date +%s)" -lt "$termination_deadline" ]; do
-        sleep 0.05
-    done
-    if process_group_has_live_descendants "$inspected_pid"; then
-        signal_child_tree KILL "$inspected_pid"
+    termination_mode=${2:-graceful}
+    [ "$child_group_verified" -eq 1 ] || return 1
+    if [ "$termination_mode" = immediate ]; then
+        signal_child_group KILL "$inspected_pid" || true
     else
-        kill -CONT "$inspected_pid" 2>/dev/null || true
+        signal_child_group TERM "$inspected_pid" || true
+        termination_attempt=0
+        while process_group_has_live_descendants "$inspected_pid" \
+            && [ "$termination_attempt" -lt "$KILL_GRACE_POLLS" ]; do
+            sleep 0.05
+            termination_attempt=$((termination_attempt + 1))
+        done
+        if process_group_has_live_descendants "$inspected_pid"; then
+            signal_child_group KILL "$inspected_pid" || true
+        else
+            # Do not send CONT before the supervisor reaches its final STOP;
+            # otherwise a fast child exit could miss the wake and hang reap.
+            while ! supervisor_is_stopped "$inspected_pid" \
+                && [ "$termination_attempt" -lt "$KILL_GRACE_POLLS" ]; do
+                sleep 0.05
+                termination_attempt=$((termination_attempt + 1))
+            done
+            if supervisor_is_stopped "$inspected_pid"; then
+                kill -CONT "$inspected_pid" 2>/dev/null || true
+            else
+                signal_child_group KILL "$inspected_pid" || true
+            fi
+        fi
     fi
     wait "$inspected_pid" 2>/dev/null || true
+    child_group_verified=0
 }
 
 verify_child_process_group() {
@@ -699,14 +779,24 @@ verify_child_process_group() {
     group_attempt=0
     while [ "$group_attempt" -lt 100 ]; do
         group=$(ps -o pgid= -p "$inspected_pid" 2>/dev/null | tr -d '[:space:]') || group=
-        [ "$group" = "$inspected_pid" ] && return 0
-        if ! kill -0 "$inspected_pid" 2>/dev/null; then
+        if [ "$group" = "$inspected_pid" ]; then
+            child_group_verified=1
             return 0
+        fi
+        if ! kill -0 "$inspected_pid" 2>/dev/null; then
+            wait "$inspected_pid" 2>/dev/null || true
+            child_pid=
+            supervisor_launching=0
+            die "benchmark supervisor exited before acquiring a dedicated process group"
         fi
         sleep 0.01
         group_attempt=$((group_attempt + 1))
     done
-    signal_child_tree KILL "$inspected_pid"
+    # No benchmark was allowed to start before this verification. The bounded
+    # supervisor startup wait therefore owns the only process that must exit.
+    wait "$inspected_pid" 2>/dev/null || true
+    child_pid=
+    supervisor_launching=0
     die "benchmark supervisor did not acquire a dedicated process group"
 }
 
@@ -796,22 +886,44 @@ set +e
 # or process-group ID from becoming a signal target between status collection
 # and cleanup.
 supervisor_status_file=$(mktemp "$state_root/supervisor-status.XXXXXX")
+supervisor_ready_file=$(mktemp "$state_root/supervisor-ready.XXXXXX")
+supervisor_go_file=$(mktemp "$state_root/supervisor-go.XXXXXX")
+rm -f "$supervisor_ready_file" "$supervisor_go_file"
+supervisor_launching=1
 setsid sh -c '
-    status_file=$1
-    kill_grace=$2
-    duration=$3
-    shift 3
+    ready_file=$1
+    go_file=$2
+    status_file=$3
+    startup_polls=$4
+    kill_grace=$5
+    duration=$6
+    shift 6
     trap "" TERM
     trap "exit 0" CONT
+    [ "${SNOOZER_TEST_SUPERVISOR_EXIT_BEFORE_READY:-}" != 1 ] || exit 125
+    own_group=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d "[:space:]") || exit 125
+    [ "$own_group" = "$$" ] || exit 125
+    printf "%s\n" "$$" >"$ready_file" || exit 125
+    startup_attempt=0
+    while [ ! -e "$go_file" ] && [ "$startup_attempt" -lt "$startup_polls" ]; do
+        sleep 0.01
+        startup_attempt=$((startup_attempt + 1))
+    done
+    [ -e "$go_file" ] || exit 125
     (
         trap - TERM
         exec timeout --foreground --signal=TERM --kill-after="${kill_grace}s" "$duration" "$@"
     )
     command_status=$?
-    printf "%s\n" "$command_status" >"$status_file" || exit 125
+    # Even if status publication fails, remain as the owned, stopped group
+    # anchor. The runner can then drain the verified PGID without guessing.
+    if [ "${SNOOZER_TEST_SUPERVISOR_SKIP_STATUS:-}" != 1 ]; then
+        printf "%s\n" "$command_status" >"$status_file" || :
+    fi
     kill -STOP "$$"
     exit 125
-' snoozer-benchmark-supervisor "$supervisor_status_file" "$KILL_GRACE_SECONDS" \
+' snoozer-benchmark-supervisor "$supervisor_ready_file" "$supervisor_go_file" \
+    "$supervisor_status_file" "$SUPERVISOR_STARTUP_POLLS" "$KILL_GRACE_SECONDS" \
     "$timeout_seconds" "$binary" \
     --waiter-cpu "$waiter_cpu" \
     --victim-cpu "$victim_cpu" \
@@ -819,12 +931,65 @@ setsid sh -c '
     --controller-cpu "$controller_cpu" \
     "$@" &
 child_pid=$!
-verify_child_process_group "$child_pid"
-while [ ! -s "$supervisor_status_file" ]; do
+
+ready_attempt=0
+while [ ! -s "$supervisor_ready_file" ] \
+    && [ "$ready_attempt" -lt "$SUPERVISOR_STARTUP_POLLS" ]; do
     if ! kill -0 "$child_pid" 2>/dev/null; then
-        terminate_child "$child_pid"
+        wait "$child_pid" 2>/dev/null || true
         child_pid=
-        die "benchmark supervisor exited without reporting benchmark status"
+        supervisor_launching=0
+        die "benchmark supervisor exited before its startup handshake"
+    fi
+    sleep 0.01
+    ready_attempt=$((ready_attempt + 1))
+done
+if [ ! -s "$supervisor_ready_file" ]; then
+    # The supervisor has not received its go-ahead and exits after the same
+    # fixed startup bound, so waiting cannot outlive an active benchmark.
+    wait "$child_pid" 2>/dev/null || true
+    child_pid=
+    supervisor_launching=0
+    die "benchmark supervisor did not complete its startup handshake"
+fi
+reported_supervisor_pid=$(tr -d '[:space:]' <"$supervisor_ready_file")
+[ "$reported_supervisor_pid" = "$child_pid" ] || {
+    wait "$child_pid" 2>/dev/null || true
+    child_pid=
+    supervisor_launching=0
+    die "benchmark supervisor startup identity did not match its owned child PID"
+}
+verify_child_process_group "$child_pid"
+if [ -n "$signal_status" ]; then
+    supervisor_launching=0
+    terminate_child "$child_pid" immediate
+    child_pid=
+    exit "$signal_status"
+fi
+: >"$supervisor_go_file"
+supervisor_launching=0
+
+while :; do
+    supervisor_state=$(ps -o stat= -p "$child_pid" 2>/dev/null | tr -d '[:space:]') \
+        || supervisor_state=
+    if [ -z "$supervisor_state" ]; then
+        wait "$child_pid" 2>/dev/null || true
+        child_pid=
+        child_group_verified=0
+        die "benchmark supervisor exited without preserving its process-group anchor"
+    fi
+    if [ -s "$supervisor_status_file" ]; then
+        case "$supervisor_state" in
+            T*) break ;;
+        esac
+    else
+        case "$supervisor_state" in
+            T*)
+                terminate_child "$child_pid" immediate
+                child_pid=
+                die "benchmark supervisor stopped without reporting benchmark status"
+                ;;
+        esac
     fi
     sleep 0.01
 done
@@ -844,9 +1009,14 @@ fi
 # GNU timeout --foreground signals only the direct benchmark process. Drain the
 # still-owned process group before restoring cpuidle so no benchmark descendant
 # can outlive the measured run, including on the timeout path.
-terminate_child "$child_pid"
+case "$command_status" in
+    124|137) terminate_child "$child_pid" immediate ;;
+    *) terminate_child "$child_pid" ;;
+esac
 child_pid=
-rm -f "$supervisor_status_file"
+rm -f "$supervisor_status_file" "$supervisor_ready_file" "$supervisor_go_file"
 supervisor_status_file=
+supervisor_ready_file=
+supervisor_go_file=
 set -e
 exit "$command_status"

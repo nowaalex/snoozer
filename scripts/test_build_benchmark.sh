@@ -44,6 +44,34 @@ run_helper() {
 
 [ "$(run_helper)" = /tmp/fake-wake-latency ]
 
+# A symlinked invocation still resolves the physical repository and checks its
+# physical ancestor chain for Cargo configuration.
+mkdir -p "$test_root/.cargo" "$test_root/invocation"
+printf '[build]\nrustflags = ["-Ctarget-cpu=native"]\n' \
+    >"$test_root/.cargo/config.toml"
+ln -s "$repository/scripts/build_benchmark.sh" "$test_root/invocation/build-benchmark"
+set +e
+physical_ancestor_output=$(env -u CARGO_HOME -u CARGO_INCREMENTAL -u CARGO_BUILD_TARGET \
+    -u RUSTC -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+    -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u RUSTUP_TOOLCHAIN \
+    -u RUSTC_BOOTSTRAP -u CARGO_BUILD_RUSTC -u CARGO_BUILD_RUSTFLAGS \
+    -u CARGO_BUILD_RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER \
+    HOME="$test_home" PATH="$fake_bin:$PATH" \
+    "$test_root/invocation/build-benchmark" 2>&1)
+physical_ancestor_status=$?
+set -e
+[ "$physical_ancestor_status" -ne 0 ]
+printf '%s\n' "$physical_ancestor_output" | grep -q 'outside the tracked repository'
+rm -f "$test_root/.cargo/config.toml"
+rmdir "$test_root/.cargo"
+[ "$(env -u CARGO_HOME -u CARGO_INCREMENTAL -u CARGO_BUILD_TARGET \
+    -u RUSTC -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+    -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u RUSTUP_TOOLCHAIN \
+    -u RUSTC_BOOTSTRAP -u CARGO_BUILD_RUSTC -u CARGO_BUILD_RUSTFLAGS \
+    -u CARGO_BUILD_RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER \
+    HOME="$test_home" PATH="$fake_bin:$PATH" \
+    "$test_root/invocation/build-benchmark")" = /tmp/fake-wake-latency ]
+
 mkdir -p "$repository/.cargo"
 printf '[build]\nrustflags = ["-Ctarget-cpu=native"]\n' \
     >"$repository/.cargo/config.toml"

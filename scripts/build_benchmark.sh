@@ -9,7 +9,7 @@ case "$BUILD_TIMEOUT_SECONDS" in
         exit 2
         ;;
 esac
-for required in awk cargo env git python3 rustc timeout; do
+for required in awk cargo env git python3 realpath rustc timeout; do
     command -v "$required" >/dev/null 2>&1 || {
         echo "required command is unavailable: $required" >&2
         exit 2
@@ -44,7 +44,26 @@ dynamic_override=$(env | awk -F= '
 ')
 [ -z "$dynamic_override" ] || reject_override "$dynamic_override"
 
-repository=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+script_path=$(realpath "$0") || {
+    echo "cannot resolve the physical benchmark build-helper path" >&2
+    exit 2
+}
+repository=$(realpath "$(dirname "$script_path")/..") || {
+    echo "cannot resolve the physical benchmark repository path" >&2
+    exit 2
+}
+git_repository=$(git -C "$repository" rev-parse --show-toplevel 2>/dev/null) || {
+    echo "benchmark build helper is not inside a Git work tree" >&2
+    exit 2
+}
+git_repository=$(realpath "$git_repository") || {
+    echo "cannot resolve the physical Git repository path" >&2
+    exit 2
+}
+[ "$git_repository" = "$repository" ] || {
+    echo "benchmark build helper must be located directly in the repository it builds" >&2
+    exit 2
+}
 cd "$repository"
 
 for repository_config in .cargo/config .cargo/config.toml; do
