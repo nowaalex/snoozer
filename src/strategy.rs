@@ -9,6 +9,11 @@ use std::time::{Duration, Instant};
 use crate::arch;
 use crate::{Strategy, UnsupportedReason, UnsupportedStrategy, WaitableAtomic, capabilities};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use self::mwaitx_raw_hardware as mwaitx_dispatch;
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+use self::mwaitx_raw_unsupported as mwaitx_dispatch;
+
 const NO_C_STATE_HINT: u32 = 0x0f;
 #[cfg(feature = "benchmark-only")]
 const C1_STATE_HINT: u32 = 0;
@@ -317,7 +322,7 @@ impl StrategyImpl for AmdMwaitx {
         expected: A::Value,
         deadline: Option<Deadline>,
     ) -> WaitTimeoutResult<A::Value> {
-        mwaitx_raw_hardware(&self.config, NO_C_STATE_HINT, atomic, expected, deadline)
+        mwaitx_dispatch(&self.config, NO_C_STATE_HINT, atomic, expected, deadline)
     }
 }
 
@@ -362,7 +367,7 @@ impl StrategyImpl for SpinThenAmdMwaitx {
         if let Some(result) = spin_prefix(atomic, expected, self.spin_iterations, deadline) {
             return result;
         }
-        mwaitx_raw_hardware(
+        mwaitx_dispatch(
             &self.amd.config,
             NO_C_STATE_HINT,
             atomic,
@@ -401,7 +406,7 @@ impl StrategyImpl for AmdMwaitxC1 {
         expected: A::Value,
         deadline: Option<Deadline>,
     ) -> WaitTimeoutResult<A::Value> {
-        mwaitx_raw_hardware(&self.config, C1_STATE_HINT, atomic, expected, deadline)
+        mwaitx_dispatch(&self.config, C1_STATE_HINT, atomic, expected, deadline)
     }
 }
 
@@ -511,7 +516,7 @@ where
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-fn mwaitx_raw_hardware<A: WaitableAtomic>(
+fn mwaitx_raw_unsupported<A: WaitableAtomic>(
     config: &AmdConfig,
     _c_state_hint: u32,
     _atomic: &A,

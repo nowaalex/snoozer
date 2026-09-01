@@ -12,8 +12,8 @@ const EMPTY_TOKEN: u32 = 0;
 const NOTIFIED_TOKEN: u32 = 1;
 
 macro_rules! publish_token {
-    ($token:expr, $notification_bits:expr, $release_ordering:expr) => {
-        $token.fetch_or($notification_bits, $release_ordering)
+    ($token:expr, $notification_bits:expr) => {
+        $token.fetch_or($notification_bits, Ordering::Release)
     };
 }
 
@@ -210,7 +210,7 @@ impl Unparker {
         // Consecutive RMWs form a release sequence, so the consumer's Acquire
         // CAS synchronizes with every coalesced producer publication rather
         // than only the last producer to overwrite the token.
-        publish_token!(self.shared.token.0, NOTIFIED_TOKEN, Ordering::Release);
+        publish_token!(self.shared.token.0, NOTIFIED_TOKEN);
     }
 }
 
@@ -237,7 +237,7 @@ mod loom_tests {
             let first_value = Arc::clone(&first_payload);
             let first = thread::spawn(move || {
                 first_value.store(11, Ordering::Relaxed);
-                publish_token!(first_token, FIRST_PRODUCER, Ordering::Release);
+                publish_token!(first_token, FIRST_PRODUCER);
                 first_completed.fetch_or(FIRST_PRODUCER, Ordering::Relaxed);
             });
 
@@ -246,7 +246,7 @@ mod loom_tests {
             let second_value = Arc::clone(&second_payload);
             let second = thread::spawn(move || {
                 second_value.store(22, Ordering::Relaxed);
-                publish_token!(second_token, SECOND_PRODUCER, Ordering::Release);
+                publish_token!(second_token, SECOND_PRODUCER);
                 second_completed.fetch_or(SECOND_PRODUCER, Ordering::Relaxed);
             });
 
