@@ -132,8 +132,8 @@ loop {
 }
 ```
 
-This loop also handles another consumer taking the work after the producer issued the
-notification.
+This loop also handles another application worker taking the work after the producer issued the
+notification. It does not permit concurrent use of the single-consumer Parker handle.
 
 ## Strategies
 

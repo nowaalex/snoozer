@@ -18,4 +18,5 @@ exclude_re = [
   "src/arch/x86_64/amd.rs:.*mwaitx",
   "src/strategy.rs:.*mwaitx_raw_hardware",
   "src/strategy.rs:.*mwaitx_raw_unsupported",
+  "src/strategy.rs:.*mwaitx_raw_timeout_unsupported",
 ]

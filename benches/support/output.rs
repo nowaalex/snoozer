@@ -16,7 +16,7 @@ pub(crate) struct AtomicOutput {
 impl AtomicOutput {
     pub(crate) fn create(final_path: &Path) -> Result<Self, io::Error> {
         let parent = output_parent(final_path);
-        fs::create_dir_all(parent)?;
+        create_parent_durably(parent)?;
         let process_id = std::process::id();
         let first_id = NEXT_PARTIAL_ID.fetch_add(MAX_PARTIAL_PATH_ATTEMPTS, Ordering::Relaxed);
         for offset in 0..MAX_PARTIAL_PATH_ATTEMPTS {
@@ -50,7 +50,7 @@ impl AtomicOutput {
         self.writer.get_ref().sync_all()?;
         fs::rename(&self.partial_path, &self.final_path)?;
         self.published = true;
-        Ok(())
+        File::open(output_parent(&self.final_path))?.sync_all()
     }
 }
 
@@ -102,4 +102,25 @@ fn output_parent(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
+}
+
+fn create_parent_durably(parent: &Path) -> Result<(), io::Error> {
+    let mut missing = Vec::new();
+    let mut current = parent;
+    loop {
+        match fs::metadata(current) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(current.to_owned());
+                current = output_parent(current);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    fs::create_dir_all(parent)?;
+    for directory in missing {
+        File::open(output_parent(&directory))?.sync_all()?;
+    }
+    Ok(())
 }

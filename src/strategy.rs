@@ -1035,6 +1035,17 @@ mod tests {
             mwaitx_timeout_cycles(&config, Duration::from_secs(1)),
             1_000_000
         );
+
+        // Make the branch choice observable independently of the conversion:
+        // an exact safety-cap budget must reuse the value cached by AmdConfig.
+        let sentinel_config = AmdConfig {
+            timer_hz: 1_000_000_000,
+            safety_timeout_cycles: 17,
+        };
+        assert_eq!(
+            mwaitx_timeout_cycles(&sentinel_config, MWAITX_SAFETY_TIMEOUT),
+            17
+        );
     }
 
     #[test]

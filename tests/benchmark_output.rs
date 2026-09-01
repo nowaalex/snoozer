@@ -5,10 +5,12 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use output::{AtomicOutput, partial_output_path};
 
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+const MAX_FIXTURE_ATTEMPTS: u64 = 1_024;
 
 struct Fixture {
     root: PathBuf,
@@ -16,13 +18,26 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "snoozer-benchmark-output-test-{}-{id}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).expect("create unique fixture directory");
-        Self { root }
+        let process_id = std::process::id();
+        let started_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let first_id = NEXT_FIXTURE_ID.fetch_add(MAX_FIXTURE_ATTEMPTS, Ordering::Relaxed);
+
+        for offset in 0..MAX_FIXTURE_ATTEMPTS {
+            let id = first_id.wrapping_add(offset);
+            let root = std::env::temp_dir().join(format!(
+                "snoozer-benchmark-output-test-{process_id}-{started_at}-{id}"
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => return Self { root },
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("create unique fixture directory: {error}"),
+            }
+        }
+
+        panic!("could not reserve a unique benchmark output fixture directory");
     }
 
     fn output(&self) -> PathBuf {
@@ -85,5 +100,21 @@ fn finish_atomically_replaces_the_final_file() {
     assert_eq!(
         fs::read_dir(&fixture.root).expect("list fixture").count(),
         1
+    );
+}
+
+#[test]
+fn create_and_finish_support_a_new_nested_output_directory() {
+    let fixture = Fixture::new();
+    let final_path = fixture.root.join("new/nested/results.jsonl");
+    let mut output = AtomicOutput::create(&final_path).expect("create nested partial output");
+    output
+        .write_all(b"complete\n")
+        .expect("write nested output");
+    output.finish().expect("publish nested output");
+
+    assert_eq!(
+        fs::read(&final_path).expect("read nested final result"),
+        b"complete\n"
     );
 }
