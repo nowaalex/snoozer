@@ -10,11 +10,21 @@ use crate::arch;
 use crate::{Strategy, UnsupportedReason, UnsupportedStrategy, WaitableAtomic, capabilities};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use self::mwaitx_raw_hardware as mwaitx_dispatch;
+use self::{
+    mwaitx_raw_hardware as mwaitx_untimed_dispatch,
+    mwaitx_raw_timeout_hardware as mwaitx_timed_dispatch,
+};
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-use self::mwaitx_raw_unsupported as mwaitx_dispatch;
+use self::{
+    mwaitx_raw_timeout_unsupported as mwaitx_timed_dispatch,
+    mwaitx_raw_unsupported as mwaitx_untimed_dispatch,
+};
 
-const NO_C_STATE_HINT: u32 = 0x0f;
+// EAX[7:4] is the MWAITX C-state field. Setting that field to 0xf disables
+// C-state entry, leaving EAX[3:0] zero. This matches Linux's
+// MWAITX_DISABLE_CSTATES:
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/include/asm/mwait.h
+const NO_C_STATE_HINT: u32 = 0xf0;
 #[cfg(feature = "benchmark-only")]
 const C1_STATE_HINT: u32 = 0;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -82,6 +92,15 @@ mod sealed {
 
 trait StrategyImpl: Send + Sync {
     fn strategy(&self) -> Strategy;
+
+    #[inline]
+    fn wait_raw_untimed<A: WaitableAtomic>(
+        &self,
+        atomic: &A,
+        expected: A::Value,
+    ) -> WaitTimeoutResult<A::Value> {
+        self.wait_raw(atomic, expected, None)
+    }
 
     fn wait_raw<A: WaitableAtomic>(
         &self,
@@ -154,7 +173,7 @@ macro_rules! impl_wait_strategy {
                 atomic: &A,
                 expected: A::Value,
             ) -> WaitResult<A::Value> {
-                match self.wait_raw(atomic, expected, None) {
+                match self.wait_raw_untimed(atomic, expected) {
                     WaitTimeoutResult::Changed(value) => WaitResult::Changed(value),
                     WaitTimeoutResult::Unclassified | WaitTimeoutResult::TimedOut => {
                         WaitResult::Unclassified
@@ -169,7 +188,8 @@ macro_rules! impl_wait_strategy {
                 expected: A::Value,
             ) -> A::Value {
                 loop {
-                    if let WaitTimeoutResult::Changed(value) = self.wait_raw(atomic, expected, None)
+                    if let WaitTimeoutResult::Changed(value) =
+                        self.wait_raw_untimed(atomic, expected)
                     {
                         return value;
                     }
@@ -288,6 +308,17 @@ impl_wait_strategy!(SpinThenYield);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AmdConfig {
     timer_hz: u64,
+    safety_timeout_cycles: u32,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl AmdConfig {
+    fn new(timer_hz: u64) -> Self {
+        Self {
+            timer_hz,
+            safety_timeout_cycles: duration_to_cycles(MWAITX_SAFETY_TIMEOUT, timer_hz),
+        }
+    }
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -316,13 +347,27 @@ impl StrategyImpl for AmdMwaitx {
     }
 
     #[inline]
+    fn wait_raw_untimed<A: WaitableAtomic>(
+        &self,
+        atomic: &A,
+        expected: A::Value,
+    ) -> WaitTimeoutResult<A::Value> {
+        mwaitx_untimed_dispatch(&self.config, NO_C_STATE_HINT, atomic, expected)
+    }
+
+    #[inline]
     fn wait_raw<A: WaitableAtomic>(
         &self,
         atomic: &A,
         expected: A::Value,
         deadline: Option<Deadline>,
     ) -> WaitTimeoutResult<A::Value> {
-        mwaitx_dispatch(&self.config, NO_C_STATE_HINT, atomic, expected, deadline)
+        match deadline {
+            Some(deadline) => {
+                mwaitx_timed_dispatch(&self.config, NO_C_STATE_HINT, atomic, expected, deadline)
+            }
+            None => self.wait_raw_untimed(atomic, expected),
+        }
     }
 }
 
@@ -358,6 +403,18 @@ impl StrategyImpl for SpinThenAmdMwaitx {
     }
 
     #[inline]
+    fn wait_raw_untimed<A: WaitableAtomic>(
+        &self,
+        atomic: &A,
+        expected: A::Value,
+    ) -> WaitTimeoutResult<A::Value> {
+        if let Some(result) = spin_prefix(atomic, expected, self.spin_iterations, None) {
+            return result;
+        }
+        self.amd.wait_raw_untimed(atomic, expected)
+    }
+
+    #[inline]
     fn wait_raw<A: WaitableAtomic>(
         &self,
         atomic: &A,
@@ -367,13 +424,16 @@ impl StrategyImpl for SpinThenAmdMwaitx {
         if let Some(result) = spin_prefix(atomic, expected, self.spin_iterations, deadline) {
             return result;
         }
-        mwaitx_dispatch(
-            &self.amd.config,
-            NO_C_STATE_HINT,
-            atomic,
-            expected,
-            deadline,
-        )
+        match deadline {
+            Some(deadline) => mwaitx_timed_dispatch(
+                &self.amd.config,
+                NO_C_STATE_HINT,
+                atomic,
+                expected,
+                deadline,
+            ),
+            None => self.amd.wait_raw_untimed(atomic, expected),
+        }
     }
 }
 
@@ -400,13 +460,27 @@ impl StrategyImpl for AmdMwaitxC1 {
     }
 
     #[inline]
+    fn wait_raw_untimed<A: WaitableAtomic>(
+        &self,
+        atomic: &A,
+        expected: A::Value,
+    ) -> WaitTimeoutResult<A::Value> {
+        mwaitx_untimed_dispatch(&self.config, C1_STATE_HINT, atomic, expected)
+    }
+
+    #[inline]
     fn wait_raw<A: WaitableAtomic>(
         &self,
         atomic: &A,
         expected: A::Value,
         deadline: Option<Deadline>,
     ) -> WaitTimeoutResult<A::Value> {
-        mwaitx_dispatch(&self.config, C1_STATE_HINT, atomic, expected, deadline)
+        match deadline {
+            Some(deadline) => {
+                mwaitx_timed_dispatch(&self.config, C1_STATE_HINT, atomic, expected, deadline)
+            }
+            None => self.wait_raw_untimed(atomic, expected),
+        }
     }
 }
 
@@ -461,9 +535,26 @@ fn mwaitx_raw_hardware<A: WaitableAtomic>(
     c_state_hint: u32,
     atomic: &A,
     expected: A::Value,
-    deadline: Option<Deadline>,
 ) -> WaitTimeoutResult<A::Value> {
-    mwaitx_protocol(
+    mwaitx_untimed_protocol(
+        config,
+        c_state_hint,
+        atomic,
+        expected,
+        arch::monitorx,
+        arch::mwaitx,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn mwaitx_raw_timeout_hardware<A: WaitableAtomic>(
+    config: &AmdConfig,
+    c_state_hint: u32,
+    atomic: &A,
+    expected: A::Value,
+    deadline: Deadline,
+) -> WaitTimeoutResult<A::Value> {
+    mwaitx_timed_protocol(
         config,
         c_state_hint,
         atomic,
@@ -475,12 +566,11 @@ fn mwaitx_raw_hardware<A: WaitableAtomic>(
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn mwaitx_protocol<A, M, W>(
+fn mwaitx_untimed_protocol<A, M, W>(
     config: &AmdConfig,
     c_state_hint: u32,
     atomic: &A,
     expected: A::Value,
-    deadline: Option<Deadline>,
     arm: M,
     wait: W,
 ) -> WaitTimeoutResult<A::Value>
@@ -493,7 +583,38 @@ where
     if observed != expected {
         return WaitTimeoutResult::Changed(observed);
     }
-    if deadline.is_some_and(|value| value.remaining().is_none()) {
+
+    arm(atomic.__monitored_address());
+
+    let observed = atomic.__load_acquire();
+    if observed != expected {
+        return WaitTimeoutResult::Changed(observed);
+    }
+
+    wait(config.safety_timeout_cycles, c_state_hint);
+    classify_after_wait(atomic, expected, None)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn mwaitx_timed_protocol<A, M, W>(
+    config: &AmdConfig,
+    c_state_hint: u32,
+    atomic: &A,
+    expected: A::Value,
+    deadline: Deadline,
+    arm: M,
+    wait: W,
+) -> WaitTimeoutResult<A::Value>
+where
+    A: WaitableAtomic,
+    M: FnOnce(*const ()),
+    W: FnOnce(u32, u32),
+{
+    let observed = atomic.__load_acquire();
+    if observed != expected {
+        return WaitTimeoutResult::Changed(observed);
+    }
+    if deadline.remaining().is_none() {
         return WaitTimeoutResult::TimedOut;
     }
 
@@ -503,16 +624,21 @@ where
     if observed != expected {
         return WaitTimeoutResult::Changed(observed);
     }
-    let remaining = match deadline {
-        Some(value) => match value.remaining() {
-            Some(remaining) => remaining.min(MWAITX_SAFETY_TIMEOUT),
-            None => return WaitTimeoutResult::TimedOut,
-        },
-        None => MWAITX_SAFETY_TIMEOUT,
+    let Some(remaining) = deadline.remaining() else {
+        return WaitTimeoutResult::TimedOut;
     };
 
-    wait(duration_to_cycles(remaining, config.timer_hz), c_state_hint);
-    classify_after_wait(atomic, expected, deadline)
+    wait(mwaitx_timeout_cycles(config, remaining), c_state_hint);
+    classify_after_wait(atomic, expected, Some(deadline))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn mwaitx_timeout_cycles(config: &AmdConfig, remaining: Duration) -> u32 {
+    if remaining < MWAITX_SAFETY_TIMEOUT {
+        duration_to_cycles(remaining, config.timer_hz)
+    } else {
+        config.safety_timeout_cycles
+    }
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -521,7 +647,17 @@ fn mwaitx_raw_unsupported<A: WaitableAtomic>(
     _c_state_hint: u32,
     _atomic: &A,
     _expected: A::Value,
-    _deadline: Option<Deadline>,
+) -> WaitTimeoutResult<A::Value> {
+    match config.never {}
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn mwaitx_raw_timeout_unsupported<A: WaitableAtomic>(
+    config: &AmdConfig,
+    _c_state_hint: u32,
+    _atomic: &A,
+    _expected: A::Value,
+    _deadline: Deadline,
 ) -> WaitTimeoutResult<A::Value> {
     match config.never {}
 }
@@ -535,7 +671,7 @@ fn amd_config(strategy: Strategy) -> Result<AmdConfig, UnsupportedStrategy> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         if let Some(timer_hz) = detected.mwaitx_timer_hz {
-            return Ok(AmdConfig { timer_hz });
+            return Ok(AmdConfig::new(timer_hz));
         }
     }
 
@@ -699,6 +835,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mwaitx_c_state_hints_match_the_architectural_literals() {
+        assert_eq!(NO_C_STATE_HINT, 0xf0);
+
+        #[cfg(feature = "benchmark-only")]
+        assert_eq!(C1_STATE_HINT, 0);
+    }
+
+    #[test]
     fn deadlines_report_a_bounded_remaining_interval_and_expire() {
         let timeout = Duration::from_secs(60);
         let deadline = Deadline::new(timeout);
@@ -727,7 +871,7 @@ mod tests {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
             let amd = AmdMwaitx {
-                config: AmdConfig { timer_hz: 1 },
+                config: AmdConfig::new(1),
             };
             let hybrid = SpinThenAmdMwaitx {
                 spin_iterations: 19,
@@ -761,20 +905,17 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn production_mwaitx_protocol_arms_rechecks_waits_and_classifies() {
-        let config = AmdConfig {
-            timer_hz: 1_000_000_000,
-        };
+    fn untimed_mwaitx_protocol_arms_rechecks_waits_and_classifies() {
+        let config = AmdConfig::new(1_000_000_000);
 
         let changed_during_arm = AtomicU32::new(0);
         let waited_after_arm_change = AtomicBool::new(false);
         assert_eq!(
-            mwaitx_protocol(
+            mwaitx_untimed_protocol(
                 &config,
                 NO_C_STATE_HINT,
                 &changed_during_arm,
                 0,
-                None,
                 |_| changed_during_arm.store(1, Ordering::Release),
                 |_, _| waited_after_arm_change.store(true, Ordering::Relaxed),
             ),
@@ -786,12 +927,11 @@ mod tests {
         let observed_cycles = AtomicU32::new(0);
         let observed_hint = AtomicU32::new(0);
         assert_eq!(
-            mwaitx_protocol(
+            mwaitx_untimed_protocol(
                 &config,
                 NO_C_STATE_HINT,
                 &changed_during_wait,
                 0,
-                None,
                 |_| {},
                 |cycles, hint| {
                     observed_cycles.store(cycles, Ordering::Relaxed);
@@ -802,36 +942,50 @@ mod tests {
             WaitTimeoutResult::Changed(1)
         );
         assert_eq!(observed_cycles.load(Ordering::Relaxed), 1_000_000);
-        assert_eq!(observed_hint.load(Ordering::Relaxed), NO_C_STATE_HINT);
+        assert_eq!(observed_hint.load(Ordering::Relaxed), 0xf0);
 
         let unchanged = AtomicU32::new(0);
         assert_eq!(
-            mwaitx_protocol(
-                &config,
-                NO_C_STATE_HINT,
-                &unchanged,
-                0,
-                None,
-                |_| {},
-                |_, _| {},
-            ),
+            mwaitx_untimed_protocol(&config, NO_C_STATE_HINT, &unchanged, 0, |_| {}, |_, _| {},),
             WaitTimeoutResult::Unclassified
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn timed_mwaitx_protocol_honors_public_deadlines_and_safety_cap() {
+        let config = AmdConfig::new(1_000_000_000);
+        let unchanged = AtomicU32::new(0);
 
         let armed_after_timeout = AtomicBool::new(false);
         assert_eq!(
-            mwaitx_protocol(
+            mwaitx_timed_protocol(
                 &config,
                 NO_C_STATE_HINT,
                 &unchanged,
                 0,
-                Some(Deadline::new(Duration::ZERO)),
+                Deadline::new(Duration::ZERO),
                 |_| armed_after_timeout.store(true, Ordering::Relaxed),
                 |_, _| {},
             ),
             WaitTimeoutResult::TimedOut
         );
         assert!(!armed_after_timeout.load(Ordering::Relaxed));
+
+        let observed_cycles = AtomicU32::new(0);
+        assert_eq!(
+            mwaitx_timed_protocol(
+                &config,
+                NO_C_STATE_HINT,
+                &unchanged,
+                0,
+                Deadline::new(Duration::from_secs(1)),
+                |_| {},
+                |cycles, _| observed_cycles.store(cycles, Ordering::Relaxed),
+            ),
+            WaitTimeoutResult::Unclassified
+        );
+        assert_eq!(observed_cycles.load(Ordering::Relaxed), 1_000_000);
     }
 
     #[test]
@@ -869,6 +1023,17 @@ mod tests {
         assert_eq!(
             duration_to_cycles(Duration::from_secs(u64::MAX), u64::MAX),
             u32::MAX
+        );
+
+        let config = AmdConfig::new(1_000_000_000);
+        assert_eq!(mwaitx_timeout_cycles(&config, Duration::from_nanos(37)), 37);
+        assert_eq!(
+            mwaitx_timeout_cycles(&config, MWAITX_SAFETY_TIMEOUT),
+            1_000_000
+        );
+        assert_eq!(
+            mwaitx_timeout_cycles(&config, Duration::from_secs(1)),
+            1_000_000
         );
     }
 

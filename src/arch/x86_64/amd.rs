@@ -207,7 +207,7 @@ pub(crate) fn monitorx(address: *const ()) {
 #[inline]
 pub(crate) fn mwaitx(timeout_cycles: u32, c_state_hint: u32) {
     // LLVM may reserve RBX, so a reversible exchange supplies EBX without
-    // naming RBX as an operand. EAX=0xF is the production no-C-state hint;
+    // naming RBX as an operand. EAX=0xF0 is the production no-C-state hint;
     // EAX=0 is reachable only through the benchmark-only diagnostic type.
     // SAFETY: AmdMwaitx construction checked CPUID and the caller performed
     // MONITORX plus an Acquire recheck. ECX enables the timer and EBX is
