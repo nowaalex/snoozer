@@ -5,7 +5,7 @@
 
 use std::sync::atomic::AtomicU64;
 
-use snoozer::{ParkResult, Parker, WaitResult, WaitStrategy};
+use snoozer::{MultiParker, ParkResult, SingleParker, WaitResult, WaitStrategy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Observation {
@@ -34,15 +34,40 @@ pub(crate) fn wait_direct_filtered<S: WaitStrategy>(
     strategy.wait_until_different(atomic, expected)
 }
 
+pub(crate) trait BenchParker {
+    fn wait_raw(&mut self) -> bool;
+
+    fn wait_filtered(&mut self);
+}
+
+macro_rules! impl_bench_parker {
+    ($parker:ident) => {
+        impl<S: WaitStrategy> BenchParker for $parker<S> {
+            #[inline]
+            fn wait_raw(&mut self) -> bool {
+                match self.park() {
+                    ParkResult::Notified => true,
+                    ParkResult::Unclassified => false,
+                }
+            }
+
+            #[inline]
+            fn wait_filtered(&mut self) {
+                self.park_until_notified();
+            }
+        }
+    };
+}
+
+impl_bench_parker!(SingleParker);
+impl_bench_parker!(MultiParker);
+
 #[inline]
-pub(crate) fn wait_parker_raw<S: WaitStrategy>(parker: &mut Parker<S>) -> bool {
-    match parker.park() {
-        ParkResult::Notified => true,
-        ParkResult::Unclassified => false,
-    }
+pub(crate) fn wait_parker_raw<P: BenchParker>(parker: &mut P) -> bool {
+    parker.wait_raw()
 }
 
 #[inline]
-pub(crate) fn wait_parker_filtered<S: WaitStrategy>(parker: &mut Parker<S>) {
-    parker.park_until_notified();
+pub(crate) fn wait_parker_filtered<P: BenchParker>(parker: &mut P) {
+    parker.wait_filtered();
 }

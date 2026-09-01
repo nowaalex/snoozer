@@ -66,10 +66,13 @@ The comparison includes:
 - spin then AMD `MONITORX/MWAITX`;
 - a benchmark-only AMD C1-hint variant as a diagnostic boundary.
 
-Both direct atomic and Parker forms are measured where applicable, including raw operations that
-expose unclassified wakes and filtered operations that absorb them. Hybrid spin counts are swept
-over the values owned by the benchmark configuration. A result must name its exact strategy and
-parameters; the repository does not assert one universal optimum.
+Direct atomic, single-producer Parker, and multi-producer Parker forms are measured where
+applicable, including raw operations that expose unclassified wakes and filtered operations that
+absorb them. The same one-producer workload drives both Parker forms so their difference isolates
+the notification publication contract: a Release store for `single_parker` and a Release RMW for
+`multi_parker`. It does not model contention among multiple producers. Hybrid spin counts are
+swept over the values owned by the benchmark configuration. A result must name its exact strategy,
+surface, and parameters; the repository does not assert one universal optimum.
 
 The C1 diagnostic is available only when the `benchmark-only` Cargo feature is enabled. The
 official build helper enables it; an ordinary library build does not expose that diagnostic API.

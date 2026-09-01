@@ -29,7 +29,10 @@ mod linux {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use snoozer::{AmdMwaitx, BusySpin, SpinThenAmdMwaitx, SpinThenYield, WaitStrategy, pair};
+    use snoozer::{
+        AmdMwaitx, BusySpin, SpinThenAmdMwaitx, SpinThenYield, WaitStrategy, multi_pair,
+        single_pair,
+    };
 
     use crate::output::AtomicOutput;
     use crate::platform::{
@@ -43,7 +46,8 @@ mod linux {
         validate_sample_set,
     };
     use crate::snoozer_api::{
-        Observation, wait_direct_filtered, wait_direct_raw, wait_parker_filtered, wait_parker_raw,
+        BenchParker, Observation, wait_direct_filtered, wait_direct_raw, wait_parker_filtered,
+        wait_parker_raw,
     };
 
     type AnyError = Box<dyn Error + Send + Sync>;
@@ -518,7 +522,8 @@ mod linux {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Surface {
         Direct,
-        Parker,
+        SingleParker,
+        MultiParker,
         StdPark,
     }
 
@@ -526,7 +531,8 @@ mod linux {
         fn as_str(self) -> &'static str {
             match self {
                 Self::Direct => "direct_atomic",
-                Self::Parker => "parker",
+                Self::SingleParker => "single_parker",
+                Self::MultiParker => "multi_parker",
                 Self::StdPark => "std_parker",
             }
         }
@@ -612,7 +618,7 @@ mod linux {
     }
 
     fn append_surface_matrix(cases: &mut Vec<Case>, strategy: StrategyKind) {
-        for surface in [Surface::Direct, Surface::Parker] {
+        for surface in [Surface::Direct, Surface::SingleParker, Surface::MultiParker] {
             for filtering in [Filtering::Raw, Filtering::Filtered] {
                 cases.push(Case {
                     strategy,
@@ -780,15 +786,32 @@ mod linux {
                 clock,
             )
             .map_err(RunCaseError::from_trial),
-            Surface::Parker => run_parker(
-                strategy,
-                case.filtering,
-                workload,
-                arguments,
-                topology,
-                clock,
-            )
-            .map_err(RunCaseError::from_trial),
+            Surface::SingleParker => {
+                let (parker, mut unparker) = single_pair(strategy);
+                run_parker(
+                    parker,
+                    move || unparker.unpark(),
+                    case.filtering,
+                    workload,
+                    arguments,
+                    topology,
+                    clock,
+                )
+                .map_err(RunCaseError::from_trial)
+            }
+            Surface::MultiParker => {
+                let (parker, unparker) = multi_pair(strategy);
+                run_parker(
+                    parker,
+                    move || unparker.unpark(),
+                    case.filtering,
+                    workload,
+                    arguments,
+                    topology,
+                    clock,
+                )
+                .map_err(RunCaseError::from_trial)
+            }
             Surface::StdPark => Err(RunCaseError::Failed(
                 "library strategy cannot use the std-park surface".into(),
             )),
@@ -911,8 +934,9 @@ mod linux {
         })
     }
 
-    fn run_parker<S>(
-        strategy: S,
+    fn run_parker<P, F>(
+        mut parker: P,
+        wake: F,
         filtering: Filtering,
         workload: Workload,
         arguments: &Arguments,
@@ -920,9 +944,9 @@ mod linux {
         clock: TscClock,
     ) -> AnyResult<ContenderTrial>
     where
-        S: WaitStrategy + Send + 'static,
+        P: BenchParker + Send + 'static,
+        F: FnMut() + Send + 'static,
     {
-        let (mut parker, unparker) = pair(strategy);
         let shared = Arc::new(TrialShared::new());
         let waiter_shared = Arc::clone(&shared);
         let waiter_cpu = topology.waiter;
@@ -974,12 +998,7 @@ mod linux {
             Ok(metrics)
         });
 
-        let producer = spawn_producer(
-            Arc::clone(&shared),
-            topology.producer,
-            workload,
-            move || unparker.unpark(),
-        );
+        let producer = spawn_producer(Arc::clone(&shared), topology.producer, workload, wake);
         let victim = spawn_victim(Arc::clone(&shared), topology.victim, clock);
         let drive_result = drive_trial(&shared, arguments.trial_duration);
         let waiter_result = join_thread(waiter, "parker waiter");
@@ -1117,10 +1136,10 @@ mod linux {
         shared: Arc<TrialShared>,
         cpu: usize,
         workload: Workload,
-        wake: F,
+        mut wake: F,
     ) -> thread::JoinHandle<AnyResult<()>>
     where
-        F: Fn() + Send + 'static,
+        F: FnMut() + Send + 'static,
     {
         thread::spawn(move || {
             if let Err(error) = pin_current(cpu) {
