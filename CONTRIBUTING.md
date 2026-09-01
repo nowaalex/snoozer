@@ -18,6 +18,11 @@ cargo install cargo-mutants --locked --version 27.1.0
 
 ## Before sending a change
 
+The optional [`Justfile`](Justfile) is the quickest command index. Run `just` or `just --list` to
+see documented recipes; the underlying Cargo commands and scripts remain usable directly. In
+particular, `just ci` runs the complete unprivileged pull-request gate, while benchmark and
+hardware recipes remain explicit separate operations.
+
 Run the same unprivileged checks as CI:
 
 ```console
