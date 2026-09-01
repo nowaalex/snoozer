@@ -27,15 +27,22 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace --all-features
 cargo test --workspace --all-features --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+syntax_status=0
 for script in scripts/run_with_cpuidle.sh scripts/test_run_with_cpuidle.sh scripts/build_benchmark.sh scripts/test_build_benchmark.sh; do
-  sh -n "$script"
+  sh -n "$script" || syntax_status=1
 done
+[ "$syntax_status" -eq 0 ]
 timeout --kill-after=5s 30s sh scripts/test_build_benchmark.sh
 timeout --kill-after=5s 240s sh scripts/test_run_with_cpuidle.sh
 ```
 
 The shell suites use only disposable fixtures and fake CPU sysfs trees. They do not invoke the
 privileged runner against the machine's real CPU-idle controls.
+
+The step-level `timeout` commands bound the directly supervised suite process; they are not a
+containment boundary for a descendant that outlives that process. CI additionally bounds the
+whole job and relies on GitHub-hosted runner teardown. When running locally, use a disposable
+process environment and check for surviving test descendants after a forced timeout.
 
 Run mutation testing for changes to protocol and strategy logic:
 
