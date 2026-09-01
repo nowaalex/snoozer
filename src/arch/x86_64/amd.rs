@@ -23,29 +23,59 @@ const TIMER_CALIBRATION_ATTEMPTS: usize = 9;
 const MAX_CALIBRATION_SPREAD_PERCENT: u64 = 20;
 const CONSERVATIVE_FREQUENCY_PERCENT: u64 = 80;
 
+#[derive(Clone, Copy)]
+struct CapabilityRegisters {
+    vendor_ebx: u32,
+    vendor_edx: u32,
+    vendor_ecx: u32,
+    extended_features_ecx: Option<u32>,
+    extended_features_edx: Option<u32>,
+    invariant_features_edx: Option<u32>,
+}
+
 pub(crate) fn detect_capabilities() -> Capabilities {
     let vendor = __cpuid(0);
-    let amd_vendor = vendor.ebx == AMD_VENDOR_EBX
-        && vendor.edx == AMD_VENDOR_EDX
-        && vendor.ecx == AMD_VENDOR_ECX;
-
     let extended_max = __cpuid(EXTENDED_CPUID_BASE).eax;
     let extended_features =
         (extended_max >= EXTENDED_FEATURES_LEAF).then(|| __cpuid_count(EXTENDED_FEATURES_LEAF, 0));
     let invariant_features =
         (extended_max >= INVARIANT_TSC_LEAF).then(|| __cpuid_count(INVARIANT_TSC_LEAF, 0));
-
-    let monitorx_mwaitx =
-        extended_features.is_some_and(|features| features.ecx & MONITORX_MWAITX_BIT != 0);
-    let rdtscp = extended_features.is_some_and(|features| features.edx & RDTSCP_BIT != 0);
-    let invariant_tsc =
-        invariant_features.is_some_and(|features| features.edx & INVARIANT_TSC_BIT != 0);
-    let mwaitx_timer_hz = if amd_vendor && monitorx_mwaitx && invariant_tsc && rdtscp {
-        calibrate_tsc_lower_bound()
+    let registers = CapabilityRegisters {
+        vendor_ebx: vendor.ebx,
+        vendor_edx: vendor.edx,
+        vendor_ecx: vendor.ecx,
+        extended_features_ecx: extended_features.map(|features| features.ecx),
+        extended_features_edx: extended_features.map(|features| features.edx),
+        invariant_features_edx: invariant_features.map(|features| features.edx),
+    };
+    let decoded = decode_capabilities(registers, None);
+    let timer_hz = if timer_calibration_is_usable(&decoded) {
+        sample_tsc_frequencies().and_then(conservative_timer_hz)
     } else {
         None
     };
+    decode_capabilities(registers, timer_hz)
+}
 
+fn decode_capabilities(
+    registers: CapabilityRegisters,
+    calibrated_timer_hz: Option<u64>,
+) -> Capabilities {
+    let amd_vendor = registers.vendor_ebx == AMD_VENDOR_EBX
+        && registers.vendor_edx == AMD_VENDOR_EDX
+        && registers.vendor_ecx == AMD_VENDOR_ECX;
+    let monitorx_mwaitx = registers
+        .extended_features_ecx
+        .is_some_and(|features| features & MONITORX_MWAITX_BIT != 0);
+    let rdtscp = registers
+        .extended_features_edx
+        .is_some_and(|features| features & RDTSCP_BIT != 0);
+    let invariant_tsc = registers
+        .invariant_features_edx
+        .is_some_and(|features| features & INVARIANT_TSC_BIT != 0);
+    let mwaitx_timer_hz = (amd_vendor && monitorx_mwaitx && invariant_tsc && rdtscp)
+        .then_some(calibrated_timer_hz)
+        .flatten();
     Capabilities {
         supported_target: true,
         amd_vendor,
@@ -56,7 +86,14 @@ pub(crate) fn detect_capabilities() -> Capabilities {
     }
 }
 
-fn calibrate_tsc_lower_bound() -> Option<u64> {
+fn timer_calibration_is_usable(capabilities: &Capabilities) -> bool {
+    capabilities.amd_vendor
+        && capabilities.monitorx_mwaitx
+        && capabilities.invariant_tsc
+        && capabilities.rdtscp
+}
+
+fn sample_tsc_frequencies() -> Option<[u64; TIMER_CALIBRATION_SAMPLES]> {
     let mut samples = [0_u64; TIMER_CALIBRATION_SAMPLES];
     let mut collected = 0;
     for _ in 0..TIMER_CALIBRATION_ATTEMPTS {
@@ -72,9 +109,7 @@ fn calibrate_tsc_lower_bound() -> Option<u64> {
         }
 
         let ticks = last.saturating_sub(first);
-        let nanos = elapsed.as_nanos().max(1);
-        let frequency = u128::from(ticks).saturating_mul(1_000_000_000) / nanos;
-        samples[collected] = u64::try_from(frequency).unwrap_or(u64::MAX).max(1);
+        samples[collected] = frequency_hz(ticks, elapsed.as_nanos());
         collected += 1;
         if collected == TIMER_CALIBRATION_SAMPLES {
             break;
@@ -84,6 +119,15 @@ fn calibrate_tsc_lower_bound() -> Option<u64> {
     if collected != TIMER_CALIBRATION_SAMPLES {
         return None;
     }
+    Some(samples)
+}
+
+fn frequency_hz(ticks: u64, elapsed_nanos: u128) -> u64 {
+    let frequency = u128::from(ticks).saturating_mul(1_000_000_000) / elapsed_nanos.max(1);
+    u64::try_from(frequency).unwrap_or(u64::MAX).max(1)
+}
+
+fn conservative_timer_hz(mut samples: [u64; TIMER_CALIBRATION_SAMPLES]) -> Option<u64> {
     samples.sort_unstable();
     let minimum = samples[0];
     let maximum = samples[TIMER_CALIBRATION_SAMPLES - 1];
@@ -92,7 +136,8 @@ fn calibrate_tsc_lower_bound() -> Option<u64> {
     {
         return None;
     }
-    Some(minimum.saturating_mul(CONSERVATIVE_FREQUENCY_PERCENT) / 100)
+    let lower_bound = minimum.saturating_mul(CONSERVATIVE_FREQUENCY_PERCENT) / 100;
+    (lower_bound > 0).then_some(lower_bound)
 }
 
 #[inline]
@@ -149,5 +194,107 @@ pub(crate) fn mwaitx(timeout_cycles: u32, c_state_hint: u32) {
             in("ecx") 1_u32 << 1,
             options(nostack)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn supported_registers() -> CapabilityRegisters {
+        CapabilityRegisters {
+            vendor_ebx: AMD_VENDOR_EBX,
+            vendor_edx: AMD_VENDOR_EDX,
+            vendor_ecx: AMD_VENDOR_ECX,
+            extended_features_ecx: Some(MONITORX_MWAITX_BIT),
+            extended_features_edx: Some(RDTSCP_BIT),
+            invariant_features_edx: Some(INVARIANT_TSC_BIT),
+        }
+    }
+
+    #[test]
+    fn capability_decoding_requires_every_exact_register_bit() {
+        assert_eq!(MONITORX_MWAITX_BIT, 0x2000_0000);
+        assert_eq!(RDTSCP_BIT, 0x0800_0000);
+        assert_eq!(INVARIANT_TSC_BIT, 0x0000_0100);
+
+        let supported = decode_capabilities(supported_registers(), Some(2_400_000_000));
+        assert!(supported.supported_target);
+        assert!(supported.amd_vendor);
+        assert!(supported.monitorx_mwaitx);
+        assert!(supported.invariant_tsc);
+        assert!(supported.rdtscp);
+        assert_eq!(supported.mwaitx_timer_hz, Some(2_400_000_000));
+        assert!(timer_calibration_is_usable(&supported));
+
+        let not_amd = decode_capabilities(
+            CapabilityRegisters {
+                vendor_ebx: 0,
+                ..supported_registers()
+            },
+            Some(2_400_000_000),
+        );
+        assert!(!not_amd.amd_vendor);
+        assert_eq!(not_amd.mwaitx_timer_hz, None);
+        assert!(!timer_calibration_is_usable(&not_amd));
+
+        let missing_features = decode_capabilities(
+            CapabilityRegisters {
+                extended_features_ecx: None,
+                extended_features_edx: None,
+                invariant_features_edx: None,
+                ..supported_registers()
+            },
+            Some(2_400_000_000),
+        );
+        assert!(!missing_features.monitorx_mwaitx);
+        assert!(!missing_features.invariant_tsc);
+        assert!(!missing_features.rdtscp);
+        assert_eq!(missing_features.mwaitx_timer_hz, None);
+
+        let zeroed_features = decode_capabilities(
+            CapabilityRegisters {
+                extended_features_ecx: Some(0),
+                extended_features_edx: Some(0),
+                invariant_features_edx: Some(0),
+                ..supported_registers()
+            },
+            Some(2_400_000_000),
+        );
+        assert!(!zeroed_features.monitorx_mwaitx);
+        assert!(!zeroed_features.invariant_tsc);
+        assert!(!zeroed_features.rdtscp);
+
+        for registers in [
+            CapabilityRegisters {
+                extended_features_ecx: Some(0),
+                ..supported_registers()
+            },
+            CapabilityRegisters {
+                extended_features_edx: Some(0),
+                ..supported_registers()
+            },
+            CapabilityRegisters {
+                invariant_features_edx: Some(0),
+                ..supported_registers()
+            },
+        ] {
+            let missing_one = decode_capabilities(registers, Some(2_400_000_000));
+            assert_eq!(missing_one.mwaitx_timer_hz, None);
+            assert!(!timer_calibration_is_usable(&missing_one));
+        }
+    }
+
+    #[test]
+    fn calibration_math_is_scaled_conservative_and_rejects_instability() {
+        assert_eq!(frequency_hz(24, 10), 2_400_000_000);
+        assert_eq!(frequency_hz(0, 0), 1);
+        assert_eq!(
+            conservative_timer_hz([2_400_000_000, 2_500_000_000, 2_450_000_000]),
+            Some(1_920_000_000)
+        );
+        assert_eq!(conservative_timer_hz([1_000, 1_000, 2_000]), None);
+        assert_eq!(conservative_timer_hz([800, 900, 1_000]), Some(640));
+        assert_eq!(conservative_timer_hz([1, 1, 1]), None);
     }
 }

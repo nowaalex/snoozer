@@ -37,10 +37,11 @@ cargo mutants
 
 The checked-in [cargo-mutants configuration](.cargo/mutants.toml) selects nextest, the workspace,
 and all features. It mutation-tests the portable strategy and token protocols with a bounded
-nextest profile. CPUID/TSC calibration, the inline-assembly module, and methods that directly cross
-the MWAITX instruction boundary are excluded because their result depends on the CI host; those
-paths instead require focused capability, encoding/safety-review, and bounded target-hardware
-tests.
+nextest profile. Pure CPUID decoding, timer-calibration arithmetic, and the production MWAITX
+arm/recheck/classification protocol stay in that mutation set. Only live CPUID/TSC sampling,
+inline assembly, and the thin hardware dispatch are excluded because their result depends on the
+CI host; those paths instead require focused capability, encoding/safety review, and bounded
+target-hardware tests.
 
 ## Hardware smoke tests
 

@@ -150,8 +150,19 @@ impl<S: WaitStrategy> Parker<S> {
         }
 
         let started = Instant::now();
+        self.park_until_notified_timeout_with(timeout, || started.elapsed())
+    }
+
+    fn park_until_notified_timeout_with<F>(
+        &mut self,
+        timeout: Duration,
+        mut elapsed: F,
+    ) -> NotificationTimeoutResult
+    where
+        F: FnMut() -> Duration,
+    {
         loop {
-            let elapsed = started.elapsed();
+            let elapsed = elapsed();
             if elapsed >= timeout {
                 return if self.take_notification() {
                     NotificationTimeoutResult::Notified
@@ -264,7 +275,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
 
-    use crate::strategy::{TestGatePoint, TestGateStrategy, TestTimeoutStrategy};
+    use crate::strategy::{TestBudgetStrategy, TestGatePoint, TestGateStrategy};
     use crate::{BusySpin, SpinThenYield};
 
     use super::*;
@@ -356,18 +367,28 @@ mod tests {
     #[test]
     fn filtered_timeout_passes_only_the_remaining_budget() {
         let timeout = Duration::from_millis(50);
-        let (strategy, observed_budgets) = TestTimeoutStrategy::new(Duration::from_millis(2));
+        let (strategy, observed_budgets) = TestBudgetStrategy::new();
         let (mut parker, _unparker) = pair(strategy);
+        let mut elapsed = [0, 10, 20, 50].into_iter().map(Duration::from_millis);
 
         assert_eq!(
-            parker.park_until_notified_timeout(timeout),
+            parker.park_until_notified_timeout_with(timeout, || {
+                elapsed.next().unwrap_or(timeout)
+            }),
             NotificationTimeoutResult::TimedOut
         );
         let observed = match observed_budgets.lock() {
             Ok(observed) => observed,
             Err(poisoned) => poisoned.into_inner(),
         };
-        assert!(observed.len() >= 2);
-        assert!(observed.iter().all(|budget| *budget <= timeout));
+        assert_eq!(
+            observed.as_slice(),
+            [
+                Duration::from_millis(50),
+                Duration::from_millis(40),
+                Duration::from_millis(30),
+            ]
+        );
+        assert!(observed.windows(2).all(|window| window[1] < window[0]));
     }
 }

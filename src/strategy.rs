@@ -317,7 +317,7 @@ impl StrategyImpl for AmdMwaitx {
         expected: A::Value,
         deadline: Option<Deadline>,
     ) -> WaitTimeoutResult<A::Value> {
-        mwaitx_raw(&self.config, NO_C_STATE_HINT, atomic, expected, deadline)
+        mwaitx_raw_hardware(&self.config, NO_C_STATE_HINT, atomic, expected, deadline)
     }
 }
 
@@ -362,7 +362,7 @@ impl StrategyImpl for SpinThenAmdMwaitx {
         if let Some(result) = spin_prefix(atomic, expected, self.spin_iterations, deadline) {
             return result;
         }
-        mwaitx_raw(
+        mwaitx_raw_hardware(
             &self.amd.config,
             NO_C_STATE_HINT,
             atomic,
@@ -401,7 +401,7 @@ impl StrategyImpl for AmdMwaitxC1 {
         expected: A::Value,
         deadline: Option<Deadline>,
     ) -> WaitTimeoutResult<A::Value> {
-        mwaitx_raw(&self.config, C1_STATE_HINT, atomic, expected, deadline)
+        mwaitx_raw_hardware(&self.config, C1_STATE_HINT, atomic, expected, deadline)
     }
 }
 
@@ -451,13 +451,39 @@ fn classify_after_wait<A: WaitableAtomic>(
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn mwaitx_raw<A: WaitableAtomic>(
+fn mwaitx_raw_hardware<A: WaitableAtomic>(
     config: &AmdConfig,
     c_state_hint: u32,
     atomic: &A,
     expected: A::Value,
     deadline: Option<Deadline>,
 ) -> WaitTimeoutResult<A::Value> {
+    mwaitx_protocol(
+        config,
+        c_state_hint,
+        atomic,
+        expected,
+        deadline,
+        arch::monitorx,
+        arch::mwaitx,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn mwaitx_protocol<A, M, W>(
+    config: &AmdConfig,
+    c_state_hint: u32,
+    atomic: &A,
+    expected: A::Value,
+    deadline: Option<Deadline>,
+    arm: M,
+    wait: W,
+) -> WaitTimeoutResult<A::Value>
+where
+    A: WaitableAtomic,
+    M: FnOnce(*const ()),
+    W: FnOnce(u32, u32),
+{
     let observed = atomic.__load_acquire();
     if observed != expected {
         return WaitTimeoutResult::Changed(observed);
@@ -466,7 +492,7 @@ fn mwaitx_raw<A: WaitableAtomic>(
         return WaitTimeoutResult::TimedOut;
     }
 
-    arch::monitorx(atomic.__monitored_address());
+    arm(atomic.__monitored_address());
 
     let observed = atomic.__load_acquire();
     if observed != expected {
@@ -480,12 +506,12 @@ fn mwaitx_raw<A: WaitableAtomic>(
         None => MWAITX_SAFETY_TIMEOUT,
     };
 
-    arch::mwaitx(duration_to_cycles(remaining, config.timer_hz), c_state_hint);
+    wait(duration_to_cycles(remaining, config.timer_hz), c_state_hint);
     classify_after_wait(atomic, expected, deadline)
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-fn mwaitx_raw<A: WaitableAtomic>(
+fn mwaitx_raw_hardware<A: WaitableAtomic>(
     config: &AmdConfig,
     _c_state_hint: u32,
     _atomic: &A,
@@ -617,18 +643,16 @@ impl StrategyImpl for TestGateStrategy {
 impl_wait_strategy!(TestGateStrategy);
 
 #[cfg(test)]
-pub(crate) struct TestTimeoutStrategy {
-    pause: Duration,
+pub(crate) struct TestBudgetStrategy {
     observed_budgets: std::sync::Arc<std::sync::Mutex<Vec<Duration>>>,
 }
 
 #[cfg(test)]
-impl TestTimeoutStrategy {
-    pub(crate) fn new(pause: Duration) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Duration>>>) {
+impl TestBudgetStrategy {
+    pub(crate) fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Duration>>>) {
         let observed_budgets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         (
             Self {
-                pause,
                 observed_budgets: std::sync::Arc::clone(&observed_budgets),
             },
             observed_budgets,
@@ -637,7 +661,7 @@ impl TestTimeoutStrategy {
 }
 
 #[cfg(test)]
-impl StrategyImpl for TestTimeoutStrategy {
+impl StrategyImpl for TestBudgetStrategy {
     fn strategy(&self) -> Strategy {
         Strategy::BusySpin
     }
@@ -648,18 +672,22 @@ impl StrategyImpl for TestTimeoutStrategy {
         expected: A::Value,
         deadline: Option<Deadline>,
     ) -> WaitTimeoutResult<A::Value> {
-        let budget = deadline.and_then(Deadline::remaining).unwrap_or_default();
+        let budget = deadline.map(|value| value.timeout).unwrap_or_default();
         match self.observed_budgets.lock() {
             Ok(mut observed) => observed.push(budget),
             Err(poisoned) => poisoned.into_inner().push(budget),
         }
-        std::thread::sleep(self.pause.min(budget));
-        classify_after_wait(atomic, expected, deadline)
+        let observed = atomic.__load_acquire();
+        if observed == expected {
+            WaitTimeoutResult::Unclassified
+        } else {
+            WaitTimeoutResult::Changed(observed)
+        }
     }
 }
 
 #[cfg(test)]
-impl_wait_strategy!(TestTimeoutStrategy);
+impl_wait_strategy!(TestBudgetStrategy);
 
 #[cfg(test)]
 mod tests {
@@ -709,12 +737,101 @@ mod tests {
             assert_eq!(StrategyImpl::strategy(&amd), Strategy::AmdMwaitx);
             assert_eq!(StrategyImpl::strategy(&hybrid), Strategy::SpinThenAmdMwaitx);
 
+            let already_changed = AtomicU32::new(2);
+            assert_eq!(
+                WaitStrategy::wait_if_equal(&amd, &already_changed, 1),
+                WaitResult::Changed(2)
+            );
+            assert_eq!(
+                WaitStrategy::wait_if_equal(&hybrid, &already_changed, 1),
+                WaitResult::Changed(2)
+            );
+
             #[cfg(feature = "benchmark-only")]
             {
                 let diagnostic = AmdMwaitxC1 { config: amd.config };
                 assert_eq!(StrategyImpl::strategy(&diagnostic), Strategy::AmdMwaitx);
+                assert_eq!(
+                    WaitStrategy::wait_if_equal(&diagnostic, &already_changed, 1),
+                    WaitResult::Changed(2)
+                );
             }
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn production_mwaitx_protocol_arms_rechecks_waits_and_classifies() {
+        let config = AmdConfig {
+            timer_hz: 1_000_000_000,
+        };
+
+        let changed_during_arm = AtomicU32::new(0);
+        let waited_after_arm_change = AtomicBool::new(false);
+        assert_eq!(
+            mwaitx_protocol(
+                &config,
+                NO_C_STATE_HINT,
+                &changed_during_arm,
+                0,
+                None,
+                |_| changed_during_arm.store(1, Ordering::Release),
+                |_, _| waited_after_arm_change.store(true, Ordering::Relaxed),
+            ),
+            WaitTimeoutResult::Changed(1)
+        );
+        assert!(!waited_after_arm_change.load(Ordering::Relaxed));
+
+        let changed_during_wait = AtomicU32::new(0);
+        let observed_cycles = AtomicU32::new(0);
+        let observed_hint = AtomicU32::new(0);
+        assert_eq!(
+            mwaitx_protocol(
+                &config,
+                NO_C_STATE_HINT,
+                &changed_during_wait,
+                0,
+                None,
+                |_| {},
+                |cycles, hint| {
+                    observed_cycles.store(cycles, Ordering::Relaxed);
+                    observed_hint.store(hint, Ordering::Relaxed);
+                    changed_during_wait.store(1, Ordering::Release);
+                },
+            ),
+            WaitTimeoutResult::Changed(1)
+        );
+        assert_eq!(observed_cycles.load(Ordering::Relaxed), 1_000_000);
+        assert_eq!(observed_hint.load(Ordering::Relaxed), NO_C_STATE_HINT);
+
+        let unchanged = AtomicU32::new(0);
+        assert_eq!(
+            mwaitx_protocol(
+                &config,
+                NO_C_STATE_HINT,
+                &unchanged,
+                0,
+                None,
+                |_| {},
+                |_, _| {},
+            ),
+            WaitTimeoutResult::Unclassified
+        );
+
+        let armed_after_timeout = AtomicBool::new(false);
+        assert_eq!(
+            mwaitx_protocol(
+                &config,
+                NO_C_STATE_HINT,
+                &unchanged,
+                0,
+                Some(Deadline::new(Duration::ZERO)),
+                |_| armed_after_timeout.store(true, Ordering::Relaxed),
+                |_, _| {},
+            ),
+            WaitTimeoutResult::TimedOut
+        );
+        assert!(!armed_after_timeout.load(Ordering::Relaxed));
     }
 
     #[test]
