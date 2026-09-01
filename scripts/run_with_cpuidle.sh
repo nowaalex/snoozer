@@ -27,6 +27,7 @@ GLOBAL_DIRTY_VERSION=SNOOZER_GLOBAL_DIRTY_V1
 DEFAULT_TIMEOUT_SECONDS=900
 KILL_GRACE_SECONDS=5
 KILL_GRACE_POLLS=$((KILL_GRACE_SECONDS * 20))
+KILL_GRACE_MILLISECONDS=$((KILL_GRACE_SECONDS * 1000))
 SUPERVISOR_STARTUP_POLLS=500
 
 sysfs_root=${SNOOZER_SYSFS_ROOT:-/sys/devices/system/cpu}
@@ -730,6 +731,24 @@ supervisor_is_stopped() {
     esac
 }
 
+monotonic_milliseconds() {
+    awk '
+        NR == 1 && $1 ~ /^[0-9]+\.[0-9]+$/ {
+            split($1, uptime, ".")
+            fraction = substr(uptime[2] "000", 1, 3)
+            printf "%.0f\n", (uptime[1] * 1000) + fraction
+            found = 1
+        }
+        END { if (!found) exit 1 }
+    ' /proc/uptime
+}
+
+termination_budget_remaining() {
+    [ "$termination_attempt" -lt "$KILL_GRACE_POLLS" ] || return 1
+    termination_now=$(monotonic_milliseconds) || return 1
+    [ "$termination_now" -lt "$termination_deadline" ]
+}
+
 signal_child_group() {
     child_signal=$1
     inspected_pid=$2
@@ -748,8 +767,16 @@ terminate_child() {
     else
         signal_child_group TERM "$inspected_pid" || true
         termination_attempt=0
+        termination_started=$(monotonic_milliseconds) || termination_started=
+        if [ -z "$termination_started" ]; then
+            signal_child_group KILL "$inspected_pid" || true
+            wait "$inspected_pid" 2>/dev/null || true
+            child_group_verified=0
+            return
+        fi
+        termination_deadline=$((termination_started + KILL_GRACE_MILLISECONDS))
         while process_group_has_live_descendants "$inspected_pid" \
-            && [ "$termination_attempt" -lt "$KILL_GRACE_POLLS" ]; do
+            && termination_budget_remaining; do
             sleep 0.05
             termination_attempt=$((termination_attempt + 1))
         done
@@ -759,7 +786,7 @@ terminate_child() {
             # Do not send CONT before the supervisor reaches its final STOP;
             # otherwise a fast child exit could miss the wake and hang reap.
             while ! supervisor_is_stopped "$inspected_pid" \
-                && [ "$termination_attempt" -lt "$KILL_GRACE_POLLS" ]; do
+                && termination_budget_remaining; do
                 sleep 0.05
                 termination_attempt=$((termination_attempt + 1))
             done

@@ -13,6 +13,10 @@ MAX_NORMAL_RUN_SECONDS=3
 MIN_KILL_PATH_SECONDS=4
 MAX_KILL_PATH_SECONDS=8
 
+monotonic_seconds() {
+    awk '{ print int($1) }' /proc/uptime
+}
+
 for cpu in 0 1 2 3; do
     for specification in 0:POLL:1 1:C1:1 2:C1E:0 3:C2:0 4:C3:0; do
         state=${specification%%:*}
@@ -122,9 +126,9 @@ assert_clean() {
 
 # First apply enables exact POLL/C1, disables every other state, then restores.
 : >"$write_log"
-normal_start_epoch=$(date +%s)
+normal_start_epoch=$(monotonic_seconds)
 run_benchmark >/dev/null
-normal_elapsed_seconds=$(($(date +%s) - normal_start_epoch))
+normal_elapsed_seconds=$(($(monotonic_seconds) - normal_start_epoch))
 [ "$normal_elapsed_seconds" -le "$MAX_NORMAL_RUN_SECONDS" ]
 assert_original
 assert_clean
@@ -139,12 +143,12 @@ normal_descendant_ready=$test_root/normal-descendant-ready
 normal_descendant_release=$test_root/normal-descendant-release
 normal_descendant_pid_file=$test_root/normal-descendant-pid
 : >"$normal_descendant_release"
-normal_descendant_start_epoch=$(date +%s)
+normal_descendant_start_epoch=$(monotonic_seconds)
 SNOOZER_TEST_READY=$normal_descendant_ready \
     SNOOZER_TEST_RELEASE=$normal_descendant_release \
     SNOOZER_TEST_DESCENDANT_PID=$normal_descendant_pid_file \
     SNOOZER_TEST_DESCENDANT_IGNORE_TERM=1 run_benchmark >/dev/null
-normal_descendant_elapsed=$(($(date +%s) - normal_descendant_start_epoch))
+normal_descendant_elapsed=$(($(monotonic_seconds) - normal_descendant_start_epoch))
 [ "$normal_descendant_elapsed" -ge "$MIN_KILL_PATH_SECONDS" ]
 [ "$normal_descendant_elapsed" -le "$MAX_KILL_PATH_SECONDS" ]
 [ -s "$normal_descendant_pid_file" ]
@@ -251,7 +255,7 @@ ready=$test_root/signal-ready
 never_release=$test_root/signal-never-release
 benchmark_pid_file=$test_root/signal-benchmark-pid
 descendant_pid_file=$test_root/signal-descendant-pid
-signal_start_epoch=$(date +%s)
+signal_start_epoch=$(monotonic_seconds)
 env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
     SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
     SNOOZER_TEST_READY="$ready" SNOOZER_TEST_RELEASE="$never_release" \
@@ -290,7 +294,7 @@ set +e
 wait "$signal_runner_pid"
 signal_status=$?
 set -e
-signal_elapsed_seconds=$(($(date +%s) - signal_start_epoch))
+signal_elapsed_seconds=$(($(monotonic_seconds) - signal_start_epoch))
 [ "$signal_status" -eq 143 ]
 [ "$signal_elapsed_seconds" -ge "$MIN_KILL_PATH_SECONDS" ]
 [ "$signal_elapsed_seconds" -le "$MAX_KILL_PATH_SECONDS" ]
@@ -347,7 +351,7 @@ ready=$test_root/timeout-ready
 never_release=$test_root/timeout-never-release
 timeout_benchmark_pid_file=$test_root/timeout-benchmark-pid
 timeout_descendant_pid_file=$test_root/timeout-descendant-pid
-timeout_start_epoch=$(date +%s)
+timeout_start_epoch=$(monotonic_seconds)
 set +e
 SNOOZER_TEST_READY=$ready SNOOZER_TEST_RELEASE=$never_release \
     SNOOZER_TEST_IGNORE_TERM=1 SNOOZER_TEST_DESCENDANT_IGNORE_TERM=1 \
@@ -358,7 +362,7 @@ SNOOZER_TEST_READY=$ready SNOOZER_TEST_RELEASE=$never_release \
 timeout_status=$?
 set -e
 [ "$timeout_status" -eq 137 ]
-timeout_elapsed_seconds=$(($(date +%s) - timeout_start_epoch))
+timeout_elapsed_seconds=$(($(monotonic_seconds) - timeout_start_epoch))
 [ "$timeout_elapsed_seconds" -ge "$MIN_KILL_PATH_SECONDS" ]
 [ "$timeout_elapsed_seconds" -le "$MAX_KILL_PATH_SECONDS" ]
 [ -e "$timeout_benchmark_pid_file" ]
