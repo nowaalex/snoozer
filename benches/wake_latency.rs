@@ -99,10 +99,13 @@ mod linux {
         {
             return Err("official mode requires a build stamped by scripts/build_benchmark.sh, the same commit still checked out, and no tracked working-tree changes".into());
         }
-        if arguments.mode == Mode::Official {
-            drop(AmdMwaitx::new().map_err(|error| {
-                format!("official mode requires the complete AMD MWAITX comparison matrix: {error}")
-            })?);
+        if arguments.mode == Mode::Official
+            && let Err(error) = AmdMwaitx::new()
+        {
+            return Err(format!(
+                "official mode requires the complete AMD MWAITX comparison matrix: {error}"
+            )
+            .into());
         }
         let metadata = cpu_metadata(topology.waiter, &sysfs_root);
         let mut output = JsonlOutput::create(&arguments.output)?;
@@ -143,13 +146,17 @@ mod linux {
                     let pair_result = if control_first {
                         let control =
                             run_victim_control(arguments.trial_duration, topology.victim, clock)?;
-                        match run_case(*case, workload, &arguments, &topology, clock) {
+                        match run_case_with_smoke_retry(
+                            *case, workload, &arguments, &topology, clock,
+                        ) {
                             Ok(contender) => Ok((control, contender)),
                             Err(RunCaseError::Unsupported(reason)) => Err(reason),
                             Err(RunCaseError::Failed(error)) => return Err(error),
                         }
                     } else {
-                        match run_case(*case, workload, &arguments, &topology, clock) {
+                        match run_case_with_smoke_retry(
+                            *case, workload, &arguments, &topology, clock,
+                        ) {
                             Ok(contender) => {
                                 let control = run_victim_control(
                                     arguments.trial_duration,
@@ -277,6 +284,9 @@ mod linux {
             let mut args = std::env::args().skip(1);
             while let Some(argument) = args.next() {
                 match argument.as_str() {
+                    // Cargo appends this libtest-compatible marker even though
+                    // this target owns its harness.
+                    "--bench" => {}
                     "--smoke" => set_once(&mut mode, Mode::Smoke, "--smoke/--official")?,
                     "--official" => set_once(&mut mode, Mode::Official, "--smoke/--official")?,
                     "--duration-ms" => set_once(
@@ -693,6 +703,29 @@ mod linux {
             StrategyKind::AmdMwaitxC1 => run_c1(case, workload, arguments, topology, clock),
             StrategyKind::StdPark => run_std_park(case, workload, arguments, topology, clock)
                 .map_err(RunCaseError::Failed),
+        }
+    }
+
+    fn run_case_with_smoke_retry(
+        case: Case,
+        workload: Workload,
+        arguments: &Arguments,
+        topology: &Topology,
+        clock: TscClock,
+    ) -> Result<ContenderTrial, RunCaseError> {
+        let mut retry = 0_u8;
+        loop {
+            match run_case(case, workload, arguments, topology, clock) {
+                Err(RunCaseError::Failed(error)) if arguments.mode == Mode::Smoke && retry < 2 => {
+                    retry += 1;
+                    eprintln!(
+                        "SMOKE RETRY {retry}/2 {} {} after transient trial failure: {error}",
+                        workload.as_str(),
+                        case.name()
+                    );
+                }
+                result => return result,
+            }
         }
     }
 
