@@ -165,6 +165,26 @@ Machine-readable output records at least:
 - treatment/control order and repetition;
 - whether the run is official.
 
+### JSONL schema compatibility
+
+The first JSONL line is the `metadata` record. Its `schema` value applies to the entire file.
+Readers must select a version-specific decoder before interpreting later records and must reject
+unknown values; inferring a version from field presence is not supported. The
+[`RESULT_SCHEMA_VERSION`](../benches/wake_latency.rs) constant owns the current writer version.
+
+`snoozer-wake-latency-v1` reports tracked-only changes through
+`compiled_tracked_working_tree_dirty` and `checkout_tracked_working_tree_dirty`. Its top-level
+`governor` and `energy_preference` fields describe only the waiter CPU.
+
+`snoozer-wake-latency-v2` reports tracked and non-ignored untracked changes through
+`compiled_working_tree_dirty` and `checkout_working_tree_dirty`, adds `rustup_toolchain`, and
+reports every assigned CPU through `power_policy` entries containing `cpu`, `governor`, and
+`energy_preference`.
+
+A reader supporting both versions must preserve these different meanings. In particular, it must
+not present a v1 tracked-only flag as proof of a completely clean working tree. Writers emit only
+their current schema and do not duplicate deprecated fields as aliases.
+
 Console output begins with the mode-appropriate CPU-idle warning.
 
 ## Interpreting a winner
