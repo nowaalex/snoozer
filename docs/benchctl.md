@@ -85,15 +85,9 @@ read back the policy and later restored it. That does not make a performance con
 the benchmark output and [benchmarking method](benchmarking.md) remain the source of truth for
 hardware, topology, timing, and result interpretation.
 
-Legacy result decoders retain their existing version-specific meaning. Benchctl owns operation
+Historical result decoders retain their existing version-specific meaning. Benchctl owns operation
 receipts and recovery records; it does not reinterpret benchmark JSONL schemas or silently map an
 old result schema to a new one.
-
-During migration, Benchctl shares the existing `snoozer-cpuidle.lock` identity and understands the
-authoritative `SNOOZER_GLOBAL_DIRTY_V1` pointer plus `SNOOZER_CPUIDLE_V2` manifest. Unknown or
-malformed versions fail before a write. Successful legacy recovery validates the boot, ownership,
-paths, names, complete inventory and current values, then removes the old records only after every
-original value has been read back.
 
 The coordinator snapshots both the accepted receipt and executable into its root-owned operation
 directory. It hashes the executable snapshot, opens that exact inode with `O_NOFOLLOW`, hashes the
@@ -107,7 +101,3 @@ receipt, swapped artifact path, forged environment variable, or user-namespace r
 cannot turn a direct or fake-root run into official evidence. `wake_latency` binds the running
 snapshot to the receipt by hashing `/proc/self/exe`, not by comparing its root-owned snapshot path
 with the original Cargo output path.
-
-The legacy shell helpers and their disposable-fixture CI gates remain during the migration. They
-are removed only after Benchctl tests demonstrate equivalent fail-closed lifecycle coverage; until
-then they are compatibility evidence, not a second operational route for new callers.

@@ -66,9 +66,39 @@ The internal token and direct waits deliberately share the same strategy impleme
 Parker backend that duplicated the hardware loop would create two places for lost-wake and safety
 bugs.
 
+## Hardware backend selection and preflight
+
+`HardwareWait` is the single production hardware strategy. On Linux x86-64 it selects the native
+backend from `HardwareBackend::{AmdMwaitx, IntelUmwait}`. Selection is explicit in diagnostics and
+never substitutes busy spinning, yielding, parking, or another vendor's instructions.
+
+`HardwareWait::preflight()` is a mandatory process-wide startup gate. It checks static capability,
+runs a bounded baseline and monitored-store operational probe through the selected backend, and
+caches the complete result. Concurrent and later callers observe that same pass or failure. A
+successful report records the selected backend, attempt count, observed store-wake trials, and
+baseline duration.
+Construction through `HardwareWait::new()` fails with `PreflightRequired` until that gate has run,
+and returns the cached failure rather than retrying or falling back. This contract is recorded in
+[ADR 0005](decisions/0005-mandatory-hardware-preflight.md).
+
+Preflight is bounded operational evidence, not a reason oracle or benchmark. Completion of a
+store-wake trial does not prove which microarchitectural event ended the wait. Preflight also does
+not prove a latency distribution, an idle-state transition, or acceptable SMT-neighbor
+interference.
+
+The caller must establish its final allowed CPU domain and power policy before preflight, while
+leaving at least two logical CPUs available so the probe's waiter and producer can run
+concurrently. Workers may later pin themselves inside that same domain, but the process must not
+widen or replace it and must keep TSC access stable. A `fork` child inherits the cache without rerunning
+the threads that produced it, so the child must `exec` before using `HardwareWait`. CPU hotplug,
+microcode changes, and virtual-machine migration after preflight invalidate its operational and
+latency evidence. If only store-wake effectiveness changes, bounded hardware deadlines and Acquire
+rechecks continue to own functional progress and state observation. Revoking the selected ISA or
+user-space TSC access is outside the execution contract and can fault the process.
+
 ## AMD Linux x86-64 backend
 
-The first hardware backend targets AMD `MONITORX/MWAITX` on Linux x86-64.
+The AMD backend uses `MONITORX/MWAITX`.
 
 - Construction checks the architectural capability before any instruction is reachable.
 - `MONITORX` arms address monitoring.
@@ -85,26 +115,28 @@ The first hardware backend targets AMD `MONITORX/MWAITX` on Linux x86-64.
   atomic.
 
 The remaining instruction operands and timer calibration are implementation-owned by the AMD
-backend, not by this document. The diagnostic `EAX = 0` C1 variant exists only in the benchmark
-boundary and is not a production strategy.
+backend, not by this document. The diagnostic `EAX = 0` CPU C1 variant exists only in the
+benchmark boundary and is not a production strategy.
 
-## Planned Intel boundary
+## Intel Linux x86-64 backend
 
-A later Intel backend may implement the same arm/recheck/wait contract with
-`UMONITOR/UMWAIT`. It must:
+The Intel backend uses `UMONITOR/UMWAIT` and preserves the same arm/recheck/wait contract.
 
-- verify `WAITPKG` support before executing either instruction;
-- account for operating-system controls on user waits and their timeout;
-- detect or report a configuration in which address monitoring is advertised but ineffective;
-- measure both wake latency and sibling interference before becoming supported.
+- Static detection verifies Intel vendor identity, `WAITPKG`, invariant TSC, and `RDTSCP` before
+  either instruction is reachable.
+- Preflight rejects a backend whose wait does not block sufficiently to classify the probe or
+  whose monitored store wake is not observed.
+- Production and benchmark paths request Intel C0.1 only. C0.1 and C0.2 are `UMWAIT` instruction
+  hints; neither name means Linux CPU idle state C1, C2, or C3.
+- The bounded TSC deadline remains a safety wake. A return is unclassified until Rust reloads the
+  atomic.
 
-No current Intel code path is implied by this boundary, and unsupported construction must remain
-an explicit typed error.
+Support means that the selected instruction path passed its startup contract. It does not claim
+hardware-verified latency or interference results on processors that have not been measured.
 
 ## Planned Arm boundary
 
-A later Arm backend will evaluate event-based waiting such as an exclusive load followed by
-`WFE`, and `WFET` where available. It must define:
+Arm is outside the current implementation. Any later backend would need to define:
 
 - how the exclusive reservation is established and rechecked;
 - the monitored reservation granule and resulting false-wake behavior;

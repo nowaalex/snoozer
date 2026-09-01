@@ -34,20 +34,21 @@ mod linux {
 
     use sha2::{Digest, Sha256};
     use snoozer::{
-        AmdMwaitx, BusySpin, SpinThenAmdMwaitx, SpinThenYield, WaitStrategy, multi_pair,
+        BusySpin, HardwareBackend, HardwareWait, HardwareWaitError, PreflightFailure,
+        PreflightReport, SpinThenHardwareWait, SpinThenYield, WaitStrategy, multi_pair,
         single_pair,
     };
 
     use crate::output::AtomicOutput;
     use crate::platform::{
         CpuIdleState, CpuPowerPolicy, Topology, TscClock, TscSkew, cpu_metadata, cpu_power_policy,
-        pin_current, stamp,
+        pin_current, set_current_affinity, stamp,
     };
     use crate::pure::{
-        DEFAULT_SMOKE_MAX_SAMPLES, GapSchedule, RESULT_SCHEMA_VERSION, SampleSetError,
-        WaiterStartup, capture_generation_before_start, correct_latency, json_escape,
-        latency_rank_key, median_latency_json_fields, percentile_sorted, resolve_cpu_sysfs_root,
-        validate_sample_set,
+        BenchmarkHardware, BenchmarkMatrix, DEFAULT_SMOKE_MAX_SAMPLES, GapSchedule,
+        RESULT_SCHEMA_VERSION, SampleSetError, WaiterStartup, benchmark_matrix,
+        capture_generation_before_start, correct_latency, json_escape, latency_rank_key,
+        median_latency_json_fields, percentile_sorted, resolve_cpu_sysfs_root, validate_sample_set,
     };
     use crate::snoozer_api::{
         BenchParker, Observation, wait_direct_filtered, wait_direct_raw, wait_parker_filtered,
@@ -57,8 +58,8 @@ mod linux {
     type AnyError = Box<dyn Error + Send + Sync>;
     type AnyResult<T> = Result<T, AnyError>;
 
-    const CSTATE_WARNING: &str = "OFFICIAL BENCHMARK POLICY: Only POLL and exact C1 may be enabled on the assigned CPUs. C1E and every other CPU idle state, including C2/C3 and deeper states, must be disabled because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration.";
-    const SMOKE_CSTATE_WARNING: &str = "NON-OFFICIAL SMOKE: CPU idle states other than POLL and exact C1, including C1E and C2/C3 or deeper states, may be enabled on the assigned CPUs. Official runs enable only POLL and exact C1 because other states conflict with the minimum-wake-latency objective.";
+    const CSTATE_WARNING: &str = "OFFICIAL BENCHMARK POLICY: Only POLL and exact CPU C1 may be enabled on the assigned CPUs. C1E and every other CPU idle state, including CPU C2/CPU C3 and deeper states, must be disabled because their exit latency conflicts with the minimum-wake-latency objective. Intel UMWAIT C0.1 is a separate instruction hint. These results do not represent the default power-saving configuration.";
+    const SMOKE_CSTATE_WARNING: &str = "NON-OFFICIAL SMOKE: CPU idle states other than POLL and exact CPU C1, including C1E and CPU C2/CPU C3 or deeper states, may be enabled on the assigned CPUs. Intel UMWAIT C0.1 is a separate instruction hint. Official runs enable only POLL and exact CPU C1 because other states conflict with the minimum-wake-latency objective.";
     const BURSTY_SCHEDULE_VERSION: &str = "bursty-v1";
     const BURSTY_SEED: u64 = 0x5a17_9d3c_e821_4b6f;
     const SPIN_SWEEP: [usize; 4] = [32, 128, 512, 2_048];
@@ -95,11 +96,23 @@ mod linux {
             Mode::Smoke => topology.read_cpuidle()?,
         };
 
-        // Prove that every selected affinity is permitted before any thread is
-        // started. The controller remains pinned after the final call.
+        // Prove every selected CPU individually, then restore the complete
+        // stable benchmark domain so the hardware-preflight producer can run
+        // concurrently with its waiter.
         for cpu in topology.selected() {
             pin_current(cpu)?;
         }
+        set_current_affinity(&topology.selected())?;
+        let hardware_preflight = match HardwareWait::preflight() {
+            Ok(report) => HardwarePreflight::Passed(report),
+            Err(error) if arguments.mode == Mode::Smoke => HardwarePreflight::Failed(error),
+            Err(error) => {
+                return Err(format!(
+                    "official mode requires the native hardware backend to pass preflight: {error}"
+                )
+                .into());
+            }
+        };
         pin_current(topology.controller)?;
         let clock = TscClock::preflight()?;
         let skew = TscSkew::preflight(
@@ -109,14 +122,6 @@ mod linux {
             clock,
         )?;
         let provenance = repository_provenance(arguments.mode)?;
-        if arguments.mode == Mode::Official
-            && let Err(error) = AmdMwaitx::new()
-        {
-            return Err(format!(
-                "official mode requires the complete AMD MWAITX comparison matrix: {error}"
-            )
-            .into());
-        }
         let metadata = cpu_metadata(topology.waiter);
         let power_policies = topology
             .selected()
@@ -144,6 +149,7 @@ mod linux {
             power_policies: &power_policies,
             provenance: &provenance,
             cstate_warning,
+            hardware_preflight: &hardware_preflight,
         })?;
 
         eprintln!(
@@ -155,12 +161,16 @@ mod linux {
             clock.cycles_per_ns,
             clock.spread_percent
         );
+        eprintln!("{}", hardware_preflight.console_summary());
         if arguments.preflight_only {
             output.finish()?;
             return Ok(());
         }
 
-        let cases = all_cases(arguments.case_filter.as_deref())?;
+        let cases = all_cases(
+            arguments.case_filter.as_deref(),
+            hardware_preflight.matrix()?,
+        )?;
         let mut summaries = Vec::new();
         for workload in [Workload::Saturated, Workload::Bursty] {
             let mut workload_summaries = Vec::new();
@@ -277,6 +287,107 @@ mod linux {
                 Self::Official => "official",
             }
         }
+    }
+
+    enum HardwarePreflight {
+        Passed(PreflightReport),
+        Failed(HardwareWaitError),
+    }
+
+    impl HardwarePreflight {
+        fn backend(&self) -> Option<HardwareBackend> {
+            match self {
+                Self::Passed(report) => Some(report.backend()),
+                Self::Failed(_) => None,
+            }
+        }
+
+        fn matrix(&self) -> AnyResult<BenchmarkMatrix> {
+            let hardware = match self.backend() {
+                Some(HardwareBackend::AmdMwaitx) => Some(BenchmarkHardware::AmdMwaitx),
+                Some(HardwareBackend::IntelUmwait) => Some(BenchmarkHardware::IntelUmwaitC01),
+                Some(_) => return Err("preflight selected an unknown hardware backend".into()),
+                None => None,
+            };
+            Ok(benchmark_matrix(hardware))
+        }
+
+        fn console_summary(&self) -> String {
+            match self {
+                Self::Passed(report) => format!(
+                    "hardware preflight passed: backend={}, attempts={}, observed_store_wake_trials={}, baseline_wait_ns={}",
+                    hardware_backend_name(report.backend()),
+                    report.attempts(),
+                    report.verified_store_wakes(),
+                    report.baseline_wait().as_nanos()
+                ),
+                Self::Failed(error) => {
+                    format!(
+                        "hardware preflight {}: {error}",
+                        preflight_error_status(error)
+                    )
+                }
+            }
+        }
+
+        fn json(&self) -> String {
+            match self {
+                Self::Passed(report) => format!(
+                    "{{\"status\":\"passed\",\"backend\":\"{}\",\"attempts\":{},\"observed_store_wake_trials\":{},\"baseline_wait_ns\":{}}}",
+                    hardware_backend_name(report.backend()),
+                    report.attempts(),
+                    report.verified_store_wakes(),
+                    report.baseline_wait().as_nanos()
+                ),
+                Self::Failed(error) => {
+                    let backend = match error {
+                        HardwareWaitError::PreflightFailed { backend, .. } => {
+                            format!("\"{}\"", hardware_backend_name(*backend))
+                        }
+                        _ => "null".to_owned(),
+                    };
+                    let failure = preflight_failure_name(error)
+                        .map_or_else(|| "null".to_owned(), |failure| format!("\"{failure}\""));
+                    format!(
+                        "{{\"status\":\"{}\",\"backend\":{},\"failure\":{},\"diagnostic\":\"{}\"}}",
+                        preflight_error_status(error),
+                        backend,
+                        failure,
+                        json_escape(&error.to_string())
+                    )
+                }
+            }
+        }
+    }
+
+    fn hardware_backend_name(backend: HardwareBackend) -> &'static str {
+        match backend {
+            HardwareBackend::AmdMwaitx => "amd_mwaitx",
+            HardwareBackend::IntelUmwait => "intel_umwait_c0_1",
+            _ => "unknown",
+        }
+    }
+
+    fn preflight_error_status(error: &HardwareWaitError) -> &'static str {
+        match error {
+            HardwareWaitError::Unsupported(_) => "unsupported",
+            HardwareWaitError::PreflightRequired => "preflight_required",
+            HardwareWaitError::PreflightPanicked => "panicked",
+            HardwareWaitError::PreflightFailed { .. } => "failed",
+            _ => "failed",
+        }
+    }
+
+    fn preflight_failure_name(error: &HardwareWaitError) -> Option<&'static str> {
+        let HardwareWaitError::PreflightFailed { reason, .. } = error else {
+            return None;
+        };
+        Some(match reason {
+            PreflightFailure::WaitDidNotBlock => "wait_did_not_block",
+            PreflightFailure::StoreWakeNotObserved => "store_wake_not_observed",
+            PreflightFailure::Inconclusive => "inconclusive",
+            _ => "unknown",
+        })
     }
 
     #[derive(Debug)]
@@ -677,8 +788,8 @@ mod linux {
     enum StrategyKind {
         BusySpin,
         SpinThenYield(usize),
-        AmdMwaitx,
-        SpinThenAmdMwaitx(usize),
+        HardwareWait(HardwareBackend),
+        SpinThenHardwareWait(HardwareBackend, usize),
         AmdMwaitxC1,
         StdPark,
     }
@@ -695,11 +806,11 @@ mod linux {
             let strategy = match self.strategy {
                 StrategyKind::BusySpin => "busy_spin".to_owned(),
                 StrategyKind::SpinThenYield(iterations) => format!("spin_then_yield_{iterations}"),
-                StrategyKind::AmdMwaitx => "amd_mwaitx".to_owned(),
-                StrategyKind::SpinThenAmdMwaitx(iterations) => {
-                    format!("spin_then_amd_mwaitx_{iterations}")
+                StrategyKind::HardwareWait(backend) => hardware_backend_name(backend).to_owned(),
+                StrategyKind::SpinThenHardwareWait(backend, iterations) => {
+                    format!("spin_then_{}_{iterations}", hardware_backend_name(backend))
                 }
-                StrategyKind::AmdMwaitxC1 => "amd_mwaitx_c1_diagnostic".to_owned(),
+                StrategyKind::AmdMwaitxC1 => "amd_mwaitx_cpu_c1_diagnostic".to_owned(),
                 StrategyKind::StdPark => "std_park".to_owned(),
             };
             format!(
@@ -710,18 +821,27 @@ mod linux {
         }
     }
 
-    fn all_cases(filter: Option<&str>) -> AnyResult<Vec<Case>> {
+    fn all_cases(filter: Option<&str>, matrix: BenchmarkMatrix) -> AnyResult<Vec<Case>> {
         let mut cases = Vec::new();
-        for strategy in [
-            StrategyKind::BusySpin,
-            StrategyKind::AmdMwaitx,
-            StrategyKind::AmdMwaitxC1,
-        ] {
-            append_surface_matrix(&mut cases, strategy);
-        }
+        append_surface_matrix(&mut cases, StrategyKind::BusySpin);
         for iterations in SPIN_SWEEP {
             append_surface_matrix(&mut cases, StrategyKind::SpinThenYield(iterations));
-            append_surface_matrix(&mut cases, StrategyKind::SpinThenAmdMwaitx(iterations));
+        }
+        if let Some(hardware) = matrix.hardware {
+            let backend = match hardware {
+                BenchmarkHardware::AmdMwaitx => HardwareBackend::AmdMwaitx,
+                BenchmarkHardware::IntelUmwaitC01 => HardwareBackend::IntelUmwait,
+            };
+            append_surface_matrix(&mut cases, StrategyKind::HardwareWait(backend));
+            for iterations in SPIN_SWEEP {
+                append_surface_matrix(
+                    &mut cases,
+                    StrategyKind::SpinThenHardwareWait(backend, iterations),
+                );
+            }
+            if matrix.include_amd_cpu_c1_diagnostic {
+                append_surface_matrix(&mut cases, StrategyKind::AmdMwaitxC1);
+            }
         }
         cases.push(Case {
             strategy: StrategyKind::StdPark,
@@ -869,13 +989,13 @@ mod linux {
                 topology,
                 clock,
             ),
-            StrategyKind::AmdMwaitx => {
-                let strategy = AmdMwaitx::new()
+            StrategyKind::HardwareWait(_) => {
+                let strategy = HardwareWait::new()
                     .map_err(|error| RunCaseError::Unsupported(error.to_string()))?;
                 run_strategy(strategy, case, workload, arguments, topology, clock)
             }
-            StrategyKind::SpinThenAmdMwaitx(iterations) => {
-                let strategy = SpinThenAmdMwaitx::new(iterations)
+            StrategyKind::SpinThenHardwareWait(_, iterations) => {
+                let strategy = SpinThenHardwareWait::new(iterations)
                     .map_err(|error| RunCaseError::Unsupported(error.to_string()))?;
                 run_strategy(strategy, case, workload, arguments, topology, clock)
             }
@@ -1679,6 +1799,7 @@ mod linux {
         power_policies: &'a [CpuPowerPolicy],
         provenance: &'a RepositoryProvenance,
         cstate_warning: &'a str,
+        hardware_preflight: &'a HardwarePreflight,
     }
 
     impl JsonlOutput {
@@ -1766,12 +1887,10 @@ mod linux {
                 ),
                 None => ("compile_stamps", "null".to_owned()),
             };
-            let mwaitx_timer_hz = snoozer::capabilities()
-                .mwaitx_timer_hz
-                .map_or_else(|| "null".to_owned(), |value| value.to_string());
+            let hardware_preflight = input.hardware_preflight.json();
             writeln!(
                 self.writer,
-                "{{\"type\":\"metadata\",\"schema\":\"{}\",\"mode\":\"{}\",\"warning\":\"{}\",\"benchmark_commit\":\"{}\",\"compiled_working_tree_dirty\":{},\"checkout_commit\":\"{}\",\"checkout_working_tree_dirty\":{},\"rustc\":\"{}\",\"rustup_toolchain\":\"{}\",\"provenance_source\":\"{}\",\"build_receipt\":{},\"benchmark_features\":{},\"schedule_version\":\"{}\",\"schedule_seed\":\"0x{:016x}\",\"bursty_gap_us_weight_percent\":[[0,30],[1,15],[5,12],[10,10],[25,10],[50,8],[100,7],[250,5],[1000,3]],\"duration_ms\":{},\"repetitions\":{},\"warmup_events\":{},\"max_samples\":{},\"acceptance_limits\":{{\"max_victim_throughput_loss_percent\":{:.6},\"max_victim_p99_degradation_percent\":{:.6}}},\"clocksource\":\"tsc\",\"cycles_per_ns\":{:.9},\"calibration_spread_percent\":{:.6},\"mwaitx_timer_hz\":{},\"tsc_skew\":{{\"producer_offset_cycles\":{},\"waiter_offset_cycles\":{},\"producer_uncertainty_cycles\":{},\"waiter_uncertainty_cycles\":{},\"producer_to_waiter_bound_ns\":{:.6},\"applied_waiter_minus_producer_cycles\":{}}},\"matched_control\":\"victim-only baseline; reported loss conservatively includes producer and waiter activity\",\"cpu_model\":\"{}\",\"microcode\":\"{}\",\"kernel\":\"{}\",\"power_policy\":[{}],\"roles\":{{\"waiter\":{},\"victim\":{},\"producer\":{},\"controller\":{}}},\"topology\":[{}],\"cpuidle\":[{}]}}",
+                "{{\"type\":\"metadata\",\"schema\":\"{}\",\"mode\":\"{}\",\"warning\":\"{}\",\"benchmark_commit\":\"{}\",\"compiled_working_tree_dirty\":{},\"checkout_commit\":\"{}\",\"checkout_working_tree_dirty\":{},\"rustc\":\"{}\",\"rustup_toolchain\":\"{}\",\"provenance_source\":\"{}\",\"build_receipt\":{},\"benchmark_features\":{},\"schedule_version\":\"{}\",\"schedule_seed\":\"0x{:016x}\",\"bursty_gap_us_weight_percent\":[[0,30],[1,15],[5,12],[10,10],[25,10],[50,8],[100,7],[250,5],[1000,3]],\"duration_ms\":{},\"repetitions\":{},\"warmup_events\":{},\"max_samples\":{},\"acceptance_limits\":{{\"max_victim_throughput_loss_percent\":{:.6},\"max_victim_p99_degradation_percent\":{:.6}}},\"clocksource\":\"tsc\",\"cycles_per_ns\":{:.9},\"calibration_spread_percent\":{:.6},\"hardware_preflight\":{},\"tsc_skew\":{{\"producer_offset_cycles\":{},\"waiter_offset_cycles\":{},\"producer_uncertainty_cycles\":{},\"waiter_uncertainty_cycles\":{},\"producer_to_waiter_bound_ns\":{:.6},\"applied_waiter_minus_producer_cycles\":{}}},\"matched_control\":\"victim-only baseline; reported loss conservatively includes producer and waiter activity\",\"cpu_model\":\"{}\",\"microcode\":\"{}\",\"kernel\":\"{}\",\"power_policy\":[{}],\"roles\":{{\"waiter\":{},\"victim\":{},\"producer\":{},\"controller\":{}}},\"topology\":[{}],\"cpuidle\":[{}]}}",
                 RESULT_SCHEMA_VERSION,
                 input.arguments.mode.as_str(),
                 json_escape(input.cstate_warning),
@@ -1798,7 +1917,7 @@ mod linux {
                 MAX_P99_DEGRADATION_PERCENT,
                 input.clock.cycles_per_ns,
                 input.clock.spread_percent,
-                mwaitx_timer_hz,
+                hardware_preflight,
                 input.skew.producer_offset_cycles,
                 input.skew.waiter_offset_cycles,
                 input.skew.producer_uncertainty_cycles,

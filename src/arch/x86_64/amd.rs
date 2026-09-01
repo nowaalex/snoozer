@@ -47,13 +47,16 @@ pub(crate) fn detect_capabilities() -> Capabilities {
         extended_features_edx: extended_features.map(|features| features.edx),
         invariant_features_edx: invariant_features.map(|features| features.edx),
     };
-    let decoded = decode_capabilities(registers, None);
-    let timer_hz = if timer_calibration_is_usable(&decoded) {
+    decode_capabilities(registers)
+}
+
+pub(crate) fn calibrate_timer_hz() -> Option<u64> {
+    let detected = detect_capabilities();
+    if timer_calibration_is_usable(&detected) {
         collect_tsc_frequencies(sample_tsc_frequency_once).and_then(conservative_timer_hz)
     } else {
         None
-    };
-    decode_capabilities(registers, timer_hz)
+    }
 }
 
 fn extended_leaf_availability(extended_max: u32) -> (bool, bool) {
@@ -63,10 +66,7 @@ fn extended_leaf_availability(extended_max: u32) -> (bool, bool) {
     )
 }
 
-fn decode_capabilities(
-    registers: CapabilityRegisters,
-    calibrated_timer_hz: Option<u64>,
-) -> Capabilities {
+fn decode_capabilities(registers: CapabilityRegisters) -> Capabilities {
     let amd_vendor = registers.vendor_ebx == AMD_VENDOR_EBX
         && registers.vendor_edx == AMD_VENDOR_EDX
         && registers.vendor_ecx == AMD_VENDOR_ECX;
@@ -79,16 +79,14 @@ fn decode_capabilities(
     let invariant_tsc = registers
         .invariant_features_edx
         .is_some_and(|features| features & INVARIANT_TSC_BIT != 0);
-    let mwaitx_timer_hz = (amd_vendor && monitorx_mwaitx && invariant_tsc && rdtscp)
-        .then_some(calibrated_timer_hz)
-        .flatten();
     Capabilities {
         supported_target: true,
         amd_vendor,
+        intel_vendor: false,
         monitorx_mwaitx,
+        waitpkg: false,
         invariant_tsc,
         rdtscp,
-        mwaitx_timer_hz,
     }
 }
 
@@ -191,7 +189,7 @@ fn tsc_from_halves(high: u32, low: u32) -> u64 {
 
 #[inline]
 pub(crate) fn monitorx(address: *const ()) {
-    // SAFETY: AmdMwaitx construction has checked CPUID. The caller passes a
+    // SAFETY: HardwareWait preflight has checked CPUID. The caller passes a
     // live AtomicU32 or AtomicU64 address and keeps it alive across MWAITX.
     unsafe {
         asm!(
@@ -209,7 +207,7 @@ pub(crate) fn mwaitx(timeout_cycles: u32, c_state_hint: u32) {
     // LLVM may reserve RBX, so a reversible exchange supplies EBX without
     // naming RBX as an operand. EAX=0xF0 is the production no-C-state hint;
     // EAX=0 is reachable only through the benchmark-only diagnostic type.
-    // SAFETY: AmdMwaitx construction checked CPUID and the caller performed
+    // SAFETY: HardwareWait preflight checked CPUID and the caller performed
     // MONITORX plus an Acquire recheck. ECX enables the timer and EBX is
     // nonzero, bounding the wait. Both exchanges restore the full RBX value.
     unsafe {
@@ -226,150 +224,9 @@ pub(crate) fn mwaitx(timeout_cycles: u32, c_state_hint: u32) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "../../../tests/unit/amd_capability_decoding.rs"]
+mod amd_capability_decoding;
 
-    fn supported_registers() -> CapabilityRegisters {
-        CapabilityRegisters {
-            vendor_ebx: AMD_VENDOR_EBX,
-            vendor_edx: AMD_VENDOR_EDX,
-            vendor_ecx: AMD_VENDOR_ECX,
-            extended_features_ecx: Some(MONITORX_MWAITX_BIT),
-            extended_features_edx: Some(RDTSCP_BIT),
-            invariant_features_edx: Some(INVARIANT_TSC_BIT),
-        }
-    }
-
-    #[test]
-    fn capability_decoding_requires_every_exact_register_bit() {
-        assert_eq!(MONITORX_MWAITX_BIT, 0x2000_0000);
-        assert_eq!(RDTSCP_BIT, 0x0800_0000);
-        assert_eq!(INVARIANT_TSC_BIT, 0x0000_0100);
-
-        let supported = decode_capabilities(supported_registers(), Some(2_400_000_000));
-        assert!(supported.supported_target);
-        assert!(supported.amd_vendor);
-        assert!(supported.monitorx_mwaitx);
-        assert!(supported.invariant_tsc);
-        assert!(supported.rdtscp);
-        assert_eq!(supported.mwaitx_timer_hz, Some(2_400_000_000));
-        assert!(timer_calibration_is_usable(&supported));
-
-        let not_amd = decode_capabilities(
-            CapabilityRegisters {
-                vendor_ebx: 0,
-                ..supported_registers()
-            },
-            Some(2_400_000_000),
-        );
-        assert!(!not_amd.amd_vendor);
-        assert_eq!(not_amd.mwaitx_timer_hz, None);
-        assert!(!timer_calibration_is_usable(&not_amd));
-
-        let missing_features = decode_capabilities(
-            CapabilityRegisters {
-                extended_features_ecx: None,
-                extended_features_edx: None,
-                invariant_features_edx: None,
-                ..supported_registers()
-            },
-            Some(2_400_000_000),
-        );
-        assert!(!missing_features.monitorx_mwaitx);
-        assert!(!missing_features.invariant_tsc);
-        assert!(!missing_features.rdtscp);
-        assert_eq!(missing_features.mwaitx_timer_hz, None);
-
-        let zeroed_features = decode_capabilities(
-            CapabilityRegisters {
-                extended_features_ecx: Some(0),
-                extended_features_edx: Some(0),
-                invariant_features_edx: Some(0),
-                ..supported_registers()
-            },
-            Some(2_400_000_000),
-        );
-        assert!(!zeroed_features.monitorx_mwaitx);
-        assert!(!zeroed_features.invariant_tsc);
-        assert!(!zeroed_features.rdtscp);
-
-        for registers in [
-            CapabilityRegisters {
-                extended_features_ecx: Some(0),
-                ..supported_registers()
-            },
-            CapabilityRegisters {
-                extended_features_edx: Some(0),
-                ..supported_registers()
-            },
-            CapabilityRegisters {
-                invariant_features_edx: Some(0),
-                ..supported_registers()
-            },
-        ] {
-            let missing_one = decode_capabilities(registers, Some(2_400_000_000));
-            assert_eq!(missing_one.mwaitx_timer_hz, None);
-            assert!(!timer_calibration_is_usable(&missing_one));
-        }
-    }
-
-    #[test]
-    fn extended_leaf_boundaries_are_interpreted_exactly() {
-        assert_eq!(
-            extended_leaf_availability(EXTENDED_FEATURES_LEAF - 1),
-            (false, false)
-        );
-        assert_eq!(
-            extended_leaf_availability(EXTENDED_FEATURES_LEAF),
-            (true, false)
-        );
-        assert_eq!(extended_leaf_availability(INVARIANT_TSC_LEAF), (true, true));
-    }
-
-    #[test]
-    fn calibration_collection_and_tsc_observations_are_pure_and_exact() {
-        let mut observations = [None, Some(10), None, Some(20), Some(30)].into_iter();
-        assert_eq!(
-            collect_tsc_frequencies(|| observations.next().flatten()),
-            Some([10, 20, 30])
-        );
-
-        let mut attempts = 0_usize;
-        assert_eq!(
-            collect_tsc_frequencies(|| {
-                attempts += 1;
-                (attempts <= 2).then_some(attempts as u64)
-            }),
-            None
-        );
-        assert_eq!(attempts, TIMER_CALIBRATION_ATTEMPTS);
-
-        assert_eq!(
-            tsc_frequency_from_observation(100, 7, 124, 7, 10),
-            Some(2_400_000_000)
-        );
-        assert_eq!(tsc_frequency_from_observation(100, 7, 124, 8, 10), None);
-        assert_eq!(tsc_frequency_from_observation(124, 7, 100, 7, 10), None);
-        assert_eq!(tsc_frequency_from_observation(100, 7, 100, 7, 10), None);
-        assert_eq!(tsc_frequency_from_observation(100, 7, 124, 7, 0), None);
-
-        assert_eq!(
-            tsc_from_halves(0x0123_4567, 0x89ab_cdef),
-            0x0123_4567_89ab_cdef
-        );
-        assert_eq!(tsc_from_halves(0, u32::MAX), u64::from(u32::MAX));
-    }
-
-    #[test]
-    fn calibration_math_is_scaled_conservative_and_rejects_instability() {
-        assert_eq!(frequency_hz(24, 10), 2_400_000_000);
-        assert_eq!(frequency_hz(0, 0), 1);
-        assert_eq!(
-            conservative_timer_hz([2_400_000_000, 2_500_000_000, 2_450_000_000]),
-            Some(1_920_000_000)
-        );
-        assert_eq!(conservative_timer_hz([1_000, 1_000, 2_000]), None);
-        assert_eq!(conservative_timer_hz([800, 900, 1_000]), Some(640));
-        assert_eq!(conservative_timer_hz([1, 1, 1]), None);
-    }
-}
+#[cfg(test)]
+#[path = "../../../tests/unit/amd_timer_calibration.rs"]
+mod amd_timer_calibration;

@@ -46,8 +46,9 @@ workspace = true
 
 [features]
 default = []
-# This feature exists only so the repository benchmark can measure the C1
-# diagnostic boundary. It is not part of the supported library API.
+# This feature exists only so the repository benchmark can measure the AMD CPU
+# C1 diagnostic boundary. It is unrelated to Intel UMWAIT C0.1 and is not part
+# of the supported library API.
 benchmark-only = []
 
 [workspace.lints.rust]

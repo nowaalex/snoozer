@@ -5,8 +5,9 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use pure::{
-    CPU_SYSFS_ROOT, DEFAULT_SMOKE_MAX_SAMPLES, GapSchedule, RESULT_SCHEMA_VERSION, SampleSetError,
-    WaiterStartup, capture_generation_before_start, correct_latency, json_escape, latency_rank_key,
+    BenchmarkHardware, BenchmarkMatrix, CPU_SYSFS_ROOT, DEFAULT_SMOKE_MAX_SAMPLES, GapSchedule,
+    RESULT_SCHEMA_VERSION, SampleSetError, WaiterStartup, benchmark_matrix,
+    capture_generation_before_start, correct_latency, json_escape, latency_rank_key,
     median_latency_json_fields, parse_cpu_list, percentile_sorted, resolve_cpu_sysfs_root,
     validate_sample_set,
 };
@@ -17,8 +18,41 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 const BURSTY_SEED: u64 = 0x5a17_9d3c_e821_4b6f;
 
 #[test]
-fn benchmark_schema_is_v2() {
-    assert_eq!(RESULT_SCHEMA_VERSION, "snoozer-wake-latency-v2");
+fn portable_matrix_has_no_hardware_or_amd_diagnostic() {
+    assert_eq!(
+        benchmark_matrix(None),
+        BenchmarkMatrix {
+            hardware: None,
+            include_amd_cpu_c1_diagnostic: false,
+        }
+    );
+}
+
+#[test]
+fn amd_matrix_includes_amd_cpu_c1_diagnostic() {
+    assert_eq!(
+        benchmark_matrix(Some(BenchmarkHardware::AmdMwaitx)),
+        BenchmarkMatrix {
+            hardware: Some(BenchmarkHardware::AmdMwaitx),
+            include_amd_cpu_c1_diagnostic: true,
+        }
+    );
+}
+
+#[test]
+fn intel_matrix_uses_c0_1_without_amd_diagnostic() {
+    assert_eq!(
+        benchmark_matrix(Some(BenchmarkHardware::IntelUmwaitC01)),
+        BenchmarkMatrix {
+            hardware: Some(BenchmarkHardware::IntelUmwaitC01),
+            include_amd_cpu_c1_diagnostic: false,
+        }
+    );
+}
+
+#[test]
+fn benchmark_schema_is_v3() {
+    assert_eq!(RESULT_SCHEMA_VERSION, "snoozer-wake-latency-v3");
 }
 
 #[test]
@@ -174,7 +208,7 @@ fn rejects_descending_cpu_range() {
 }
 
 #[test]
-fn metadata_schema_is_v2() {
-    assert_eq!(RESULT_SCHEMA_VERSION, "snoozer-wake-latency-v2");
+fn metadata_schema_is_v3() {
+    assert_eq!(RESULT_SCHEMA_VERSION, "snoozer-wake-latency-v3");
     assert_ne!(RESULT_SCHEMA_VERSION, "snoozer-wake-latency-v1");
 }

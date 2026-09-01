@@ -4,10 +4,10 @@ use std::sync::OnceLock;
 
 use crate::arch;
 
-/// Cached hardware facts used to guard the AMD strategy.
+/// Cached, side-effect-free hardware facts used to select an x86 backend.
 ///
-/// This structure is non-exhaustive so later Intel and Arm backends can add
-/// capability fields without breaking callers that inspect this snapshot.
+/// This snapshot performs CPUID discovery only. Timer calibration and the
+/// functional wait probe belong exclusively to [`crate::HardwareWait::preflight`].
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Capabilities {
@@ -15,14 +15,16 @@ pub struct Capabilities {
     pub supported_target: bool,
     /// CPUID reports an AMD processor vendor.
     pub amd_vendor: bool,
+    /// CPUID reports an Intel processor vendor.
+    pub intel_vendor: bool,
     /// CPUID advertises AMD `MONITORX`/`MWAITX`.
     pub monitorx_mwaitx: bool,
+    /// CPUID advertises Intel `UMONITOR`/`UMWAIT`.
+    pub waitpkg: bool,
     /// CPUID advertises an invariant timestamp counter.
     pub invariant_tsc: bool,
     /// CPUID advertises ordered `RDTSCP` reads.
     pub rdtscp: bool,
-    /// Calibrated conservative MWAITX timer frequency.
-    pub mwaitx_timer_hz: Option<u64>,
 }
 
 static CAPABILITIES: OnceLock<Capabilities> = OnceLock::new();
@@ -34,13 +36,5 @@ pub fn capabilities() -> &'static Capabilities {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detection_is_cached() {
-        let first = capabilities() as *const Capabilities;
-        let second = capabilities() as *const Capabilities;
-        assert_eq!(first, second);
-    }
-}
+#[path = "../tests/unit/capability_cache.rs"]
+mod capability_cache;

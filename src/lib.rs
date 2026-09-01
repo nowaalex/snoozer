@@ -15,14 +15,17 @@ mod strategy;
 
 pub use atomic::WaitableAtomic;
 pub use capabilities::{Capabilities, capabilities};
-pub use error::{Strategy, UnsupportedReason, UnsupportedStrategy};
+pub use error::{
+    HardwareBackend, HardwareWaitError, PreflightFailure, Strategy, UnsupportedReason,
+    UnsupportedStrategy,
+};
 pub use parker::{
     MultiParker, MultiUnparker, NotificationTimeoutResult, ParkResult, ParkTimeoutResult,
     SingleParker, SingleUnparker, multi_pair, single_pair,
 };
 pub use strategy::{
-    AmdMwaitx, BusySpin, SpinThenAmdMwaitx, SpinThenYield, WaitResult, WaitStrategy,
-    WaitTimeoutResult, WaitUntilTimeoutResult,
+    BusySpin, HardwareWait, PreflightReport, SpinThenHardwareWait, SpinThenYield, WaitResult,
+    WaitStrategy, WaitTimeoutResult, WaitUntilTimeoutResult,
 };
 
 /// Diagnostic strategies used only by this repository's benchmark suite.

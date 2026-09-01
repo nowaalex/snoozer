@@ -46,7 +46,8 @@ other than `expected`. What it does while the value remains equal depends on the
   after observing a change;
 - `SpinThenYield` polls for its configured prefix, yields at most once, then classifies its Acquire
   recheck;
-- AMD and hybrid AMD strategies use the address-monitoring protocol below after any spin prefix.
+- hardware and hybrid hardware strategies use the selected native address-monitoring protocol
+  after any spin prefix.
 
 An address-monitoring attempt follows this sequence:
 
@@ -142,22 +143,40 @@ object in the hot loop:
 
 - busy spin for the shortest expected gaps;
 - spin then yield when scheduler cooperation is acceptable;
-- AMD `MONITORX/MWAITX` for a hardware-assisted wait;
-- spin then AMD `MONITORX/MWAITX` for short gaps followed by hardware waiting.
+- `HardwareWait` for the preflighted native AMD `MONITORX/MWAITX` or Intel
+  `UMONITOR/UMWAIT` path;
+- `SpinThenHardwareWait` for short gaps followed by that same native hardware wait.
 
-Construction performs capability checks before an architecture-specific instruction can execute.
-`AmdMwaitx::new` and `SpinThenAmdMwaitx::new` return a typed
-`UnsupportedStrategy` when their requirements are absent. `BusySpin` is a unit strategy,
-and `SpinThenYield::new` owns its explicit spin count. There is intentionally no automatic or
-silent fallback: changing the wait mechanism would invalidate performance expectations.
+Call `HardwareWait::preflight()` during process startup before constructing either hardware
+strategy. It runs a bounded baseline and monitored-store probe once for the process and returns a
+`PreflightReport` containing the selected `HardwareBackend`, attempt count, observed store-wake
+trial count, and baseline duration. `HardwareWait::new` fails with `PreflightRequired` until that gate has run;
+`SpinThenHardwareWait::new` observes the same cached result. A cached unsupported, panicked, or
+failed result is returned as `HardwareWaitError`, not retried and not replaced by another
+mechanism.
 
-Use `capabilities()` to report detected platform support without constructing a hardware
-strategy. `UnsupportedStrategy::strategy` identifies the requested strategy and
-`UnsupportedStrategy::reason` identifies the failed requirement; do not branch on display
-text. `Capabilities`, `Strategy`, and `UnsupportedReason` are non-exhaustive because planned
-architecture backends may add fields, strategies, and failure reasons. Match the enums with a
-wildcard arm and inspect capability fields without constructing or exhaustively destructuring the
-snapshot.
+Run preflight after the process has established its final allowed CPU domain and power policy, but
+while at least two logical CPUs remain available to run the probe concurrently. Worker threads may
+later pin themselves within that domain. Do not widen or replace the domain, and keep TSC access
+stable for the lifetime of the cached result. A `fork` child must `exec`
+before it constructs or uses a hardware strategy; it must not rely on the parent's inherited
+cache. CPU hotplug, microcode changes, and virtual-machine migration invalidate the report's
+operational and latency meaning. Bounded deadlines and Acquire rechecks preserve functional state
+checks only while the selected ISA and user-space TSC access remain available.
+
+On AMD the selected backend is `HardwareBackend::AmdMwaitx`. On Intel it is
+`HardwareBackend::IntelUmwait`, and both production and benchmark paths request UMWAIT C0.1. Intel
+C0.1 and C0.2 are instruction hints, not Linux CPU idle states C1, C2, or C3. `BusySpin` remains a
+unit strategy, and `SpinThenYield::new` owns its explicit spin count. There is intentionally no
+automatic or silent fallback: changing the wait mechanism would invalidate performance
+expectations.
+
+Use `capabilities()` to report CPUID-only platform facts without calibration, probe threads, or a
+hardware wait. Static support does not replace the runtime preflight report. `HardwareWaitError`
+distinguishes a missing gate, caught initializer panic, `UnsupportedStrategy`, and a
+backend-specific `PreflightFailure`; do not branch on display text. Public capability and strategy
+enums are non-exhaustive, so match them with a wildcard arm and avoid exhaustive snapshot
+destructuring.
 
 ## Choosing quickly
 

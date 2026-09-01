@@ -5,9 +5,28 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-pub(crate) const RESULT_SCHEMA_VERSION: &str = "snoozer-wake-latency-v2";
+pub(crate) const RESULT_SCHEMA_VERSION: &str = "snoozer-wake-latency-v3";
 pub(crate) const CPU_SYSFS_ROOT: &str = "/sys/devices/system/cpu";
 pub(crate) const DEFAULT_SMOKE_MAX_SAMPLES: usize = 2_000_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BenchmarkHardware {
+    AmdMwaitx,
+    IntelUmwaitC01,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BenchmarkMatrix {
+    pub(crate) hardware: Option<BenchmarkHardware>,
+    pub(crate) include_amd_cpu_c1_diagnostic: bool,
+}
+
+pub(crate) fn benchmark_matrix(hardware: Option<BenchmarkHardware>) -> BenchmarkMatrix {
+    BenchmarkMatrix {
+        hardware,
+        include_amd_cpu_c1_diagnostic: hardware == Some(BenchmarkHardware::AmdMwaitx),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SampleSetError {

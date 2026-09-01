@@ -115,7 +115,7 @@ impl Topology {
             }
             if exact_poll != 1 || exact_c1 != 1 {
                 return Err(format!(
-                    "CPU {cpu} must expose exactly one POLL and one exact C1 state"
+                    "CPU {cpu} must expose exactly one POLL and one exact CPU C1 state"
                 )
                 .into());
             }
@@ -135,7 +135,7 @@ impl Topology {
                 "POLL" | "C1" => {}
                 _ if !state.disabled => {
                     return Err(format!(
-                        "CPU {}: {} is enabled; only exact POLL/C1 are allowed",
+                        "CPU {}: {} is enabled; only exact POLL/CPU C1 are allowed",
                         state.cpu, state.name
                     )
                     .into());
@@ -276,7 +276,17 @@ unsafe extern "C" {
 }
 
 pub(crate) fn pin_current(cpu: usize) -> Result<(), io::Error> {
-    if cpu >= CPU_SET_BITS {
+    set_current_affinity(&[cpu])
+}
+
+pub(crate) fn set_current_affinity(cpus: &[usize]) -> Result<(), io::Error> {
+    if cpus.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "affinity mask must contain at least one CPU",
+        ));
+    }
+    if cpus.iter().any(|&cpu| cpu >= CPU_SET_BITS) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "CPU exceeds the affinity mask limit",
@@ -285,9 +295,11 @@ pub(crate) fn pin_current(cpu: usize) -> Result<(), io::Error> {
     let mut set = LinuxCpuSet {
         words: [0; CPU_SET_WORDS],
     };
-    set.words[cpu / usize::BITS as usize] |= 1_usize << (cpu % usize::BITS as usize);
-    // SAFETY: `set` has the Linux x86_64 `cpu_set_t` layout and remains alive for
-    // the call. A pid of zero targets only the calling thread.
+    for &cpu in cpus {
+        set.words[cpu / usize::BITS as usize] |= 1_usize << (cpu % usize::BITS as usize);
+    }
+    // SAFETY: `set` has the Linux x86_64 `cpu_set_t` layout and remains alive
+    // for the call. A pid of zero targets only the calling thread.
     let result = unsafe { sched_setaffinity(0, size_of::<LinuxCpuSet>(), &raw const set) };
     if result == 0 {
         Ok(())

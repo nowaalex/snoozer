@@ -4,8 +4,8 @@ This page is for reviewers and backend implementers. It records the assumptions 
 safe public API sound and the rules that constrain architecture-specific assembly.
 
 Snoozer uses `unsafe` because Rust has no safe intrinsic for the targeted user-mode wait
-instructions. The public API remains safe: unsupported hardware must fail during strategy
-construction rather than reach an illegal instruction.
+instructions. The public API remains safe: unsupported hardware and failed runtime preflight must
+remain typed errors rather than reach an illegal instruction or select a substitute strategy.
 
 ## Watched-address lifetime
 
@@ -71,28 +71,56 @@ not claim a universal hardware monitoring granule.
 
 ## Capability and operating-system checks
 
-Architecture-specific instructions are unreachable until construction confirms their advertised
-capability. The AMD backend checks the relevant extended CPUID feature. A forced-unsupported test
-seam verifies that detection errors return a typed `UnsupportedStrategy` instead of executing
-assembly.
+Architecture-specific instructions are unreachable until static detection confirms their
+advertised capability. AMD checks its extended CPUID feature; Intel checks vendor identity and
+`WAITPKG`. Both require the timing capabilities used by their bounded wait. Forced-unsupported
+test seams verify that detection errors return typed failures instead of executing assembly.
 
-Capability bits are necessary, but a future backend may need stronger checks. Intel user waits can
-be constrained by the operating system or affected by microcode behavior. Arm event and
-reservation behavior varies by architecture level. Each backend owns those checks and must fail
-visibly when its requirements cannot be established.
+Capability bits are necessary but insufficient because user waits can be constrained by the
+operating system, hypervisor, firmware, or microcode. `HardwareWait::preflight()` therefore runs a
+bounded native baseline and monitored-store operational probe before `HardwareWait::new()` can
+succeed. Its result is cached process-wide, including failure, so concurrent callers cannot race
+different hardware verdicts and later callers cannot silently retry a failed gate. A passed
+`PreflightReport` establishes only that the controlled trials completed in that process. Because
+hardware waits have multiple wake causes, the report does not prove the exact cause of a return and
+is not performance evidence.
+
+`HardwareWaitError` keeps startup states distinct: preflight not yet run, initializer panic,
+statically unsupported, or a runtime preflight failure naming its backend and failure class. Every
+terminal result, including a caught panic, is cached. Callers must branch on those types, never
+display text. No error path may construct busy-spin, yield, park, or the other vendor's backend as
+a fallback.
+
+`capabilities()` is side-effect-free CPUID discovery. It does not calibrate a timer, create probe
+threads, execute a hardware wait, or satisfy the preflight gate.
+
+Preflight belongs after the final allowed CPU domain and power policy are established, while at
+least two logical CPUs can run its waiter and producer concurrently. Workers may later narrow
+their own affinity within that domain; the process must not widen or replace the domain or lose the
+TSC access on which the selected backend was checked. A child
+created with `fork` inherits cached memory without reproducing the probe; it must `exec` before
+constructing or using `HardwareWait`. CPU hotplug, microcode update, or virtual-machine migration
+after preflight invalidates the report as operational and latency evidence. If the change only
+degrades monitored-store wake effectiveness, the bounded safety deadline and final Acquire
+rechecks still protect functional progress and observation. Revoking the selected instruction set
+or user-space TSC access is outside the execution contract and can fault the process; a cheap
+constructor cannot make that mutable environment immutable. Callers must not present measurements
+from a changed environment as preflighted evidence.
 
 ## Progress and timeouts
 
-The AMD hardware wait always uses its bounded safety timer. Its expiry is an internal,
-unclassified wake. It is distinct from a caller-requested timeout:
+Every production hardware wait uses a bounded TSC deadline. Its expiry is an internal,
+unclassified wake and is distinct from a caller-requested timeout:
 
 - a raw timed operation may report changed, unclassified, or timed out;
 - a filtered timed operation reports only its condition or timed out;
 - repeated hardware timer expirations cause another condition check and do not masquerade as a
   public timeout.
 
-Timer calibration is performed outside the hot loop. If a usable timer cannot be established,
-hardware-strategy construction fails rather than selecting an unbounded wait or a silent fallback.
+AMD calibrates the MWAITX timer outside the hot loop. Intel UMWAIT uses the bounded deadline and
+requests C0.1 only; C0.1 is an instruction hint and must not be described as Linux CPU C1, C2, or
+C3. If a usable timer or native wait cannot be established, preflight fails rather than selecting
+an unbounded wait or a silent fallback.
 
 ## Inline assembly rules
 
@@ -119,6 +147,6 @@ Snoozer does not make a logically racy application protocol correct. In particul
 - changing affinity, scheduler policy, governor, or idle states remains the caller's operational
   responsibility.
 
-The benchmark runner has additional privileged-state recovery requirements documented in
+Benchctl has additional privileged-state recovery requirements documented in
 [Benchmarking](benchmarking.md), including the trust boundary for custom sysfs roots and write
 helpers. Those operations are not performed by the library.

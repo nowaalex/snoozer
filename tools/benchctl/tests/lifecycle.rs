@@ -302,10 +302,10 @@ fn lock_contention_and_artifact_tampering_fail_before_mutation() {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(rig.sysfs.join(".snoozer-cpuidle.lock"))
+        .open(rig.sysfs.join(".benchctl-cpuidle.lock"))
         .expect("open fixture lock");
     fs::set_permissions(
-        rig.sysfs.join(".snoozer-cpuidle.lock"),
+        rig.sysfs.join(".benchctl-cpuidle.lock"),
         fs::Permissions::from_mode(0o600),
     )
     .expect("secure fixture lock");

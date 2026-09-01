@@ -5,7 +5,8 @@ use std::fmt::{Display, Formatter};
 
 /// Identifies a built-in wait strategy.
 ///
-/// New architecture backends may add variants in later releases.
+/// New architecture backends may be selected behind [`Strategy::HardwareWait`]
+/// without changing callers.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Strategy {
@@ -13,28 +14,40 @@ pub enum Strategy {
     BusySpin,
     /// Poll briefly, then yield once.
     SpinThenYield,
-    /// AMD `MONITORX`/`MWAITX` without entering a C-state.
-    AmdMwaitx,
-    /// Poll briefly, then use AMD `MONITORX`/`MWAITX`.
-    SpinThenAmdMwaitx,
+    /// Use the hardware-address monitor selected by process-wide preflight.
+    HardwareWait,
+    /// Poll briefly, then use the selected hardware-address monitor.
+    SpinThenHardwareWait,
 }
 
-/// Why a requested hardware strategy cannot run on this process.
-///
-/// New architecture backends may add failure reasons in later releases.
+/// Hardware backend selected for this process.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HardwareBackend {
+    /// AMD `MONITORX`/`MWAITX`, with production C-state entry disabled.
+    AmdMwaitx,
+    /// Intel `UMONITOR`/`UMWAIT`, requesting the fast C0.1 state.
+    IntelUmwait,
+}
+
+/// Why the target cannot construct a hardware wait strategy.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedReason {
     /// The operating system or target architecture is not supported.
     UnsupportedTarget,
-    /// The CPU vendor is not AMD.
-    NotAmd,
-    /// CPUID does not advertise `MONITORX`/`MWAITX`.
+    /// The CPU vendor has no backend in this release.
+    UnsupportedCpuVendor,
+    /// CPUID does not advertise AMD `MONITORX`/`MWAITX`.
     MissingMonitorxMwaitx,
+    /// CPUID does not advertise Intel `UMONITOR`/`UMWAIT`.
+    MissingWaitpkg,
     /// CPUID does not advertise an invariant timestamp counter.
     MissingInvariantTsc,
-    /// CPUID does not advertise `RDTSCP`.
+    /// CPUID does not advertise ordered `RDTSCP` reads.
     MissingRdtscp,
+    /// Linux has disabled user-space timestamp-counter reads for this thread.
+    TscAccessDisabled,
     /// A stable timer frequency could not be established.
     UnstableTimerCalibration,
 }
@@ -72,22 +85,71 @@ impl Display for UnsupportedStrategy {
 
 impl Error for UnsupportedStrategy {}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Why the one-time functional preflight rejected a supported backend.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreflightFailure {
+    /// Hardware waits repeatedly returned too quickly to have blocked.
+    WaitDidNotBlock,
+    /// A store to the monitored address was not observed to wake the waiter.
+    StoreWakeNotObserved,
+    /// Scheduling did not provide a conclusive waiter/producer overlap.
+    Inconclusive,
+}
 
-    #[test]
-    fn unsupported_error_exposes_typed_fields_and_display_context() {
-        let error = UnsupportedStrategy {
-            strategy: Strategy::AmdMwaitx,
-            reason: UnsupportedReason::MissingMonitorxMwaitx,
-        };
+/// Failure to initialize or construct the process-wide hardware wait backend.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HardwareWaitError {
+    /// [`crate::HardwareWait::preflight`] has not run in this process.
+    PreflightRequired,
+    /// The one-time initializer panicked; the failure is cached permanently.
+    PreflightPanicked,
+    /// Static capability checks rejected the target.
+    Unsupported(UnsupportedStrategy),
+    /// Static checks passed, but the functional probe failed closed.
+    PreflightFailed {
+        /// Backend exercised by the probe.
+        backend: HardwareBackend,
+        /// Functional condition that was not established.
+        reason: PreflightFailure,
+    },
+}
 
-        assert_eq!(error.strategy(), Strategy::AmdMwaitx);
-        assert_eq!(error.reason(), UnsupportedReason::MissingMonitorxMwaitx);
-        assert_eq!(
-            error.to_string(),
-            "strategy AmdMwaitx is unavailable: MissingMonitorxMwaitx"
-        );
+impl From<UnsupportedStrategy> for HardwareWaitError {
+    fn from(value: UnsupportedStrategy) -> Self {
+        Self::Unsupported(value)
     }
 }
+
+impl Display for HardwareWaitError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreflightRequired => formatter
+                .write_str("hardware wait preflight must run once before constructing a strategy"),
+            Self::PreflightPanicked => formatter.write_str(
+                "hardware wait preflight panicked; hardware waiting remains unavailable",
+            ),
+            Self::Unsupported(error) => Display::fmt(error, formatter),
+            Self::PreflightFailed { backend, reason } => write!(
+                formatter,
+                "hardware wait preflight for {backend:?} failed: {reason:?}"
+            ),
+        }
+    }
+}
+
+impl Error for HardwareWaitError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Unsupported(error) => Some(error),
+            Self::PreflightRequired | Self::PreflightPanicked | Self::PreflightFailed { .. } => {
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/hardware_wait_errors.rs"]
+mod hardware_wait_errors;

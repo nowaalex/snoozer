@@ -1,41 +1,25 @@
 # snoozer
 
-## Change Contract
-
-- **Responsibility:** provide explicit, low-latency userspace waiting primitives and
-  park/unpark-style wrappers. The first production hardware backend is AMD
-  `MONITORX/MWAITX` on Linux x86-64.
-- **Prohibitions and boundaries:** the library does not change CPU affinity, scheduler policy,
-  power policy, or CPU idle settings; it does not silently replace an unsupported hardware
-  strategy with a scheduler-based wait. Intel and Arm backends are planned, not implemented.
-- **Critical invariants:** arm-then-recheck closes the lost-wake window; the watched atomic
-  remains alive and suitably aligned throughout a wait; filtered operations return only after an
-  Acquire load observes their stated condition; raw operations may return after an unclassified
-  wake; `Single*` notification handles have one producer, while `Multi*` handles preserve every
-  coalesced producer publication.
-- **Configuration owners:** crate metadata and build profiles live in
-  [`Cargo.toml`](Cargo.toml), the compiler version in
-  [`rust-toolchain.toml`](rust-toolchain.toml), test policy in
-  [`.config/nextest.toml`](.config/nextest.toml), mutation policy in
-  [`.cargo/mutants.toml`](.cargo/mutants.toml), and measurement parameters in the
-  [benchmark source](benches/wake_latency.rs).
-- **Targeted check:** run `just ci`. Hardware-specific and official benchmark checks are separate
-  because ordinary CI must not depend on privileged CPU configuration or a particular processor.
-
 Snoozer explores the shortest practical path from a published state change to a running
 consumer thread. It exposes both the raw hardware-wake boundary and stronger filtered operations,
 so callers can choose whether an extra wake matters.
 
-The project is AMD/Linux-first. Version 1 targets AMD `MONITORX/MWAITX` on Linux x86-64 and
-also includes busy-spin and spin-then-yield comparison strategies. The internal boundary is
-designed for later Intel `UMONITOR/UMWAIT` and Arm event-based backends, but those backends
-must earn support through their own correctness and interference measurements.
+The hardware strategy supports AMD `MONITORX/MWAITX` and Intel `UMONITOR/UMWAIT` on Linux
+x86-64. Before either instruction path can be constructed, `HardwareWait::preflight()` runs the
+native backend's bounded operational probe and caches its result for the process. Passing this
+startup gate establishes only that the controlled publication/wait trials completed; it neither
+proves the exact reason each wait returned nor makes a latency, power, or universal-performance
+claim.
+
+Intel `UMWAIT` uses the architectural C0.1 hint. The name is an instruction hint, not Linux's CPU
+idle-state naming: Intel C0.1 is distinct from CPU C1, C2, C3, and deeper package or core states.
 
 > [!WARNING]
-> Official benchmarks enable only POLL and exact C1 on the assigned CPUs. C1E and every other CPU
-> idle state, including C2, C3, and deeper states, are disabled because their exit latency conflicts
-> with the minimum-wake-latency objective. Results therefore do not represent the machine's default
-> power-saving configuration.
+> Official benchmarks enable only POLL and exact CPU C1 on the assigned CPUs. C1E and every other
+> CPU idle state, including CPU C2, CPU C3, and deeper states, are disabled because their exit
+> latency conflicts with the minimum-wake-latency objective. Intel UMWAIT's C0.1 hint is separate
+> from that sysfs policy. Results therefore do not represent the machine's default power-saving
+> configuration.
 
 ## Choose an interface
 
@@ -59,6 +43,30 @@ assert_eq!(next, 1);
 // Filters unclassified wakes and returns the newly observed value.
 assert_eq!(strategy.wait_until_different(&generation, observed), 1);
 ```
+
+## Change Contract
+
+- **Responsibility:** provide explicit, low-latency userspace waiting primitives and
+  park/unpark-style wrappers. `HardwareWait` selects the native AMD `MONITORX/MWAITX` or Intel
+  `UMONITOR/UMWAIT` backend on Linux x86-64 only after a successful process-wide preflight.
+- **Prohibitions and boundaries:** the library does not change CPU affinity, scheduler policy,
+  power policy, or CPU idle settings; it does not silently replace an unsupported or failed
+  hardware strategy with a scheduler-based wait. Arm support is outside the current contract.
+- **Critical invariants:** arm-then-recheck closes the lost-wake window; the watched atomic
+  remains alive and suitably aligned throughout a wait; filtered operations return only after an
+  Acquire load observes their stated condition; raw operations may return after an unclassified
+  wake; `Single*` notification handles have one producer, while `Multi*` handles preserve every
+  coalesced producer publication; hardware preflight runs after the final allowed CPU domain and
+  power policy are established, while its helper can still run concurrently; a `fork` child must
+  `exec` before using an inherited hardware-wait cache.
+- **Configuration owners:** crate metadata and build profiles live in
+  [`Cargo.toml`](Cargo.toml), the compiler version in
+  [`rust-toolchain.toml`](rust-toolchain.toml), test policy in
+  [`.config/nextest.toml`](.config/nextest.toml), mutation policy in
+  [`.cargo/mutants.toml`](.cargo/mutants.toml), and measurement parameters in the
+  [benchmark source](benches/wake_latency.rs).
+- **Targeted check:** run `just ci`. Hardware-specific and official benchmark checks are separate
+  because ordinary CI must not depend on privileged CPU configuration or a particular processor.
 
 Use `single_pair` when one producer owns the wake handle. This is the lowest-overhead Parker path:
 
@@ -85,6 +93,21 @@ publication. Both forms have exactly one consumer; `multi` describes producers, 
 
 The exact exported constructors and strategy types are documented in the crate API. The behavior
 and selection rules live in [Waiting API](docs/waiting-api.md).
+
+For the native hardware path, preflight once before constructing the strategy:
+
+```rust
+use snoozer::{HardwareWait, WaitStrategy as _};
+use std::sync::atomic::AtomicU32;
+
+let report = HardwareWait::preflight()?;
+let strategy = HardwareWait::new()?;
+let state = AtomicU32::new(0);
+let _outcome = strategy.wait_if_equal(&state, 0);
+
+println!("using {:?} after {} preflight attempts", report.backend(), report.attempts());
+# Ok::<(), snoozer::HardwareWaitError>(())
+```
 
 ## Documentation
 

@@ -1,5 +1,8 @@
 test_tool = "nextest"
-test_workspace = true
+# Mutants are generated for the Snoozer package. Benchctl is an independent
+# control-plane package and has its own complete CI suite; rebuilding it for
+# every Snoozer mutant adds no coverage.
+test_workspace = false
 all_features = true
 additional_cargo_test_args = ["--profile", "mutants"]
 
@@ -11,12 +14,27 @@ additional_cargo_test_args = ["--profile", "mutants"]
 # remain mutation-tested.
 exclude_re = [
   "src/arch/mod.rs:.*detect_capabilities",
+  "^src/arch/x86_64/mod[.]rs:[0-9]+:[0-9]+: .*\\bdetect_capabilities\\b",
   "src/arch/x86_64/amd.rs:.*detect_capabilities",
+  "^src/arch/x86_64/amd[.]rs:[0-9]+:[0-9]+: .*\\bcalibrate_timer_hz\\b",
   "src/arch/x86_64/amd.rs:.*sample_tsc_frequency_once",
   "src/arch/x86_64/amd.rs:.*read_tsc_ordered",
   "src/arch/x86_64/amd.rs:.*monitorx",
   "src/arch/x86_64/amd.rs:.*mwaitx",
+  "src/arch/x86_64/intel.rs:.*detect_capabilities",
+  "src/arch/x86_64/intel.rs:.*calibrate_timer_hz",
+  "src/arch/x86_64/intel.rs:.*sample_tsc_frequency_once",
+  "src/arch/x86_64/intel.rs:.*read_tsc_ordered",
+  "src/arch/x86_64/intel.rs:.*userspace_tsc_is_enabled",
+  "src/arch/x86_64/intel.rs:.*umonitor",
+  "src/arch/x86_64/intel.rs:.*umwait_c01",
   "src/strategy.rs:.*mwaitx_raw_hardware",
-  "src/strategy.rs:.*mwaitx_raw_unsupported",
-  "src/strategy.rs:.*mwaitx_raw_timeout_unsupported",
+  "src/strategy.rs:.*mwaitx_raw_timeout_hardware",
+  "src/strategy.rs:.*umwait_raw_hardware",
+  "src/strategy.rs:.*umwait_raw_timeout_hardware",
+  "src/strategy.rs:.*umwait_deadline",
+  "src/strategy.rs:.*functional_preflight",
+  "src/strategy.rs:.*preflight_wait_once",
+  "src/strategy.rs:.*hardware_wait_unsupported",
+  "src/strategy.rs:.*run_hardware_preflight",
 ]

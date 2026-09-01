@@ -29,13 +29,8 @@ Run the same unprivileged checks as CI:
 just ci
 ```
 
-The shell suites use only disposable fixtures and fake CPU sysfs trees. They do not invoke the
-privileged runner against the machine's real CPU-idle controls.
-
-The step-level `timeout` commands bound the directly supervised suite process; they are not a
-containment boundary for a descendant that outlives that process. CI additionally bounds the
-whole job and relies on GitHub-hosted runner teardown. When running locally, use a disposable
-process environment and check for surviving test descendants after a forced timeout.
+The Benchctl lifecycle suite uses only disposable fixtures, fake CPU sysfs trees, and fixture
+workloads. It does not invoke `sudo` or change the machine's real CPU-idle controls.
 
 Run mutation testing for changes to protocol and strategy logic:
 
@@ -43,9 +38,12 @@ Run mutation testing for changes to protocol and strategy logic:
 cargo mutants
 ```
 
-The checked-in [cargo-mutants configuration](.cargo/mutants.toml) selects nextest, the workspace,
-and all features. It mutation-tests the portable strategy and token protocols with a bounded
-nextest profile. Pure CPUID decoding and leaf interpretation, sample collection, TSC
+The checked-in [cargo-mutants configuration](.cargo/mutants.toml) selects nextest, the Snoozer
+package, and all features. Benchctl is an independent package with its own complete CI suite and is
+not rebuilt for every Snoozer mutant. The bounded mutation profile excludes the native
+`hardware_wait` test binary: deterministic
+mutations run without host latency noise, while `just hardware-test-strict` supplies the separate
+instruction evidence. Pure CPUID decoding and leaf interpretation, sample collection, TSC
 reconstruction, timer-calibration arithmetic, and the production MWAITX
 arm/recheck/classification protocol stay in that mutation set. Only live CPUID/RDTSCP and
 wall-clock sample acquisition, inline assembly, and the thin native hardware dispatch are
@@ -56,31 +54,33 @@ cross-compiled by CI.
 
 ## Hardware smoke tests
 
-The AMD hardware tests perform bounded real `MONITORX/MWAITX` waits when the host supports them.
-An ordinary optional probe prints a visible `SKIP` diagnostic and returns successfully on an
+The hardware tests run the process-wide preflight and bounded native waits on a supported AMD
+`MONITORX/MWAITX` or Intel `UMONITOR/UMWAIT` host. The Intel production path requests C0.1 only;
+C0.2 is not a production mode, and neither name refers to Linux CPU idle states C2 or C3. An
+ordinary optional probe prints a visible `SKIP` diagnostic and returns successfully on an
 unsupported host:
 
 ```console
-cargo test --test amd_mwaitx -- --nocapture
+just hardware-test
 ```
 
 To cite the command as target-hardware evidence, enable the strict gate so an unsupported target,
-CPU, or timer configuration is a test failure. The strict suite includes an equal-atomic raw wait
-that necessarily reaches one real MWAITX instruction and is bounded by its internal safety timer:
+CPU, timer configuration, or failed operational preflight is a test failure:
 
 ```console
-SNOOZER_REQUIRE_AMD_MWAITX=1 cargo test --test amd_mwaitx
+just hardware-test-strict
 ```
 
-`SNOOZER_REQUIRE_AMD_MWAITX` must be unset or exactly `1`; other values fail visibly so a typo
-cannot silently disable the gate. These tests establish basic notification and timer progress.
-They are not latency benchmarks. Record the CPU model, kernel, and test output when reporting a
-hardware-only failure.
+The strict recipe owns the exact environment variable and integration-test target. These tests are
+bounded operational evidence: they show that the controlled publication/wait trials completed,
+but do not prove the exact event that ended an individual hardware wait. They are not latency
+benchmarks. Record the selected backend, CPU model, kernel, preflight report, and test output when
+reporting a hardware-only failure.
 
 ## Benchmarks
 
 Read [Benchmarking](docs/benchmarking.md) before running measurements. In particular, an official
-run temporarily changes CPU-idle state controls and must preserve its recovery manifest.
+run temporarily changes CPU-idle state controls and must preserve its durable operation journal.
 
 Run a short, non-official smoke measurement without changing CPU-idle state:
 
@@ -89,7 +89,9 @@ cargo bench --bench wake_latency --features benchmark-only -- --smoke
 ```
 
 Smoke mode reads and reports the current CPU-idle configuration and prints a `NON-OFFICIAL`
-warning. It does not change CPU-idle policy and cannot produce a publishable result.
+warning. It records hardware preflight status and selects the native vendor's hardware cases only
+after a pass; on failure it runs only the explicitly portable cases. It does not change CPU-idle
+policy and cannot produce a publishable result.
 
 For an official run, select four logical CPUs that satisfy the topology contract in
 [Benchmarking](docs/benchmarking.md), then use Benchctl. Run it as your normal user; it invokes
@@ -109,9 +111,10 @@ just benchmark-official
 benchmark-official` creates or replaces that receipt and uses it for the run. The `benchctl --help`
 output and [Benchctl documentation](docs/benchctl.md) own the exact control-plane interface.
 
-Official results are valid only when Benchctl and the benchmark complete topology checks, permit
-only POLL and exact C1 on assigned CPUs, disable C1E and every other state including C2/C3+, verify
-the new state, and restore the original state.
+Official results are valid only when Benchctl and the benchmark complete topology and native
+hardware preflight checks, permit only POLL and exact CPU C1 on assigned CPUs, disable C1E and
+every other state including CPU C2/CPU C3+, verify the new state, and restore the original state.
+Intel UMWAIT C0.1 is a separate instruction hint, not that CPU C1 state.
 
 If a prior process was killed before restoration, do not start another run. Inspect its durable
 operation record and recover it as the same user:

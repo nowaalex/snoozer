@@ -1,10 +1,11 @@
 # Benchmarking
 
 > [!CAUTION]
-> **Official benchmarks enable only POLL and exact C1 on every assigned logical CPU. C1E and every
-> other CPU idle state, including C2, C3, and deeper states, are disabled because their exit latency
-> conflicts with the minimum-wake-latency objective. These results do not represent the machine's
-> default power-saving configuration.**
+> **Official benchmarks enable only POLL and exact CPU C1 on every assigned logical CPU. C1E and
+> every other CPU idle state, including CPU C2, CPU C3, and deeper states, are disabled because
+> their exit latency conflicts with the minimum-wake-latency objective. Intel UMWAIT C0.1 and C0.2
+> are instruction hints, not those CPU idle states; Snoozer requests C0.1 only. These results do not
+> represent the machine's default power-saving configuration.**
 
 This page is for engineers who run or interpret wake-latency measurements. It defines the
 experimental controls and recovery obligations. It is not a guide for changing a production
@@ -30,14 +31,16 @@ repetitions.
 
 ## Official and smoke runs
 
-An **official run** uses the privileged runner. The benchmark discovers and validates topology
-and pins its participating threads. The runner applies the documented CPU-idle policy, verifies it
+An **official run** uses Benchctl's privileged coordinator. The benchmark discovers and validates
+topology and pins its participating threads. Benchctl applies the documented CPU-idle policy, verifies it
 by reading sysfs back, starts the benchmark, and restores the exact prior state.
 
 A **smoke run** uses shorter measurement settings and does not satisfy the official evidence
 contract. It reads and reports the current CPU-idle configuration, leaves it unchanged, and prints
-a distinct `NON-OFFICIAL` warning that deeper states may be enabled. Smoke mode is suitable for
-checking output shape and detecting obvious regressions, not for publishing a winner.
+a distinct `NON-OFFICIAL` warning that deeper states may be enabled. It records hardware preflight
+failure and continues with portable spin, yield, and standard-library cases; it never relabels one
+of those cases as the requested hardware backend. Smoke mode is suitable for checking output shape
+and detecting obvious regressions, not for publishing a winner.
 
 Use the commands in [Contributing](../CONTRIBUTING.md). [`benchctl`](benchctl.md) owns the official
 build receipt, CPU-idle lifecycle, and recovery interface; the
@@ -53,17 +56,28 @@ provenance rather than claiming official evidence.
 Official mode also requires readable CPU governor and energy-performance preference values for the
 waiter, victim, producer, and controller CPUs. Any failed check rejects the run. Smoke mode records
 `unknown` for an unreadable power-policy value instead of claiming official evidence.
+Official mode also requires `HardwareWait::preflight()` to pass for the host's native AMD or Intel
+backend before timing begins.
 
 ## Compared strategies
 
-The comparison includes:
+Every host compares the common cases:
 
 - `std::thread::park` as a contextual scheduler baseline;
 - busy spin;
-- spin then yield;
-- AMD `MONITORX/MWAITX`;
-- spin then AMD `MONITORX/MWAITX`;
-- a benchmark-only AMD C1-hint variant as a diagnostic boundary.
+- spin then yield.
+
+After a successful hardware preflight, the native vendor adds its own matrix:
+
+- AMD adds `HardwareWait` using `MONITORX/MWAITX`, `SpinThenHardwareWait`, and the benchmark-only
+  AMD CPU C1-hint diagnostic;
+- Intel adds `HardwareWait` using `UMONITOR/UMWAIT` C0.1 and `SpinThenHardwareWait` using C0.1.
+
+The Intel matrix does not request C0.2 and does not include the AMD CPU C1 diagnostic. Case names
+carry the concrete backend and hint so results from different mechanisms cannot be merged under a
+generic hardware label. A smoke run whose preflight fails contains only the common matrix. An
+official run fails instead because a cross-vendor comparison without the host's native hardware
+case is incomplete.
 
 Direct atomic, single-producer Parker, and multi-producer Parker forms are measured where
 applicable, including raw operations that expose unclassified wakes and filtered operations that
@@ -73,8 +87,9 @@ the notification publication contract: a Release store for `single_parker` and a
 swept over the values owned by the benchmark configuration. A result must name its exact strategy,
 surface, and parameters; the repository does not assert one universal optimum.
 
-The C1 diagnostic is available only when the `benchmark-only` Cargo feature is enabled. The
-official build helper enables it; an ordinary library build does not expose that diagnostic API.
+The AMD CPU C1 diagnostic is available only when the `benchmark-only` Cargo feature is enabled.
+The official Benchctl build enables it; an ordinary library build does not expose that diagnostic
+API. It is unrelated to Intel UMWAIT C0.1.
 
 ## Workloads
 
@@ -114,6 +129,8 @@ with every result rather than copied into this document.
 Cycle timing is accepted only when preflight can establish the required processor and operating
 system properties. The benchmark checks:
 
+- the process-wide `HardwareWait::preflight()` result, including its selected backend, attempts,
+  observed store-wake trials, and baseline duration;
 - invariant timestamp-counter support and the required ordered timestamp instruction;
 - the active Linux clocksource;
 - stable cycle-to-time calibration;
@@ -131,6 +148,12 @@ Every latency result reports cycles and calibrated time, distribution percentile
 public-timeout count, unclassified-wake count, and invalid-sample count. Each corrected cycle
 sample is also emitted in observation order as a machine-readable latency record.
 
+Hardware preflight is a mandatory bounded operational gate for hardware cases, not a reason oracle
+or performance evidence. A successful trial does not prove which event ended `MWAITX` or `UMWAIT`,
+and a successful Intel preflight must not be reported as verified latency, power, or
+SMT-interference. Those claims require the controlled measurements described in this document on
+the named processor.
+
 ## CPU-idle state lifecycle
 
 Benchctl is the current lifecycle owner. It journals the exact original values before mutation,
@@ -138,27 +161,26 @@ uses one privileged coordinator and a crash guardian to drain the workload proce
 performs conditional restoration. `status` and `recover` operate on the durable journal; a
 conflicting external CPU-idle change is retained for explicit resolution rather than overwritten.
 The complete operational contract, including timeouts and recovery semantics, is in
-[Benchctl](benchctl.md). The legacy shell helpers below remain compatibility evidence during the
-migration; do not use them for new official runs.
+[Benchctl](benchctl.md).
 
 The library never changes CPU idle states. Benchctl implements the operational boundary with these
 obligations:
 
 1. Acquire an exclusive lock so two official runs cannot modify the same state.
 2. Discover all idle states on every assigned logical CPU.
-3. Save each exact original `disable` value in a private recovery manifest.
-4. Permit only POLL and exact C1; disable C1E and every other state, including C2, C3, and
-   deeper or unknown states.
+3. Save each exact original `disable` value in the durable versioned operation journal.
+4. Permit only POLL and exact CPU C1; disable C1E and every other state, including CPU C2, CPU C3,
+   and deeper or unknown states.
 5. Read every value back and refuse timing if the requested state was not applied.
 6. Print the warning at the top of this page before the first measurement.
 7. Restore every original value on success, ordinary failure, and handled termination signals.
-8. Preserve a dirty marker when restoration is incomplete so the next run fails closed and gives
-   a recovery path.
+8. Preserve the non-restored journal stage when restoration is incomplete so the next run fails
+   closed and exposes the recorded recovery path.
 
 The benchmark binary performs its own read-only verification against the kernel CPU sysfs tree. It
-refuses official timing if any state other than exact POLL/C1 is enabled on an assigned CPU, even if
-it was launched without the runner. `SNOOZER_SYSFS_ROOT` is accepted only by non-official smoke
-runs; official mode rejects the override instead of trusting a custom tree.
+refuses official timing if any state other than exact POLL/CPU C1 is enabled on an assigned CPU,
+even if it was launched without Benchctl. `SNOOZER_SYSFS_ROOT` is accepted only by non-official
+smoke runs; official mode rejects the override instead of trusting a custom tree.
 
 For real sysfs, the normal-user client starts the same Benchctl executable once through `sudo`.
 The root coordinator owns the fixed state directory, journal and sysfs writes. It launches the
@@ -185,12 +207,6 @@ This is trusted process-group supervision, not containment of hostile code. A wo
 limited to the fixed kernel-owned CPU sysfs tree and fixed root-owned state directory; alternate
 roots are hidden integration-test seams.
 
-During migration Benchctl uses the same global lock as the shell runner. It rejects new work while
-an old `SNOOZER_GLOBAL_DIRTY_V1` record exists and can recover its referenced
-`SNOOZER_CPUIDLE_V2` manifest after validating ownership, mode, boot, paths, names, values and exact
-inventory. Unknown formats fail closed. The legacy scripts and their fixture tests remain in CI as
-compatibility evidence, not as the official command path.
-
 ## Result provenance
 
 Machine-readable output records at least:
@@ -201,6 +217,7 @@ Machine-readable output records at least:
 - CPU model, microcode, kernel, and logical/physical topology;
 - governor, energy-performance preference, active clocksource, and observed idle-state table;
 - strategy, API contract, spin settings, timer calibration, and sample counts;
+- hardware preflight status and, on success, its native backend and probe measurements;
 - timestamp offset, uncertainty, correction, and the victim-only control description;
 - thread-to-CPU assignment;
 - treatment/control order and repetition;
@@ -237,6 +254,12 @@ not a second Git query from the benchmark process. Smoke output has `provenance_
 present a v1 tracked-only flag as proof of a completely clean working tree. Writers emit only their
 current schema and do not duplicate deprecated fields as aliases.
 
+`snoozer-wake-latency-v3` adds a `hardware_preflight` object. A passed record names the backend and
+contains the attempt count, observed store-wake trial count, and baseline wait duration. A failed smoke
+record carries a typed-status label and diagnostic text and has no hardware cases. The selected
+case names distinguish AMD MWAITX, AMD CPU C1 diagnostics, and Intel UMWAIT C0.1. Earlier schema
+versions must not infer this information from CPU vendor or case-name substrings.
+
 Console output begins with the mode-appropriate CPU-idle warning.
 
 ## Interpreting a winner
@@ -251,5 +274,6 @@ p99.9 cycles, then median p50 cycles. Cycle counts, rather than rounded nanoseco
 selection. A failed preflight, an unsupported strategy, an invalid topology, or an incomplete
 state restoration invalidates the run rather than selecting a fallback.
 
-Conclusions apply only to the recorded environment. Intel and Arm implementations require fresh
-platform-specific measurements; AMD results cannot be used as their evidence.
+Conclusions apply only to the recorded environment. AMD results cannot be used as Intel evidence,
+an Intel preflight pass is not an Intel performance result, and Arm remains outside the current
+implementation.

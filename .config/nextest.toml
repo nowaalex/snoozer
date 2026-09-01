@@ -5,14 +5,20 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 
 [profile.ci]
 fail-fast = false
+default-filter = 'not binary(hardware_wait)'
 
 # Mutation operators can deliberately turn a terminating wait into an
 # infinite loop. Kill that individual test before cargo-mutants' outer command
 # timeout so the mutation is reported as caught rather than stalling a shard.
 [profile.mutants]
 fail-fast = true
+default-filter = 'not binary(hardware_wait)'
 slow-timeout = { period = "10s", terminate-after = 1 }
 
+# Native wait evidence belongs to the separate hardware-test-strict gate.
+# Re-running it for every deterministic mutant makes results host-dependent
+# and lets concurrent mutation workers interfere with the latency probe.
+
 [[profile.mutants.overrides]]
-filter = 'test(parker::loom_tests::coalesced_release_sequence_carries_every_producer_publication)'
+filter = 'test(parker::parker_publication_ordering::coalesced_release_sequence_carries_every_producer_publication)'
 slow-timeout = { period = "60s", terminate-after = 2 }
