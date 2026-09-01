@@ -17,7 +17,8 @@ pub use atomic::WaitableAtomic;
 pub use capabilities::{Capabilities, capabilities};
 pub use error::{Strategy, UnsupportedReason, UnsupportedStrategy};
 pub use parker::{
-    NotificationTimeoutResult, ParkResult, ParkTimeoutResult, Parker, Unparker, pair,
+    MultiParker, MultiUnparker, NotificationTimeoutResult, ParkResult, ParkTimeoutResult,
+    SingleParker, SingleUnparker, multi_pair, single_pair,
 };
 pub use strategy::{
     AmdMwaitx, BusySpin, SpinThenAmdMwaitx, SpinThenYield, WaitResult, WaitStrategy,

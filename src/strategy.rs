@@ -648,25 +648,23 @@ impl StrategyImpl for TestGateStrategy {
 impl_wait_strategy!(TestGateStrategy);
 
 #[cfg(test)]
-pub(crate) struct TestBudgetStrategy {
-    observed_budgets: std::sync::Arc<std::sync::Mutex<Vec<Duration>>>,
+pub(crate) struct TestTimeoutGateStrategy {
+    reached: std::sync::Arc<std::sync::Barrier>,
+    released: std::sync::Arc<std::sync::Barrier>,
 }
 
 #[cfg(test)]
-impl TestBudgetStrategy {
-    pub(crate) fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Duration>>>) {
-        let observed_budgets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        (
-            Self {
-                observed_budgets: std::sync::Arc::clone(&observed_budgets),
-            },
-            observed_budgets,
-        )
+impl TestTimeoutGateStrategy {
+    pub(crate) fn new(
+        reached: std::sync::Arc<std::sync::Barrier>,
+        released: std::sync::Arc<std::sync::Barrier>,
+    ) -> Self {
+        Self { reached, released }
     }
 }
 
 #[cfg(test)]
-impl StrategyImpl for TestBudgetStrategy {
+impl StrategyImpl for TestTimeoutGateStrategy {
     fn strategy(&self) -> Strategy {
         Strategy::BusySpin
     }
@@ -675,24 +673,21 @@ impl StrategyImpl for TestBudgetStrategy {
         &self,
         atomic: &A,
         expected: A::Value,
-        deadline: Option<Deadline>,
+        _deadline: Option<Deadline>,
     ) -> WaitTimeoutResult<A::Value> {
-        let budget = deadline.map(|value| value.timeout).unwrap_or_default();
-        match self.observed_budgets.lock() {
-            Ok(mut observed) => observed.push(budget),
-            Err(poisoned) => poisoned.into_inner().push(budget),
-        }
         let observed = atomic.__load_acquire();
-        if observed == expected {
-            WaitTimeoutResult::Unclassified
-        } else {
-            WaitTimeoutResult::Changed(observed)
+        if observed != expected {
+            return WaitTimeoutResult::Changed(observed);
         }
+
+        self.reached.wait();
+        self.released.wait();
+        WaitTimeoutResult::TimedOut
     }
 }
 
 #[cfg(test)]
-impl_wait_strategy!(TestBudgetStrategy);
+impl_wait_strategy!(TestTimeoutGateStrategy);
 
 #[cfg(test)]
 mod tests {

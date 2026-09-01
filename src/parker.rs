@@ -4,9 +4,9 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::{WaitStrategy, WaitTimeoutResult};
+use crate::{WaitStrategy, WaitTimeoutResult, WaitUntilTimeoutResult};
 
 const EMPTY_TOKEN: u32 = 0;
 const NOTIFIED_TOKEN: u32 = 1;
@@ -53,52 +53,137 @@ pub enum NotificationTimeoutResult {
     TimedOut,
 }
 
-/// The single-consumer end of a notification pair.
-///
-/// `Parker` is `Send` but intentionally not `Sync`. Its wait methods require
-/// exclusive access, so one consumer owns the token protocol at a time.
-pub struct Parker<S> {
+struct ParkerCore<S> {
     shared: Arc<Shared>,
     strategy: S,
+}
+
+/// The consumer end of a single-producer notification pair.
+///
+/// `Single` describes the producer count. This type always supports exactly
+/// one consumer, just like [`MultiParker`]. It is `Send` but intentionally not
+/// `Sync`, and every park operation requires exclusive access so the consumer
+/// token can never be taken concurrently.
+///
+/// ```compile_fail
+/// use snoozer::{BusySpin, SingleParker};
+///
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<SingleParker<BusySpin>>();
+/// ```
+pub struct SingleParker<S> {
+    core: ParkerCore<S>,
     not_sync: PhantomData<Cell<()>>,
 }
 
-/// The clonable producer end of a notification pair.
+/// The sole producer end of a single-producer notification pair.
+///
+/// This handle is `Send`, but intentionally neither `Sync` nor `Clone`.
+/// [`SingleUnparker::unpark`] requires exclusive access, preserving the
+/// one-producer contract in safe Rust.
+///
+/// ```compile_fail
+/// use snoozer::{SingleUnparker, single_pair, BusySpin};
+///
+/// fn require_sync<T: Sync>() {}
+/// let (_, _unparker): (_, SingleUnparker) = single_pair(BusySpin);
+/// require_sync::<SingleUnparker>();
+/// ```
+///
+/// ```compile_fail
+/// use snoozer::{SingleUnparker, single_pair, BusySpin};
+///
+/// fn require_clone<T: Clone>() {}
+/// let (_, _unparker): (_, SingleUnparker) = single_pair(BusySpin);
+/// require_clone::<SingleUnparker>();
+/// ```
+///
+/// ```compile_fail
+/// use snoozer::{BusySpin, single_pair};
+///
+/// let (_, unparker) = single_pair(BusySpin);
+/// unparker.unpark(); // The sole producer handle requires exclusive access.
+/// ```
+pub struct SingleUnparker {
+    shared: Arc<Shared>,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+/// The consumer end of a multi-producer notification pair.
+///
+/// `Multi` describes the producer count, never the consumer count. There is
+/// still exactly one consumer. This type is `Send` but intentionally not
+/// `Sync`, and every park operation requires exclusive access.
+///
+/// ```compile_fail
+/// use snoozer::{BusySpin, MultiParker};
+///
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<MultiParker<BusySpin>>();
+/// ```
+pub struct MultiParker<S> {
+    core: ParkerCore<S>,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+/// A producer end of a multi-producer notification pair.
+///
+/// This handle is `Send`, `Sync`, and `Clone`, allowing any number of producer
+/// threads. `Multi` never permits multiple consumers; [`MultiParker`] remains
+/// a single-consumer handle.
 #[derive(Clone)]
-pub struct Unparker {
+pub struct MultiUnparker {
     shared: Arc<Shared>,
 }
 
-/// Creates a single-consumer parker and its clonable producer handle.
+/// Creates a pair with exactly one consumer and exactly one producer.
+///
+/// The producer handle is deliberately not clonable or shareable. Use
+/// [`multi_pair`] when more than one producer must publish notifications.
 #[must_use]
-pub fn pair<S: WaitStrategy>(strategy: S) -> (Parker<S>, Unparker) {
+pub fn single_pair<S: WaitStrategy>(strategy: S) -> (SingleParker<S>, SingleUnparker) {
     let shared = Arc::new(Shared {
         token: CacheLineToken(AtomicU32::new(EMPTY_TOKEN)),
     });
     (
-        Parker {
-            shared: Arc::clone(&shared),
-            strategy,
+        SingleParker {
+            core: ParkerCore {
+                shared: Arc::clone(&shared),
+                strategy,
+            },
             not_sync: PhantomData,
         },
-        Unparker { shared },
+        SingleUnparker {
+            shared,
+            not_sync: PhantomData,
+        },
     )
 }
 
-impl<S: WaitStrategy> Parker<S> {
-    /// Returns the configured strategy.
-    #[must_use]
-    pub const fn strategy(&self) -> &S {
-        &self.strategy
-    }
+/// Creates a pair with exactly one consumer and any number of producers.
+///
+/// `Multi` refers only to producers. Cloning the returned [`MultiUnparker`]
+/// adds producers; it does not make [`MultiParker`] safe for multiple
+/// consumers.
+#[must_use]
+pub fn multi_pair<S: WaitStrategy>(strategy: S) -> (MultiParker<S>, MultiUnparker) {
+    let shared = Arc::new(Shared {
+        token: CacheLineToken(AtomicU32::new(EMPTY_TOKEN)),
+    });
+    (
+        MultiParker {
+            core: ParkerCore {
+                shared: Arc::clone(&shared),
+                strategy,
+            },
+            not_sync: PhantomData,
+        },
+        MultiUnparker { shared },
+    )
+}
 
-    /// Consumes a ready token or performs one raw wait attempt.
-    ///
-    /// [`ParkResult::Unclassified`] does not prove that work is available and
-    /// does not synchronize with a producer. Application state must be
-    /// rechecked with an Acquire operation.
-    #[must_use]
-    pub fn park(&mut self) -> ParkResult {
+impl<S: WaitStrategy> ParkerCore<S> {
+    fn park(&mut self) -> ParkResult {
         if self.take_notification() {
             return ParkResult::Notified;
         }
@@ -113,15 +198,22 @@ impl<S: WaitStrategy> Parker<S> {
         }
     }
 
-    /// Absorbs unclassified wakes and returns only after consuming a token.
-    pub fn park_until_notified(&mut self) {
-        while self.park() != ParkResult::Notified {}
+    fn park_until_notified(&mut self) {
+        if self.take_notification() {
+            return;
+        }
+
+        let _observed = self
+            .strategy
+            .wait_until_different(&self.shared.token.0, EMPTY_TOKEN);
+        // This core has exactly one consumer, and producers only change the
+        // token from EMPTY_TOKEN to NOTIFIED_TOKEN. Once the filtered wait has
+        // observed a change, no other safe caller can consume it first.
+        let consumed = self.take_notification();
+        debug_assert!(consumed);
     }
 
-    /// Consumes a ready token or performs one raw wait attempt bounded by
-    /// `timeout`.
-    #[must_use]
-    pub fn park_timeout(&mut self, timeout: Duration) -> ParkTimeoutResult {
+    fn park_timeout(&mut self, timeout: Duration) -> ParkTimeoutResult {
         if self.take_notification() {
             return ParkTimeoutResult::Notified;
         }
@@ -141,52 +233,38 @@ impl<S: WaitStrategy> Parker<S> {
         }
     }
 
-    /// Absorbs unclassified wakes until a token is consumed or `timeout`
-    /// expires.
-    #[must_use]
-    pub fn park_until_notified_timeout(&mut self, timeout: Duration) -> NotificationTimeoutResult {
+    fn park_until_notified_timeout(&mut self, timeout: Duration) -> NotificationTimeoutResult {
         if self.take_notification() {
             return NotificationTimeoutResult::Notified;
         }
 
-        let started = Instant::now();
-        self.park_until_notified_timeout_with(timeout, || started.elapsed())
-    }
-
-    fn park_until_notified_timeout_with<F>(
-        &mut self,
-        timeout: Duration,
-        mut elapsed: F,
-    ) -> NotificationTimeoutResult
-    where
-        F: FnMut() -> Duration,
-    {
-        loop {
-            let elapsed = elapsed();
-            if elapsed >= timeout {
-                return if self.take_notification() {
+        match self
+            .strategy
+            .wait_until_different_timeout(&self.shared.token.0, EMPTY_TOKEN, timeout)
+        {
+            WaitUntilTimeoutResult::Changed(_observed) => {
+                // The single-consumer invariant makes this token exclusively
+                // ours after the filtered wait observes it.
+                let consumed = self.take_notification();
+                debug_assert!(consumed);
+                NotificationTimeoutResult::Notified
+            }
+            WaitUntilTimeoutResult::TimedOut => {
+                if self.take_notification() {
                     NotificationTimeoutResult::Notified
                 } else {
                     NotificationTimeoutResult::TimedOut
-                };
-            }
-
-            match self.park_timeout(timeout - elapsed) {
-                ParkTimeoutResult::Notified => return NotificationTimeoutResult::Notified,
-                ParkTimeoutResult::TimedOut => {
-                    return if self.take_notification() {
-                        NotificationTimeoutResult::Notified
-                    } else {
-                        NotificationTimeoutResult::TimedOut
-                    };
                 }
-                ParkTimeoutResult::Unclassified => {}
             }
         }
     }
 
     #[inline]
     fn take_notification(&self) -> bool {
+        if self.shared.token.0.load(Ordering::Relaxed) != NOTIFIED_TOKEN {
+            return false;
+        }
+
         self.shared
             .token
             .0
@@ -200,10 +278,75 @@ impl<S: WaitStrategy> Parker<S> {
     }
 }
 
-impl Unparker {
+macro_rules! impl_parker {
+    ($parker:ident) => {
+        impl<S: WaitStrategy> $parker<S> {
+            /// Returns the configured strategy.
+            #[must_use]
+            pub const fn strategy(&self) -> &S {
+                &self.core.strategy
+            }
+
+            /// Consumes a ready token or performs one raw wait attempt.
+            ///
+            /// [`ParkResult::Unclassified`] does not prove that work is
+            /// available and does not synchronize with a producer.
+            /// Application state must be rechecked with an Acquire operation.
+            #[must_use]
+            pub fn park(&mut self) -> ParkResult {
+                self.core.park()
+            }
+
+            /// Absorbs unclassified wakes and returns only after consuming a
+            /// notification token.
+            pub fn park_until_notified(&mut self) {
+                self.core.park_until_notified();
+            }
+
+            /// Consumes a ready token or performs one raw wait attempt bounded
+            /// by `timeout`.
+            #[must_use]
+            pub fn park_timeout(&mut self, timeout: Duration) -> ParkTimeoutResult {
+                self.core.park_timeout(timeout)
+            }
+
+            /// Absorbs unclassified wakes until a token is consumed or
+            /// `timeout` expires.
+            ///
+            /// A token already present at entry wins over a zero timeout. If a
+            /// producer publishes at the timeout boundary, one final token
+            /// check decides the result without losing that notification.
+            #[must_use]
+            pub fn park_until_notified_timeout(
+                &mut self,
+                timeout: Duration,
+            ) -> NotificationTimeoutResult {
+                self.core.park_until_notified_timeout(timeout)
+            }
+        }
+    };
+}
+
+impl_parker!(SingleParker);
+impl_parker!(MultiParker);
+
+impl SingleUnparker {
     /// Publishes one notification token with Release ordering.
     ///
     /// Multiple calls before the consumer takes the token coalesce into one.
+    #[inline]
+    pub fn unpark(&mut self) {
+        self.shared.token.0.store(NOTIFIED_TOKEN, Ordering::Release);
+    }
+}
+
+impl MultiUnparker {
+    /// Publishes one notification token with Release ordering.
+    ///
+    /// Concurrent calls from cloned handles coalesce into one token. The
+    /// atomic read-modify-write operations form a release sequence, so the
+    /// consumer's Acquire operation observes state published by every
+    /// producer whose notification has coalesced into that token.
     #[inline]
     pub fn unpark(&self) {
         // Every producer performs an RMW even when the token is already set.
@@ -225,6 +368,30 @@ mod loom_tests {
     const BOTH_PRODUCERS: u32 = FIRST_PRODUCER | SECOND_PRODUCER;
 
     #[test]
+    fn single_producer_store_publishes_before_notification() {
+        loom::model(|| {
+            let token = Arc::new(AtomicU32::new(0));
+            let payload = Arc::new(AtomicUsize::new(0));
+
+            let producer_token = Arc::clone(&token);
+            let producer_payload = Arc::clone(&payload);
+            let producer = thread::spawn(move || {
+                producer_payload.store(17, Ordering::Relaxed);
+                producer_token.store(1, Ordering::Release);
+            });
+
+            while token
+                .compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                thread::yield_now();
+            }
+            assert_eq!(payload.load(Ordering::Relaxed), 17);
+            assert!(producer.join().is_ok());
+        });
+    }
+
+    #[test]
     fn coalesced_release_sequence_carries_every_producer_publication() {
         loom::model(|| {
             let token = Arc::new(AtomicU32::new(0));
@@ -237,7 +404,7 @@ mod loom_tests {
             let first_value = Arc::clone(&first_payload);
             let first = thread::spawn(move || {
                 first_value.store(11, Ordering::Relaxed);
-                publish_token!(first_token, FIRST_PRODUCER);
+                publish_token!(first_token, 1);
                 first_completed.fetch_or(FIRST_PRODUCER, Ordering::Relaxed);
             });
 
@@ -246,7 +413,7 @@ mod loom_tests {
             let second_value = Arc::clone(&second_payload);
             let second = thread::spawn(move || {
                 second_value.store(22, Ordering::Relaxed);
-                publish_token!(second_token, SECOND_PRODUCER);
+                publish_token!(second_token, 1);
                 second_completed.fetch_or(SECOND_PRODUCER, Ordering::Relaxed);
             });
 
@@ -258,8 +425,8 @@ mod loom_tests {
             }
 
             assert_eq!(
-                token.compare_exchange(BOTH_PRODUCERS, 0, Ordering::Acquire, Ordering::Relaxed,),
-                Ok(BOTH_PRODUCERS)
+                token.compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed,),
+                Ok(1)
             );
             assert_eq!(first_payload.load(Ordering::Relaxed), 11);
             assert_eq!(second_payload.load(Ordering::Relaxed), 22);
@@ -275,21 +442,30 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
 
-    use crate::strategy::{TestBudgetStrategy, TestGatePoint, TestGateStrategy};
+    use crate::strategy::{TestGatePoint, TestGateStrategy, TestTimeoutGateStrategy};
     use crate::{BusySpin, SpinThenYield};
 
     use super::*;
 
     #[test]
-    fn notification_before_park_is_consumed() {
-        let (mut parker, unparker) = pair(SpinThenYield::new(0));
+    fn single_notification_before_park_is_consumed() {
+        let (mut parker, mut unparker) = single_pair(SpinThenYield::new(0));
         unparker.unpark();
         assert_eq!(parker.park(), ParkResult::Notified);
     }
 
     #[test]
-    fn notifications_coalesce_into_one_token() {
-        let (mut parker, unparker) = pair(SpinThenYield::new(0));
+    fn single_notifications_coalesce_into_one_token() {
+        let (mut parker, mut unparker) = single_pair(SpinThenYield::new(0));
+        unparker.unpark();
+        unparker.unpark();
+        assert_eq!(parker.park(), ParkResult::Notified);
+        assert_eq!(parker.park(), ParkResult::Unclassified);
+    }
+
+    #[test]
+    fn multi_notifications_coalesce_into_one_token() {
+        let (mut parker, unparker) = multi_pair(SpinThenYield::new(0));
         unparker.unpark();
         unparker.unpark();
         assert_eq!(parker.park(), ParkResult::Notified);
@@ -298,7 +474,7 @@ mod tests {
 
     #[test]
     fn filtered_park_ignores_unclassified_wakes() {
-        let (mut parker, unparker) = pair(SpinThenYield::new(0));
+        let (mut parker, mut unparker) = single_pair(SpinThenYield::new(0));
         let started = Arc::new(Barrier::new(2));
         let consumer_started = Arc::clone(&started);
         let consumer = std::thread::spawn(move || {
@@ -315,7 +491,7 @@ mod tests {
     fn notification_synchronizes_published_state() {
         let published = Arc::new(AtomicBool::new(false));
         let producer_value = Arc::clone(&published);
-        let (mut parker, unparker) = pair(BusySpin);
+        let (mut parker, mut unparker) = single_pair(BusySpin);
         let producer = std::thread::spawn(move || {
             producer_value.store(true, Ordering::Relaxed);
             unparker.unpark();
@@ -337,7 +513,7 @@ mod tests {
             let released = Arc::new(Barrier::new(2));
             let strategy =
                 TestGateStrategy::new(point, Arc::clone(&reached), Arc::clone(&released));
-            let (mut parker, unparker) = pair(strategy);
+            let (mut parker, mut unparker) = single_pair(strategy);
             let consumer = std::thread::spawn(move || parker.park());
 
             reached.wait();
@@ -352,7 +528,7 @@ mod tests {
 
     #[test]
     fn zero_timeout_consumes_a_ready_token_first() {
-        let (mut parker, unparker) = pair(BusySpin);
+        let (mut parker, mut unparker) = single_pair(BusySpin);
         unparker.unpark();
         assert_eq!(
             parker.park_until_notified_timeout(Duration::ZERO),
@@ -365,30 +541,35 @@ mod tests {
     }
 
     #[test]
-    fn filtered_timeout_passes_only_the_remaining_budget() {
-        let timeout = Duration::from_millis(50);
-        let (strategy, observed_budgets) = TestBudgetStrategy::new();
-        let (mut parker, _unparker) = pair(strategy);
-        let mut elapsed = [0, 10, 20, 50].into_iter().map(Duration::from_millis);
+    fn final_notification_wins_at_filtered_timeout_boundary() {
+        let reached = Arc::new(Barrier::new(2));
+        let released = Arc::new(Barrier::new(2));
+        let strategy = TestTimeoutGateStrategy::new(Arc::clone(&reached), Arc::clone(&released));
+        let (mut parker, mut unparker) = single_pair(strategy);
+        let consumer = std::thread::spawn(move || {
+            parker.park_until_notified_timeout(Duration::from_millis(1))
+        });
 
-        assert_eq!(
-            parker.park_until_notified_timeout_with(timeout, || {
-                elapsed.next().unwrap_or(timeout)
-            }),
-            NotificationTimeoutResult::TimedOut
-        );
-        let observed = match observed_budgets.lock() {
-            Ok(observed) => observed,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        assert_eq!(
-            observed.as_slice(),
-            [
-                Duration::from_millis(50),
-                Duration::from_millis(40),
-                Duration::from_millis(30),
-            ]
-        );
-        assert!(observed.windows(2).all(|window| window[1] < window[0]));
+        reached.wait();
+        unparker.unpark();
+        released.wait();
+        match consumer.join() {
+            Ok(result) => assert_eq!(result, NotificationTimeoutResult::Notified),
+            Err(_) => panic!("consumer thread panicked"),
+        }
+    }
+
+    #[test]
+    fn public_handles_have_the_positive_auto_traits() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        fn assert_clone<T: Clone>() {}
+
+        assert_send::<SingleParker<BusySpin>>();
+        assert_send::<SingleUnparker>();
+        assert_send::<MultiParker<BusySpin>>();
+        assert_send::<MultiUnparker>();
+        assert_sync::<MultiUnparker>();
+        assert_clone::<MultiUnparker>();
     }
 }

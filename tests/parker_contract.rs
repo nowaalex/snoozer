@@ -2,11 +2,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use snoozer::{BusySpin, NotificationTimeoutResult, ParkResult, SpinThenYield, pair};
+use snoozer::{
+    BusySpin, NotificationTimeoutResult, ParkResult, SpinThenYield, multi_pair, single_pair,
+};
 
 #[test]
 fn early_notification_is_not_lost_and_duplicates_coalesce() {
-    let (mut parker, unparker) = pair(SpinThenYield::new(0));
+    let (mut parker, mut unparker) = single_pair(SpinThenYield::new(0));
     unparker.unpark();
     unparker.unpark();
 
@@ -18,13 +20,13 @@ fn early_notification_is_not_lost_and_duplicates_coalesce() {
 fn notification_during_wait_is_not_lost() {
     let published = Arc::new(AtomicUsize::new(0));
     let consumer_state = Arc::clone(&published);
-    let (mut parker, unparker) = pair(BusySpin);
+    let (mut parker, mut unparker) = single_pair(BusySpin);
 
     let consumer = std::thread::spawn(move || {
         parker.park_until_notified();
-        consumer_state.load(Ordering::Acquire)
+        consumer_state.load(Ordering::Relaxed)
     });
-    published.store(7, Ordering::Release);
+    published.store(7, Ordering::Relaxed);
     unparker.unpark();
 
     match consumer.join() {
@@ -35,7 +37,7 @@ fn notification_during_wait_is_not_lost() {
 
 #[test]
 fn timeout_does_not_consume_a_later_notification() {
-    let (mut parker, unparker) = pair(SpinThenYield::new(0));
+    let (mut parker, mut unparker) = single_pair(SpinThenYield::new(0));
     assert_eq!(
         parker.park_until_notified_timeout(Duration::ZERO),
         NotificationTimeoutResult::TimedOut
@@ -47,7 +49,7 @@ fn timeout_does_not_consume_a_later_notification() {
 
 #[test]
 fn coalesced_token_acquires_every_concurrent_producer_publication() {
-    let (mut parker, unparker) = pair(SpinThenYield::new(0));
+    let (mut parker, unparker) = multi_pair(SpinThenYield::new(0));
     let published = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
     let completed = Arc::new(AtomicUsize::new(0));
     let first = unparker.clone();
