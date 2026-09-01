@@ -32,9 +32,10 @@ designed for later Intel `UMONITOR/UMWAIT` and Arm event-based backends, but tho
 must earn support through their own correctness and interference measurements.
 
 > [!WARNING]
-> Official benchmarks disable C2, C3, and every deeper CPU idle state on the assigned CPUs.
-> Their exit latency conflicts with the minimum-wake-latency objective. Results therefore do not
-> represent the machine's default power-saving configuration.
+> Official benchmarks enable only POLL and exact C1 on the assigned CPUs. C1E and every other CPU
+> idle state, including C2, C3, and deeper states, are disabled because their exit latency conflicts
+> with the minimum-wake-latency objective. Results therefore do not represent the machine's default
+> power-saving configuration.
 
 ## Choose an interface
 

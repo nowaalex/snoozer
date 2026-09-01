@@ -1,9 +1,10 @@
 # Benchmarking
 
 > [!CAUTION]
-> **Official benchmarks disable C2, C3, and every deeper CPU idle state on every assigned logical
-> CPU. Their exit latency conflicts with the minimum-wake-latency objective. These results do not
-> represent the machine's default power-saving configuration.**
+> **Official benchmarks enable only POLL and exact C1 on every assigned logical CPU. C1E and every
+> other CPU idle state, including C2, C3, and deeper states, are disabled because their exit latency
+> conflicts with the minimum-wake-latency objective. These results do not represent the machine's
+> default power-saving configuration.**
 
 This page is for engineers who run or interpret wake-latency measurements. It defines the
 experimental controls and recovery obligations. It is not a guide for changing a production
@@ -136,7 +137,8 @@ with these obligations:
 1. Acquire an exclusive lock so two official runs cannot modify the same state.
 2. Discover all idle states on every assigned logical CPU.
 3. Save each exact original `disable` value in a private recovery manifest.
-4. Permit only POLL and C1; disable C2, C3, and every deeper or unknown state.
+4. Permit only POLL and exact C1; disable C1E and every other state, including C2, C3, and
+   deeper or unknown states.
 5. Read every value back and refuse timing if the requested state was not applied.
 6. Print the warning at the top of this page before the first measurement.
 7. Restore every original value on success, ordinary failure, and handled termination signals.
@@ -144,27 +146,55 @@ with these obligations:
    a recovery path.
 
 The benchmark binary performs its own read-only verification against the kernel CPU sysfs tree. It
-refuses official timing if a deeper state is enabled on an assigned CPU, even if it was launched
-without the runner. `SNOOZER_SYSFS_ROOT` is accepted only by non-official smoke runs; official mode
-rejects the override instead of trusting a custom tree.
+refuses official timing if any state other than exact POLL/C1 is enabled on an assigned CPU, even if
+it was launched without the runner. `SNOOZER_SYSFS_ROOT` is accepted only by non-official smoke
+runs; official mode rejects the override instead of trusting a custom tree.
 
 Before authorizing the benchmark, the runner starts a separate crash guardian that inherits the
 private `active-run.lock`. The benchmark process group does not inherit that lock or the mutation
-locks. Once the runner has published a verified benchmark process group, the guardian sends that
-group `SIGKILL` if the runner disappears, including after `SIGKILL`. It repeatedly inspects the
-group until it proves that no live non-zombie process remains and only then releases the active
-lock. If process inspection fails or the group cannot be proved empty, the guardian keeps the
-active lock and waits instead of allowing recovery to write while a benchmark process may still be
-running.
+locks. The runner writes and synchronizes the verified PGID in a private candidate, validates the
+complete value, and then publishes a separate ready marker with a shell builtin before GO. Marker
+creation cannot outlive a killed runner, and the guardian reads the candidate only after the marker
+exists. A crash before publication therefore exposes no partial or guessed PGID to the guardian,
+sends no group signal, and cannot launch the benchmark. The same atomic marker arms the supervisor.
+After marker creation, an unreadable or malformed candidate is ambiguous, never unpublished: the
+guardian retains the active lock and retries, while the supervisor and anchor preserve the PGID.
+If the runner dies after publication but before GO, the supervisor does not apply the
+pre-publication startup timeout, the anchor's self-held FIFO remains blocked, and no benchmark
+launches. Supervisor and anchor preserve the original PGID until guardian `SIGKILL` and drain proof.
+Once publication succeeds, the guardian sends that group `SIGKILL` if the runner disappears,
+including after `SIGKILL`. It repeatedly inspects the group until it proves that no live non-zombie
+process remains and only then releases the active lock. If process inspection fails or the group
+cannot be proved empty, the guardian keeps the active lock and waits instead of allowing recovery
+to write while a benchmark process may still be running.
+
+Normal and handled-signal teardown use the same ownership rule. After the workload has stopped, the
+runner leaves the supervisor and anchor in the verified group and publishes a guardian drain
+request. The guardian performs the final group `SIGKILL`, proves the group empty, and acknowledges
+the request before the runner explicitly reaps the supervisor. Runner death on either side of that
+request therefore cannot leave an armed guardian that may send another signal to a reused numeric
+PGID. A missing, unreadable, malformed, or mismatched proof request after release publication also
+retains the active lock and PGID owners until the exact request can be validated.
 
 The guardian does not restore CPU-idle policy. After runner `SIGKILL`, the assigned CPUs may remain
 in the benchmark policy and the local and global dirty-owner records remain authoritative. Before
-another run, use the runner's explicit recovery command. Recovery waits for the active lock,
-validates the global dirty-owner record and its private manifest, and restores only the recorded
-values. The global record identifies the authoritative private state directory even when recovery
-starts with a different `SNOOZER_STATE_DIR`; recovery still requires the recorded user and selected
-sysfs root. Power loss and a kernel crash cannot run either in-process cleanup or the guardian, so
-never infer restoration or guess original values when a recovery record remains.
+another run, use the runner's explicit recovery command. Recovery first makes a bounded wait for
+the prior mutation lock, including a transient inherited descriptor, and then makes a separate
+bounded wait for the guardian-owned active lock. Either timeout fails before restoration and leaves
+the recovery records authoritative; the exact budgets are owned by the
+[`run_with_cpuidle.sh`](../scripts/run_with_cpuidle.sh) constants. After both locks are acquired,
+recovery validates the global dirty-owner record and its private manifest and restores only the
+recorded values. The global record identifies the authoritative private state directory even when
+recovery starts with a different `SNOOZER_STATE_DIR`; recovery still requires the recorded user and
+selected sysfs root. Power loss and a kernel crash cannot run either in-process cleanup or the
+guardian, so never infer restoration or guess original values when a recovery record remains.
+
+The runner's mode-`0700` state directory and mode-`0600` metadata protect against other UIDs; they
+are not an isolation boundary against hostile processes running as the same UID. The benchmark
+binary, the state directory contents, and other same-UID processes are trusted not to rewrite
+guardian metadata or signal the runner, supervisor, anchor, or guardian. Run an untrusted benchmark
+under a separately privileged supervisor and a distinct UID with an independently protected
+control channel; this shell runner does not provide that adversarial isolation.
 
 The path checks assume the real CPU sysfs tree remains kernel-owned and cannot be renamed by an
 unprivileged process while the runner is operating. `SNOOZER_SYSFS_ROOT` exists for smoke tests and

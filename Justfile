@@ -86,7 +86,7 @@ benchmark-build:
 benchmark-recover:
     scripts/run_with_cpuidle.sh --recover
 
-# Run an official benchmark; temporarily disables C2/C3+ on the four assigned CPUs.
+# Run officially with only POLL/exact C1; disables C1E and all other states, including C2/C3+.
 benchmark-official:
     #!/bin/sh
     set -eu

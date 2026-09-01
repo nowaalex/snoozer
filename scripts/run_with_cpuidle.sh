@@ -50,7 +50,10 @@ Usage:
   run_with_cpuidle.sh --recover
 
 Only the selected CPUs are changed. POLL and exact C1 are enabled; C1E, C2,
-C3, and every other state are disabled. Every original value is restored.
+C3, and every other state are disabled. Original values are restored after
+success, ordinary failure, and handled signals. After SIGKILL, power loss, or
+restore failure, keep the recovery records and run --recover; failed recovery
+preserves those records and never guesses original values.
 EOF
     exit "$usage_status"
 }
@@ -196,7 +199,16 @@ else
 fi
 exec 8>>"$global_lock_file"
 reject_symlink "$global_lock_file" "global cpuidle lock"
-flock -n 8 || die "another cpuidle runner is mutating this sysfs CPU tree"
+if [ "$recover" -eq 1 ]; then
+    # A runner killed while an external polling command is alive can leave its
+    # inherited descriptor open for a few milliseconds. Recovery waits through
+    # that bounded handoff instead of spuriously failing before the guardian's
+    # active-lock proof becomes authoritative.
+    flock -w "$ACTIVE_RECOVERY_WAIT_SECONDS" 8 \
+        || die "timed out waiting for the prior cpuidle mutation lock"
+else
+    flock -n 8 || die "another cpuidle runner is mutating this sysfs CPU tree"
+fi
 
 boot_id=$(tr -d '[:space:]' </proc/sys/kernel/random/boot_id) \
     || die "cannot read the Linux boot identity"
@@ -596,7 +608,9 @@ remove_stale_runtime_files() {
         "$state_root"/supervisor-anchor-ready.* \
         "$state_root"/supervisor-anchor-release.* \
         "$state_root"/guardian-ready.* "$state_root"/guardian-release.* \
-        "$state_root"/guardian-group.* "$state_root"/guardian-proof-request.* \
+        "$state_root"/guardian-group.* \
+        "$state_root"/guardian-group-candidate.* \
+        "$state_root"/guardian-proof-request.* \
         "$state_root"/guardian-proof-ready.*; do
         if [ -e "$runtime_file" ] || [ -L "$runtime_file" ]; then
             rm -f "$runtime_file" || die "cannot remove stale benchmark runtime file"
@@ -694,6 +708,7 @@ guardian_group_verified=0
 guardian_ready_file=
 guardian_release_file=
 guardian_group_file=
+guardian_group_candidate=
 guardian_proof_request_file=
 guardian_proof_ready_file=
 supervisor_status_file=
@@ -741,6 +756,7 @@ cleanup() {
         "${supervisor_go_file:-}" "${supervisor_anchor_ready_file:-}" \
         "${supervisor_anchor_release_file:-}" "${guardian_ready_file:-}" \
         "${guardian_release_file:-}" "${guardian_group_file:-}" \
+        "${guardian_group_candidate:-}" \
         "${guardian_proof_request_file:-}" "${guardian_proof_ready_file:-}" \
         2>/dev/null || true
     supervisor_status_file=
@@ -862,16 +878,6 @@ process_start_ticks() {
     ' "/proc/$inspected_pid/stat"
 }
 
-supervisor_is_stopped() {
-    inspected_pid=$1
-    supervisor_state=$(ps -o stat= -p "$inspected_pid" 2>/dev/null | tr -d '[:space:]') \
-        || return 1
-    case "$supervisor_state" in
-        T*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 monotonic_milliseconds() {
     awk '
         NR == 1 && $1 ~ /^[0-9]+\.[0-9]+$/ {
@@ -890,20 +896,29 @@ termination_budget_remaining() {
     [ "$termination_now" -lt "$termination_deadline" ]
 }
 
-prove_killed_group_drained() {
+release_guardian_and_drain_group() {
     inspected_group=$1
+    inspected_supervisor=$2
     [ -n "$guardian_pid" ] && [ "$guardian_group_verified" -eq 1 ] || return 1
     printf '%s\n' "$inspected_group" >"$guardian_proof_request_file" || return 1
-    while [ ! -s "$guardian_proof_ready_file" ]; do
-        guardian_state=$(ps -o stat= -p "$guardian_pid" 2>/dev/null | tr -d '[:space:]') \
-            || guardian_state=
-        case "$guardian_state" in
-            ''|Z*) return 1 ;;
-        esac
-        sleep 0.05
-    done
-    proved_group=$(tr -d '[:space:]' <"$guardian_proof_ready_file") || return 1
-    [ "$proved_group" = "$inspected_group" ]
+    : >"$guardian_release_file" || return 1
+    # Do not explicitly reap the directly owned supervisor until the guardian
+    # has completed and the exact drain proof has been validated. The grouped
+    # redirection also keeps shells from printing an asynchronous
+    # "Killed setsid ..." diagnostic.
+    {
+        wait "$guardian_pid" || {
+            guardian_pid=
+            guardian_group_verified=0
+            return 1
+        }
+        guardian_pid=
+        guardian_group_verified=0
+        proved_group=$(tr -d '[:space:]' <"$guardian_proof_ready_file") \
+            || return 1
+        [ "$proved_group" = "$inspected_group" ] || return 1
+        wait "$inspected_supervisor" || true
+    } 2>/dev/null
 }
 
 signal_child_group() {
@@ -915,29 +930,6 @@ signal_child_group() {
     kill -s "$child_signal" -- "-$inspected_group" 2>/dev/null
 }
 
-release_child_anchor() {
-    inspected_anchor=$1
-    [ "$child_anchor_verified" -eq 1 ] || return 1
-    [ "$child_anchor_release_fd_open" -eq 1 ] || return 1
-    if [ "${SNOOZER_TEST_ANCHOR_EXIT_BEFORE_RELEASE:-}" = 1 ]; then
-        kill -KILL "$inspected_anchor" 2>/dev/null || true
-        release_test_attempt=0
-        while process_is_live_non_zombie "$inspected_anchor" \
-            && [ "$release_test_attempt" -lt "$SUPERVISOR_STARTUP_POLLS" ]; do
-            sleep 0.01
-            release_test_attempt=$((release_test_attempt + 1))
-        done
-        ! process_is_live_non_zombie "$inspected_anchor" || return 1
-    fi
-    printf 'release\n' >&6 || return 1
-    while process_is_live_non_zombie "$inspected_anchor" \
-        && termination_budget_remaining; do
-        sleep 0.05
-        termination_attempt=$((termination_attempt + 1))
-    done
-    ! process_is_live_non_zombie "$inspected_anchor"
-}
-
 terminate_child() {
     inspected_supervisor=$1
     inspected_group=$2
@@ -947,20 +939,13 @@ terminate_child() {
         && [ "$child_anchor_verified" -eq 1 ] \
         && [ -n "$inspected_group" ] \
         && [ -n "$inspected_anchor" ] || return 1
-    child_group_killed=0
-    if [ "$termination_mode" = immediate ] \
-        || ! process_is_live_non_zombie "$inspected_supervisor" \
-        || ! process_is_live_non_zombie "$inspected_anchor"; then
-        signal_child_group KILL "$inspected_group" || true
-        child_group_killed=1
-    else
+    if [ "$termination_mode" != immediate ] \
+        && process_is_live_non_zombie "$inspected_supervisor" \
+        && process_is_live_non_zombie "$inspected_anchor"; then
         signal_child_group TERM "$inspected_group" || true
         termination_attempt=0
         termination_started=$(monotonic_milliseconds) || termination_started=
-        if [ -z "$termination_started" ]; then
-            signal_child_group KILL "$inspected_group" || true
-            child_group_killed=1
-        else
+        if [ -n "$termination_started" ]; then
             termination_deadline=$((termination_started + KILL_GRACE_MILLISECONDS))
             while process_group_has_live_descendants "$inspected_group" \
                 "$inspected_supervisor" "$inspected_anchor" \
@@ -968,41 +953,21 @@ terminate_child() {
                 sleep 0.05
                 termination_attempt=$((termination_attempt + 1))
             done
-            if process_group_has_live_descendants "$inspected_group" \
-                "$inspected_supervisor" "$inspected_anchor"; then
-                signal_child_group KILL "$inspected_group" || true
-                child_group_killed=1
-            else
-                # Do not release the anchor or send CONT before the supervisor
-                # reaches its final STOP; otherwise a fast benchmark exit could
-                # miss the wake and release the stable group identity early.
-                while ! supervisor_is_stopped "$inspected_supervisor" \
-                    && process_is_live_non_zombie "$inspected_supervisor" \
-                    && termination_budget_remaining; do
-                    sleep 0.05
-                    termination_attempt=$((termination_attempt + 1))
-                done
-                if supervisor_is_stopped "$inspected_supervisor" \
-                    && release_child_anchor "$inspected_anchor"; then
-                    kill -CONT "$inspected_supervisor" 2>/dev/null || {
-                        signal_child_group KILL "$inspected_group" || true
-                        child_group_killed=1
-                    }
-                else
-                    signal_child_group KILL "$inspected_group" || true
-                    child_group_killed=1
-                fi
-            fi
         fi
     fi
-    # Keep the verified group identity until the guardian proves every
-    # non-zombie member is gone. Only then may the supervisor be reaped.
-    if [ "$child_group_killed" -eq 1 ]; then
-        prove_killed_group_drained "$inspected_group" || return 1
+    # The guardian owns the final KILL and drain proof while the anchor still
+    # holds the verified PGID. Publishing its release request before the KILL
+    # also makes runner death at this boundary safe: the guardian completes the
+    # same drain protocol instead of ever signaling a reusable numeric PGID.
+    if [ "${SNOOZER_TEST_KILL_AFTER_BENCHMARK_DRAIN:-}" = 1 ]; then
+        ! process_group_has_live_descendants "$inspected_group" \
+            "$inspected_supervisor" "$inspected_anchor" || return 1
+        process_is_live_non_zombie "$inspected_supervisor" || return 1
+        process_is_live_non_zombie "$inspected_anchor" || return 1
+        kill -KILL "$$"
+        return 1
     fi
-    if [ -n "$inspected_supervisor" ]; then
-        wait "$inspected_supervisor" 2>/dev/null || true
-    fi
+    release_guardian_and_drain_group "$inspected_group" "$inspected_supervisor" || return 1
     child_group_verified=0
     child_anchor_verified=0
     child_group_id=
@@ -1168,7 +1133,7 @@ case "${SNOOZER_TEST_SIGNAL_AFTER_APPLY:-}" in
     *) die "unsupported test signal after apply" ;;
 esac
 
-echo "C2/C3 and every deeper CPU idle state are disabled on the assigned CPUs because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration."
+echo "Only POLL and exact C1 are enabled on the assigned CPUs. C1E and every other CPU idle state, including C2/C3 and deeper states, are disabled because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration."
 
 supervisor_launching=1
 runner_start_ticks=$(process_start_ticks "$$") \
@@ -1179,6 +1144,8 @@ guardian_release_file=$(mktemp "$state_root/guardian-release.XXXXXX") \
     || die "cannot allocate guardian release file"
 guardian_group_file=$(mktemp "$state_root/guardian-group.XXXXXX") \
     || die "cannot allocate guardian group file"
+guardian_group_candidate=$(mktemp "$state_root/guardian-group-candidate.XXXXXX") \
+    || die "cannot allocate benchmark process-group publication candidate"
 guardian_proof_request_file=$(mktemp "$state_root/guardian-proof-request.XXXXXX") \
     || die "cannot allocate guardian proof request file"
 guardian_proof_ready_file=$(mktemp "$state_root/guardian-proof-ready.XXXXXX") \
@@ -1195,10 +1162,11 @@ setsid sh -c '
     ready_file=$1
     release_file=$2
     group_file=$3
-    proof_request_file=$4
-    proof_ready_file=$5
-    runner_pid=$6
-    runner_ticks=$7
+    group_candidate=$4
+    proof_request_file=$5
+    proof_ready_file=$6
+    runner_pid=$7
+    runner_ticks=$8
     exec 8>&- 9>&- || exit 125
     trap "" HUP INT TERM
 
@@ -1234,6 +1202,14 @@ setsid sh -c '
             END { exit !found }
         '\''
     }
+    group_scan_before_kill() {
+        inspected_group=$1
+        processes=$(ps -eo pgid=,stat= 2>/dev/null) || return 2
+        printf "%s\n" "$processes" | awk -v expected_group="$inspected_group" '\''
+            $1 == expected_group && $2 !~ /^Z/ { found = 1 }
+            END { exit !found }
+        '\''
+    }
     prove_empty() {
         inspected_group=$1
         while :; do
@@ -1246,10 +1222,55 @@ setsid sh -c '
             esac
         done
     }
+    kill_and_prove_empty() {
+        inspected_group=$1
+        # A live member must still own the verified PGID when it is signaled.
+        # Empty means the work is already drained; inspection failure waits
+        # fail-closed instead of risking a signal to a recycled process group.
+        while :; do
+            group_scan_before_kill "$inspected_group"
+            scan_status=$?
+            case "$scan_status" in
+                0) break ;;
+                1) return 0 ;;
+                2) sleep 0.05 ;;
+                *) sleep 0.05 ;;
+            esac
+        done
+        while [ -n "${SNOOZER_TEST_GUARDIAN_PRE_GROUP_KILL_BLOCK_FILE:-}" ] \
+            && [ -e "$SNOOZER_TEST_GUARDIAN_PRE_GROUP_KILL_BLOCK_FILE" ]; do
+            sleep 0.05
+        done
+        if [ -n "${SNOOZER_TEST_GUARDIAN_SIGNAL_FILE:-}" ]; then
+            printf "%s\n" "$inspected_group" \
+                >"$SNOOZER_TEST_GUARDIAN_SIGNAL_FILE" || return 1
+        fi
+        kill -s KILL -- "-$inspected_group" 2>/dev/null || :
+        prove_empty "$inspected_group"
+    }
     read_group() {
-        [ -s "$group_file" ] || return 1
-        active_group=$(tr -d "[:space:]" <"$group_file") || return 1
-        case "$active_group" in ""|*[!0-9]*) return 1 ;; esac
+        # 0 = complete publication, 1 = marker absent, 2 = marker present but
+        # metadata ambiguous. Only 1 permits an unpublished exit.
+        [ -e "$group_file" ] || return 1
+        if [ -n "${SNOOZER_TEST_GROUP_METADATA_READ_BLOCK_FILE:-}" ] \
+            && [ -e "$SNOOZER_TEST_GROUP_METADATA_READ_BLOCK_FILE" ]; then
+            return 2
+        fi
+        active_group=$(tr -d "[:space:]" <"$group_candidate") || return 2
+        case "$active_group" in ""|*[!0-9]*) return 2 ;; esac
+        return 0
+    }
+    read_proof_request() {
+        if [ -n "${SNOOZER_TEST_PROOF_REQUEST_READ_BLOCK_FILE:-}" ] \
+            && [ -e "$SNOOZER_TEST_PROOF_REQUEST_READ_BLOCK_FILE" ]; then
+            return 2
+        fi
+        [ -s "$proof_request_file" ] || return 2
+        requested_group=$(tr -d "[:space:]" <"$proof_request_file") \
+            || return 2
+        case "$requested_group" in ""|*[!0-9]*) return 2 ;; esac
+        [ "$requested_group" = "$active_group" ] || return 2
+        return 0
     }
 
     own_group=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d "[:space:]") || exit 125
@@ -1259,26 +1280,49 @@ setsid sh -c '
     [ "${SNOOZER_TEST_GUARDIAN_EXIT_AFTER_READY:-}" != 1 ] || exit 0
 
     while :; do
-        [ ! -e "$release_file" ] || exit 0
-        if ! runner_is_same_process; then
-            if read_group; then
-                kill -s KILL -- "-$active_group" 2>/dev/null || :
-                prove_empty "$active_group"
-            fi
+        if [ -e "$release_file" ]; then
+            read_group
+            group_status=$?
+            case "$group_status" in
+                0) ;;
+                1) exit 0 ;;
+                2) sleep 0.05; continue ;;
+                *) sleep 0.05; continue ;;
+            esac
+            read_proof_request
+            proof_status=$?
+            case "$proof_status" in
+                0) ;;
+                2) sleep 0.05; continue ;;
+                *) sleep 0.05; continue ;;
+            esac
+            kill_and_prove_empty "$active_group" || exit 125
+            printf "%s\n" "$active_group" >"$proof_ready_file" || exit 125
             exit 0
         fi
-        if [ -s "$proof_request_file" ]; then
-            requested_group=$(tr -d "[:space:]" <"$proof_request_file") || exit 125
-            read_group || exit 125
-            [ "$requested_group" = "$active_group" ] || exit 125
-            prove_empty "$active_group"
-            printf "%s\n" "$active_group" >"$proof_ready_file" || exit 125
+        if ! runner_is_same_process; then
+            while [ -n "${SNOOZER_TEST_GUARDIAN_PRE_KILL_BLOCK_FILE:-}" ] \
+                && [ -e "$SNOOZER_TEST_GUARDIAN_PRE_KILL_BLOCK_FILE" ]; do
+                sleep 0.05
+            done
+            read_group
+            group_status=$?
+            case "$group_status" in
+                0)
+                    kill_and_prove_empty "$active_group" || exit 125
+                    exit 0
+                    ;;
+                1) exit 0 ;;
+                2) sleep 0.05; continue ;;
+                *) sleep 0.05; continue ;;
+            esac
         fi
         sleep 0.05
     done
 ' snoozer-benchmark-guardian "$guardian_ready_file" "$guardian_release_file" \
-    "$guardian_group_file" "$guardian_proof_request_file" \
-    "$guardian_proof_ready_file" "$$" "$runner_start_ticks" &
+    "$guardian_group_file" "$guardian_group_candidate" \
+    "$guardian_proof_request_file" "$guardian_proof_ready_file" \
+    "$$" "$runner_start_ticks" &
 guardian_pid=$!
 
 guardian_attempt=0
@@ -1351,10 +1395,13 @@ setsid sh -c '
     status_file=$3
     anchor_ready_file=$4
     anchor_release_file=$5
-    startup_polls=$6
-    kill_grace=$7
-    duration=$8
-    shift 8
+    published_group_file=$6
+    published_group_candidate=$7
+    runner_pid=$8
+    startup_polls=$9
+    kill_grace=${10}
+    duration=${11}
+    shift 11
     exec 6>&- 7>&- 8>&- 9>&- || exit 125
     trap "" TERM
     trap "exit 0" CONT
@@ -1369,6 +1416,24 @@ setsid sh -c '
         printf "anchor-startup-failed\n" >"$status_file" || :
         exit 125
     }
+    runner_is_parent() {
+        observed_parent=$(ps -o ppid= -p "$$" 2>/dev/null | tr -d "[:space:]") \
+            || return 1
+        [ "$observed_parent" = "$runner_pid" ]
+    }
+    group_is_published() {
+        # Match the guardian tri-state contract: marker absence is unpublished;
+        # every post-marker metadata failure is an armed, retryable ambiguity.
+        [ -e "$published_group_file" ] || return 1
+        if [ -n "${SNOOZER_TEST_GROUP_METADATA_READ_BLOCK_FILE:-}" ] \
+            && [ -e "$SNOOZER_TEST_GROUP_METADATA_READ_BLOCK_FILE" ]; then
+            return 2
+        fi
+        published_group=$(tr -d "[:space:]" <"$published_group_candidate") \
+            || return 2
+        [ "$published_group" = "$own_group" ] || return 2
+        return 0
+    }
     trap "cleanup_anchor" EXIT
     [ "${SNOOZER_TEST_SUPERVISOR_EXIT_BEFORE_READY:-}" != 1 ] || exit 125
     own_group=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d "[:space:]") || exit 125
@@ -1376,9 +1441,10 @@ setsid sh -c '
     (
         trap "" HUP INT TERM CONT
         [ "${SNOOZER_TEST_ANCHOR_EXIT_BEFORE_READY:-}" != 1 ] || exit 125
-        # The runner already owns both FIFO ends, so opening this separate read
-        # descriptor cannot block. READY proves this read end is attached.
-        exec 6<"$anchor_release_file" || exit 125
+        # Holding both FIFO ends keeps this read blocked if the runner dies.
+        # The atomically published group file then keeps the supervisor from
+        # timing out, so the anchor preserves the PGID until guardian KILL.
+        exec 6<>"$anchor_release_file" || exit 125
         : >"$anchor_ready_file" || exit 125
         IFS= read -r anchor_release <&6 || exit 125
         [ "$anchor_release" = release ] || exit 125
@@ -1411,11 +1477,31 @@ setsid sh -c '
     printf "%s\n" "$$" >"$ready_file" || exit 125
     [ "${SNOOZER_TEST_SUPERVISOR_EXIT_AFTER_READY:-}" != 1 ] || exit 125
     startup_attempt=0
-    while [ ! -e "$go_file" ] && [ "$startup_attempt" -lt "$startup_polls" ]; do
+    while [ ! -e "$go_file" ]; do
+        group_is_published
+        publication_status=$?
+        case "$publication_status" in
+            0)
+                # Publication arms this group. If the runner disappears before
+                # GO, remain alive with the anchor until guardian drain.
+                if ! runner_is_parent; then
+                    while :; do sleep 0.05; done
+                fi
+                ;;
+            1)
+                runner_is_parent || exit 125
+                [ "$startup_attempt" -lt "$startup_polls" ] || exit 125
+                startup_attempt=$((startup_attempt + 1))
+                ;;
+            2)
+                # Marker existence is authoritative. Ambiguous metadata after
+                # publication must preserve this PGID and retry fail-closed.
+                :
+                ;;
+            *) : ;;
+        esac
         sleep 0.01
-        startup_attempt=$((startup_attempt + 1))
     done
-    [ -e "$go_file" ] || exit 125
     (
         trap - TERM
         exec timeout --foreground --signal=TERM --kill-after="${kill_grace}s" "$duration" "$@"
@@ -1430,7 +1516,8 @@ setsid sh -c '
     exit 125
 ' snoozer-benchmark-supervisor "$supervisor_ready_file" "$supervisor_go_file" \
     "$supervisor_status_file" "$supervisor_anchor_ready_file" \
-    "$supervisor_anchor_release_file" "$SUPERVISOR_STARTUP_POLLS" \
+    "$supervisor_anchor_release_file" "$guardian_group_file" \
+    "$guardian_group_candidate" "$$" "$SUPERVISOR_STARTUP_POLLS" \
     "$KILL_GRACE_SECONDS" "$timeout_seconds" "$binary" \
     --waiter-cpu "$waiter_cpu" \
     --victim-cpu "$victim_cpu" \
@@ -1498,12 +1585,48 @@ if [ "$guardian_invalid" -eq 1 ]; then
     supervisor_launching=0
     die "benchmark crash guardian exited before benchmark authorization"
 fi
+if [ "${SNOOZER_TEST_KILL_DURING_GROUP_PUBLICATION:-}" = 1 ]; then
+    partial_group_id=${child_group_id%?}
+    [ -n "$partial_group_id" ] || partial_group_id=0
+    printf '%s\n' "$partial_group_id" >"$guardian_group_candidate" \
+        || die "cannot write partial benchmark process-group test candidate"
+    sync -f "$guardian_group_candidate" \
+        || die "cannot persist partial benchmark process-group test candidate"
+    kill -KILL "$$"
+    exit 125
+fi
+group_publication_failed=0
+printf '%s\n' "$child_group_id" >"$guardian_group_candidate" \
+    || group_publication_failed=1
+if [ "$group_publication_failed" -eq 0 ]; then
+    sync -f "$guardian_group_candidate" || group_publication_failed=1
+fi
+if [ "$group_publication_failed" -eq 0 ]; then
+    published_group_id=$(tr -d '[:space:]' <"$guardian_group_candidate") \
+        || group_publication_failed=1
+fi
+if [ "$group_publication_failed" -eq 0 ] \
+    && [ "$published_group_id" != "$child_group_id" ]; then
+    group_publication_failed=1
+fi
 if [ "${SNOOZER_TEST_FAIL_GROUP_PUBLICATION:-}" = 1 ] \
-    || ! printf '%s\n' "$child_group_id" >"$guardian_group_file"; then
+    || [ "$group_publication_failed" -ne 0 ] \
+    || ! : >"$guardian_group_file"; then
     drain_unpublished_child_group "$child_pid" "$child_group_id" || exit 1
     child_pid=
     supervisor_launching=0
     die "cannot publish the verified benchmark process-group identity"
+fi
+sync -f "$state_root" \
+    || die "cannot persist the verified benchmark process-group identity"
+if [ -n "${SNOOZER_TEST_AFTER_GROUP_PUBLICATION_READY:-}" ]; then
+    [ -n "${SNOOZER_TEST_AFTER_GROUP_PUBLICATION_RELEASE:-}" ] \
+        || die "post-group-publication test release path is missing"
+    : >"$SNOOZER_TEST_AFTER_GROUP_PUBLICATION_READY" \
+        || die "cannot publish the post-group-publication test handshake"
+    while [ ! -e "${SNOOZER_TEST_AFTER_GROUP_PUBLICATION_RELEASE:-}" ]; do
+        sleep 0.01
+    done
 fi
 supervisor_launching=0
 if [ -n "$signal_status" ]; then

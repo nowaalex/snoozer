@@ -71,7 +71,8 @@ fi
 if [ "$value" = 1 ] && [ "${target##*/cpuidle/}" = state0/disable ]; then
     for pid_file in "${SNOOZER_TEST_RESTORE_BENCHMARK_PID_FILE:-}" \
         "${SNOOZER_TEST_RESTORE_DESCENDANT_PID_FILE:-}" \
-        "${SNOOZER_TEST_RESTORE_ANCHOR_PID_FILE:-}"; do
+        "${SNOOZER_TEST_RESTORE_ANCHOR_PID_FILE:-}" \
+        "${SNOOZER_TEST_RESTORE_SUPERVISOR_PID_FILE:-}"; do
         [ -n "$pid_file" ] || continue
         [ -s "$pid_file" ] || exit 1
         inspected_pid=$(tr -d "[:space:]" <"$pid_file")
@@ -177,6 +178,7 @@ assert_clean() {
         "$state_root"/supervisor-go.* "$state_root"/supervisor-anchor-ready.* \
         "$state_root"/supervisor-anchor-release.* "$state_root"/guardian-ready.* \
         "$state_root"/guardian-release.* "$state_root"/guardian-group.* \
+        "$state_root"/guardian-group-candidate.* \
         "$state_root"/guardian-proof-request.* \
         "$state_root"/guardian-proof-ready.*; do
         [ ! -e "$supervisor_handshake" ] || return 1
@@ -224,12 +226,15 @@ assert_guardian_lock_contract() {
 : >"$write_log"
 normal_benchmark_exit=$test_root/normal-benchmark-exit-ms
 normal_first_restore=$test_root/normal-first-restore-ms
+normal_output=$test_root/normal.out
 normal_start_epoch=$(monotonic_seconds)
 SNOOZER_TEST_BENCHMARK_EXIT_FILE=$normal_benchmark_exit \
     SNOOZER_TEST_FIRST_RESTORE_FILE=$normal_first_restore \
-    run_benchmark >/dev/null
+    run_benchmark >"$normal_output"
 normal_elapsed_seconds=$(($(monotonic_seconds) - normal_start_epoch))
 [ "$normal_elapsed_seconds" -le "$MAX_NORMAL_RUN_SECONDS" ]
+grep -Fq 'Only POLL and exact C1 are enabled on the assigned CPUs. C1E and every other CPU idle state, including C2/C3 and deeper states, are disabled' \
+    "$normal_output"
 [ -s "$normal_benchmark_exit" ]
 [ -s "$normal_first_restore" ]
 normal_benchmark_exit_ms=$(tr -d '[:space:]' <"$normal_benchmark_exit")
@@ -244,13 +249,38 @@ grep -q '|.*/state4/disable$' "$write_log"
 ! grep -q '/cpu4/' "$write_log"
 [ "$(tr -d '[:space:]' <"$sysfs_root/cpu4/cpuidle/state0/disable")" = 0 ]
 
-# If the anchor dies immediately before release, the runner writes through its
-# already-open FIFO descriptor and completes without a blocking open race.
-anchor_release_death_start=$(monotonic_seconds)
-SNOOZER_TEST_ANCHOR_EXIT_BEFORE_RELEASE=1 run_benchmark \
-    >"$test_root/anchor-release-death.out" 2>&1
-anchor_release_death_elapsed=$(($(monotonic_seconds) - anchor_release_death_start))
-[ "$anchor_release_death_elapsed" -le "$MAX_NORMAL_RUN_SECONDS" ]
+# Runner SIGKILL after the workload is drained but before guardian release
+# cannot expose an unowned, reusable PGID. The verified supervisor and anchor
+# still own the group, so the guardian KILLs that exact group, proves it empty,
+# and releases recovery only afterward.
+drained_crash_supervisor_pid_file=$test_root/drained-crash-supervisor-pid
+drained_crash_anchor_pid_file=$test_root/drained-crash-anchor-pid
+drained_crash_guardian_signal_file=$test_root/drained-crash-guardian-signal
+set +e
+SNOOZER_TEST_KILL_AFTER_BENCHMARK_DRAIN=1 \
+    SNOOZER_TEST_SUPERVISOR_PID_FILE=$drained_crash_supervisor_pid_file \
+    SNOOZER_TEST_ANCHOR_PID_FILE=$drained_crash_anchor_pid_file \
+    SNOOZER_TEST_GUARDIAN_SIGNAL_FILE=$drained_crash_guardian_signal_file \
+    run_benchmark >"$test_root/drained-crash.out" 2>&1
+drained_crash_status=$?
+set -e
+[ "$drained_crash_status" -eq 137 ]
+[ -s "$drained_crash_supervisor_pid_file" ]
+[ -s "$drained_crash_anchor_pid_file" ]
+drained_crash_supervisor_pid=$(tr -d '[:space:]' \
+    <"$drained_crash_supervisor_pid_file")
+drained_crash_anchor_pid=$(tr -d '[:space:]' \
+    <"$drained_crash_anchor_pid_file")
+SNOOZER_TEST_RESTORE_SUPERVISOR_PID_FILE=$drained_crash_supervisor_pid_file \
+    SNOOZER_TEST_RESTORE_ANCHOR_PID_FILE=$drained_crash_anchor_pid_file \
+    runner_env "$runner" --recover \
+    >"$test_root/drained-crash-recovery.out" 2>&1
+[ -s "$drained_crash_guardian_signal_file" ]
+drained_crash_signaled_group=$(tr -d '[:space:]' \
+    <"$drained_crash_guardian_signal_file")
+[ "$drained_crash_signaled_group" = "$drained_crash_supervisor_pid" ]
+assert_process_not_live "$drained_crash_supervisor_pid"
+assert_process_not_live "$drained_crash_anchor_pid"
 assert_original
 assert_clean
 
@@ -378,8 +408,222 @@ supervisor_exit_status=$?
 set -e
 [ "$supervisor_exit_status" -ne 0 ]
 [ "$(($(monotonic_seconds) - supervisor_exit_start))" -le "$MAX_NORMAL_RUN_SECONDS" ]
-grep -Eq 'exited before acquiring|exited without preserving' \
+grep -Eq 'exited before acquiring a dedicated process group|process-group anchor failed verification before benchmark authorization' \
     "$test_root/supervisor-after-ready.out"
+assert_original
+assert_clean
+
+# A SIGKILL after a deliberately partial candidate write but before the atomic
+# ready-marker publication leaves the guardian group path absent. The guardian
+# therefore sends no group signal, and the supervisor cannot launch the
+# benchmark because GO was never published.
+partial_group_benchmark_ready=$test_root/partial-group-benchmark-ready
+partial_group_never_release=$test_root/partial-group-never-release
+partial_group_supervisor_pid_file=$test_root/partial-group-supervisor-pid
+partial_group_guardian_signal_file=$test_root/partial-group-guardian-signal
+set +e
+SNOOZER_TEST_KILL_DURING_GROUP_PUBLICATION=1 \
+    SNOOZER_TEST_GUARDIAN_SIGNAL_FILE=$partial_group_guardian_signal_file \
+    SNOOZER_TEST_SUPERVISOR_PID_FILE=$partial_group_supervisor_pid_file \
+    SNOOZER_TEST_READY=$partial_group_benchmark_ready \
+    SNOOZER_TEST_RELEASE=$partial_group_never_release \
+    run_benchmark >"$test_root/partial-group-publication.out" 2>&1
+partial_group_status=$?
+set -e
+[ "$partial_group_status" -eq 137 ]
+[ -s "$partial_group_supervisor_pid_file" ]
+[ ! -e "$partial_group_benchmark_ready" ]
+[ ! -e "$partial_group_guardian_signal_file" ]
+for published_group_file in "$state_root"/guardian-group.*; do
+    [ ! -e "$published_group_file" ] || exit 1
+done
+runner_env "$runner" --recover \
+    >"$test_root/partial-group-recovery.out" 2>&1
+partial_group_supervisor_pid=$(tr -d '[:space:]' \
+    <"$partial_group_supervisor_pid_file")
+partial_group_attempt=0
+while ! assert_process_not_live "$partial_group_supervisor_pid" \
+    && [ "$partial_group_attempt" -lt 600 ]; do
+    sleep 0.01
+    partial_group_attempt=$((partial_group_attempt + 1))
+done
+assert_process_not_live "$partial_group_supervisor_pid"
+[ ! -e "$partial_group_benchmark_ready" ]
+[ ! -e "$partial_group_guardian_signal_file" ]
+assert_original
+assert_clean
+
+# Once the complete PGID marker is published, an injected candidate-read fault
+# is ambiguous rather than unpublished. Runner death before GO must leave the
+# guardian active lock and the supervisor/anchor PGID owners intact beyond the
+# old startup bound. Recovery performs no write until candidate reads recover.
+post_link_ready=$test_root/post-link-ready
+post_link_never_release=$test_root/post-link-never-release
+post_link_metadata_block=$test_root/post-link-metadata-block
+post_link_guardian_signal=$test_root/post-link-guardian-signal
+post_link_supervisor_pid_file=$test_root/post-link-supervisor-pid
+post_link_anchor_pid_file=$test_root/post-link-anchor-pid
+post_link_benchmark_ready=$test_root/post-link-benchmark-ready
+: >"$post_link_metadata_block"
+env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
+    SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    SNOOZER_TEST_AFTER_GROUP_PUBLICATION_READY="$post_link_ready" \
+    SNOOZER_TEST_AFTER_GROUP_PUBLICATION_RELEASE="$post_link_never_release" \
+    SNOOZER_TEST_GROUP_METADATA_READ_BLOCK_FILE="$post_link_metadata_block" \
+    SNOOZER_TEST_GUARDIAN_SIGNAL_FILE="$post_link_guardian_signal" \
+    SNOOZER_TEST_SUPERVISOR_PID_FILE="$post_link_supervisor_pid_file" \
+    SNOOZER_TEST_ANCHOR_PID_FILE="$post_link_anchor_pid_file" \
+    SNOOZER_TEST_READY="$post_link_benchmark_ready" \
+    SNOOZER_TEST_RELEASE="$post_link_never_release" \
+    "$runner" --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 \
+    --producer-cpu 2 --controller-cpu 3 --timeout-seconds 30 \
+    >"$test_root/post-link-runner.out" 2>&1 &
+post_link_runner_pid=$!
+post_link_attempt=0
+while [ ! -e "$post_link_ready" ] \
+    || [ ! -s "$post_link_supervisor_pid_file" ] \
+    || [ ! -s "$post_link_anchor_pid_file" ]; do
+    [ "$post_link_attempt" -lt 500 ] \
+        || { kill -KILL "$post_link_runner_pid" 2>/dev/null || true; exit 1; }
+    sleep 0.01
+    post_link_attempt=$((post_link_attempt + 1))
+done
+post_link_supervisor_pid=$(tr -d '[:space:]' \
+    <"$post_link_supervisor_pid_file")
+post_link_anchor_pid=$(tr -d '[:space:]' <"$post_link_anchor_pid_file")
+post_link_group=$(ps -o pgid= -p "$post_link_anchor_pid" | tr -d '[:space:]')
+[ "$post_link_group" = "$post_link_supervisor_pid" ]
+kill -KILL "$post_link_runner_pid"
+set +e
+wait "$post_link_runner_pid" 2>/dev/null
+post_link_runner_status=$?
+set -e
+[ "$post_link_runner_status" -eq 137 ]
+sleep 6
+! assert_process_not_live "$post_link_supervisor_pid"
+! assert_process_not_live "$post_link_anchor_pid"
+[ "$(ps -o pgid= -p "$post_link_anchor_pid" | tr -d '[:space:]')" \
+    = "$post_link_group" ]
+[ ! -e "$post_link_benchmark_ready" ]
+[ ! -e "$post_link_guardian_signal" ]
+post_link_guardian_pid=
+for guardian_ready in "$state_root"/guardian-ready.*; do
+    [ -s "$guardian_ready" ] || continue
+    post_link_guardian_pid=$(tr -d '[:space:]' <"$guardian_ready")
+done
+[ -n "$post_link_guardian_pid" ]
+assert_guardian_lock_contract "$post_link_guardian_pid"
+post_link_writes_before_recovery=$(wc -l <"$write_log")
+env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
+    SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    SNOOZER_TEST_RESTORE_ANCHOR_PID_FILE="$post_link_anchor_pid_file" \
+    SNOOZER_TEST_RESTORE_SUPERVISOR_PID_FILE="$post_link_supervisor_pid_file" \
+    "$runner" --recover >"$test_root/post-link-recovery.out" 2>&1 &
+post_link_recovery_pid=$!
+sleep 0.1
+kill -0 "$post_link_recovery_pid"
+[ "$(wc -l <"$write_log")" -eq "$post_link_writes_before_recovery" ]
+rm "$post_link_metadata_block"
+wait "$post_link_recovery_pid"
+[ -e "$post_link_guardian_signal" ]
+assert_process_not_live "$post_link_supervisor_pid"
+assert_process_not_live "$post_link_anchor_pid"
+[ ! -e "$post_link_benchmark_ready" ]
+assert_original
+assert_clean
+
+# A published guardian release with an unreadable proof request is also
+# fail-closed. The guardian retains the active lock and the stopped supervisor
+# plus anchor retain the PGID after runner SIGKILL; recovery cannot write until
+# the exact proof request becomes readable and valid again.
+proof_read_block=$test_root/proof-read-block
+proof_guardian_signal=$test_root/proof-guardian-signal
+proof_supervisor_pid_file=$test_root/proof-supervisor-pid
+proof_anchor_pid_file=$test_root/proof-anchor-pid
+: >"$proof_read_block"
+env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
+    SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    SNOOZER_TEST_PROOF_REQUEST_READ_BLOCK_FILE="$proof_read_block" \
+    SNOOZER_TEST_GUARDIAN_SIGNAL_FILE="$proof_guardian_signal" \
+    SNOOZER_TEST_SUPERVISOR_PID_FILE="$proof_supervisor_pid_file" \
+    SNOOZER_TEST_ANCHOR_PID_FILE="$proof_anchor_pid_file" \
+    "$runner" --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 \
+    --producer-cpu 2 --controller-cpu 3 --timeout-seconds 30 \
+    >"$test_root/proof-read-runner.out" 2>&1 &
+proof_runner_pid=$!
+proof_attempt=0
+proof_request_path=
+while :; do
+    proof_request_published=0
+    proof_release_published=0
+    for proof_request in "$state_root"/guardian-proof-request.*; do
+        if [ -s "$proof_request" ]; then
+            proof_request_published=1
+            proof_request_path=$proof_request
+            break
+        fi
+    done
+    for proof_release in "$state_root"/guardian-release.*; do
+        if [ -e "$proof_release" ]; then proof_release_published=1; break; fi
+    done
+    [ "$proof_request_published" -eq 0 ] \
+        || [ "$proof_release_published" -eq 0 ] || break
+    [ "$proof_attempt" -lt 500 ] \
+        || { kill -KILL "$proof_runner_pid" 2>/dev/null || true; exit 1; }
+    sleep 0.01
+    proof_attempt=$((proof_attempt + 1))
+done
+[ -s "$proof_supervisor_pid_file" ]
+[ -s "$proof_anchor_pid_file" ]
+proof_supervisor_pid=$(tr -d '[:space:]' <"$proof_supervisor_pid_file")
+proof_anchor_pid=$(tr -d '[:space:]' <"$proof_anchor_pid_file")
+proof_guardian_pid=
+for guardian_ready in "$state_root"/guardian-ready.*; do
+    [ -s "$guardian_ready" ] || continue
+    proof_guardian_pid=$(tr -d '[:space:]' <"$guardian_ready")
+done
+[ -n "$proof_guardian_pid" ]
+! assert_process_not_live "$proof_supervisor_pid"
+! assert_process_not_live "$proof_anchor_pid"
+assert_guardian_lock_contract "$proof_guardian_pid"
+[ ! -e "$proof_guardian_signal" ]
+# Move from an injected read failure to malformed content without ever making
+# the request valid in between. Both states must retain the same ownership.
+printf 'invalid-proof\n' >"$proof_request_path"
+rm "$proof_read_block"
+sleep 0.1
+! assert_process_not_live "$proof_supervisor_pid"
+! assert_process_not_live "$proof_anchor_pid"
+assert_guardian_lock_contract "$proof_guardian_pid"
+[ ! -e "$proof_guardian_signal" ]
+kill -KILL "$proof_runner_pid"
+set +e
+wait "$proof_runner_pid" 2>/dev/null
+proof_runner_status=$?
+set -e
+[ "$proof_runner_status" -eq 137 ]
+sleep 0.1
+! assert_process_not_live "$proof_supervisor_pid"
+! assert_process_not_live "$proof_anchor_pid"
+assert_guardian_lock_contract "$proof_guardian_pid"
+[ ! -e "$proof_guardian_signal" ]
+proof_writes_before_recovery=$(wc -l <"$write_log")
+env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
+    SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    SNOOZER_TEST_RESTORE_SUPERVISOR_PID_FILE="$proof_supervisor_pid_file" \
+    SNOOZER_TEST_RESTORE_ANCHOR_PID_FILE="$proof_anchor_pid_file" \
+    "$runner" --recover >"$test_root/proof-read-recovery.out" 2>&1 &
+proof_recovery_pid=$!
+sleep 0.1
+kill -0 "$proof_recovery_pid"
+[ "$(wc -l <"$write_log")" -eq "$proof_writes_before_recovery" ]
+printf '%s\n' "$proof_supervisor_pid" >"$proof_request_path"
+wait "$proof_recovery_pid"
+[ -s "$proof_guardian_signal" ]
+[ "$(tr -d '[:space:]' <"$proof_guardian_signal")" \
+    = "$proof_supervisor_pid" ]
+assert_process_not_live "$proof_supervisor_pid"
+assert_process_not_live "$proof_anchor_pid"
 assert_original
 assert_clean
 
@@ -415,16 +659,23 @@ if [ -n "$dash_shell" ]; then
     assert_clean
 fi
 
-# A failed post-KILL inspection keeps the guardian and active lock alive. No
-# restore write occurs until the inspection fault clears and the guardian can
-# prove that the already-KILLed group has no non-zombie members.
+# A failed post-KILL inspection keeps the guardian and active lock alive. The
+# pre-KILL gate first proves the supervisor is still stopped when the guardian
+# owns teardown; after KILL, no restore write occurs until the inspection fault
+# clears and the guardian can prove the group has no non-zombie members.
 post_kill_block=$test_root/post-kill-inspection-block
+post_kill_pre_block=$test_root/post-kill-pre-signal-block
+post_kill_guardian_signal=$test_root/post-kill-guardian-signal
+post_kill_supervisor_pid_file=$test_root/post-kill-supervisor-pid
 : >"$post_kill_block"
+: >"$post_kill_pre_block"
 writes_before_post_kill=$(wc -l <"$write_log")
 env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
     SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
-    SNOOZER_TEST_FAIL_GO_PUBLICATION=1 \
+    SNOOZER_TEST_GUARDIAN_PRE_GROUP_KILL_BLOCK_FILE="$post_kill_pre_block" \
     SNOOZER_TEST_POST_KILL_BLOCK_FILE="$post_kill_block" \
+    SNOOZER_TEST_GUARDIAN_SIGNAL_FILE="$post_kill_guardian_signal" \
+    SNOOZER_TEST_SUPERVISOR_PID_FILE="$post_kill_supervisor_pid_file" \
     "$runner" --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 \
     --producer-cpu 2 --controller-cpu 3 --timeout-seconds 5 \
     >"$test_root/post-kill-inspection.out" 2>&1 &
@@ -441,19 +692,53 @@ while :; do
     sleep 0.01
     attempt=$((attempt + 1))
 done
-sleep 0.1
+[ -s "$post_kill_supervisor_pid_file" ]
+post_kill_supervisor_pid=$(tr -d '[:space:]' \
+    <"$post_kill_supervisor_pid_file")
+post_kill_supervisor_state=$(ps -o stat= -p "$post_kill_supervisor_pid" \
+    2>/dev/null | tr -d '[:space:]') || post_kill_supervisor_state=
+case "$post_kill_supervisor_state" in T*) ;; *) exit 1 ;; esac
+post_kill_guardian_pid=
+for guardian_ready in "$state_root"/guardian-ready.*; do
+    [ -s "$guardian_ready" ] || continue
+    post_kill_guardian_pid=$(tr -d '[:space:]' <"$guardian_ready")
+done
+[ -n "$post_kill_guardian_pid" ]
+assert_guardian_lock_contract "$post_kill_guardian_pid"
+rm "$post_kill_pre_block"
+attempt=0
+while [ ! -s "$post_kill_guardian_signal" ]; do
+    [ "$attempt" -lt 500 ] \
+        || { kill -KILL "$post_kill_runner_pid" 2>/dev/null || true; exit 1; }
+    sleep 0.01
+    attempt=$((attempt + 1))
+done
+[ "$(tr -d '[:space:]' <"$post_kill_guardian_signal")" \
+    = "$post_kill_supervisor_pid" ]
+assert_guardian_lock_contract "$post_kill_guardian_pid"
 kill -0 "$post_kill_runner_pid"
 [ -f "$state_root/dirty" ]
 [ -f "$sysfs_root/.snoozer-cpuidle.dirty" ]
 [ "$(tr -d '[:space:]' <"$sysfs_root/cpu0/cpuidle/state0/disable")" = 0 ]
 # Only apply writes have happened; the blocked proof precedes every restore.
 [ "$(wc -l <"$write_log")" -eq "$((writes_before_post_kill + 20))" ]
+env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
+    SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    "$runner" --recover >"$test_root/post-kill-recovery.out" 2>&1 &
+post_kill_recovery_pid=$!
+sleep 0.1
+kill -0 "$post_kill_recovery_pid"
+[ "$(wc -l <"$write_log")" -eq "$((writes_before_post_kill + 20))" ]
 rm "$post_kill_block"
 set +e
 wait "$post_kill_runner_pid"
 post_kill_runner_status=$?
+wait "$post_kill_recovery_pid"
+post_kill_recovery_status=$?
 set -e
-[ "$post_kill_runner_status" -ne 0 ]
+[ "$post_kill_runner_status" -eq 0 ]
+[ "$post_kill_recovery_status" -ne 0 ]
+assert_process_not_live "$post_kill_supervisor_pid"
 assert_original
 assert_clean
 
@@ -791,7 +1076,15 @@ env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$crash_recovery_state" \
     "$runner" --recover >"$test_root/active-crash-recovery.out" 2>&1 &
 crash_recovery_pid=$!
 sleep 0.1
-kill -0 "$crash_recovery_pid"
+if ! kill -0 "$crash_recovery_pid" 2>/dev/null; then
+    set +e
+    wait "$crash_recovery_pid"
+    crash_recovery_early_status=$?
+    set -e
+    echo "active crash recovery exited early with status $crash_recovery_early_status" >&2
+    cat "$test_root/active-crash-recovery.out" >&2
+    exit 1
+fi
 [ "$(wc -l <"$write_log")" -eq "$crash_writes_before_recovery" ]
 [ "$(tr -d '[:space:]' <"$sysfs_root/cpu0/cpuidle/state0/disable")" = 0 ]
 rm "$crash_guardian_block"

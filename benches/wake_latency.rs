@@ -48,8 +48,8 @@ mod linux {
     type AnyError = Box<dyn Error + Send + Sync>;
     type AnyResult<T> = Result<T, AnyError>;
 
-    const CSTATE_WARNING: &str = "OFFICIAL BENCHMARK POLICY: C2/C3 and every deeper CPU idle state must be disabled on the assigned CPUs because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration.";
-    const SMOKE_CSTATE_WARNING: &str = "NON-OFFICIAL SMOKE: C2/C3 and deeper CPU idle states may be enabled on the assigned CPUs. Official runs disable them on the assigned CPUs because their exit latency conflicts with the minimum-wake-latency objective.";
+    const CSTATE_WARNING: &str = "OFFICIAL BENCHMARK POLICY: Only POLL and exact C1 may be enabled on the assigned CPUs. C1E and every other CPU idle state, including C2/C3 and deeper states, must be disabled because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration.";
+    const SMOKE_CSTATE_WARNING: &str = "NON-OFFICIAL SMOKE: CPU idle states other than POLL and exact C1, including C1E and C2/C3 or deeper states, may be enabled on the assigned CPUs. Official runs enable only POLL and exact C1 because other states conflict with the minimum-wake-latency objective.";
     const BURSTY_SCHEDULE_VERSION: &str = "bursty-v1";
     const BURSTY_SEED: u64 = 0x5a17_9d3c_e821_4b6f;
     const SPIN_SWEEP: [usize; 4] = [32, 128, 512, 2_048];

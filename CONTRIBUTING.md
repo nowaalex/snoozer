@@ -101,7 +101,7 @@ cargo bench --bench wake_latency --features benchmark-only -- --smoke
 ```
 
 Smoke mode reads and reports the current CPU-idle configuration and prints a `NON-OFFICIAL`
-warning. It does not disable C2/C3 or deeper states and cannot produce a publishable result.
+warning. It does not change CPU-idle policy and cannot produce a publishable result.
 
 For an official run, build the exact feature-enabled artifact, select four logical CPUs that
 satisfy the topology contract in [Benchmarking](docs/benchmarking.md), and use the
@@ -129,8 +129,9 @@ scripts/run_with_cpuidle.sh \
 C1 diagnostic comparison is present and prints the exact executable path. The runner's
 `--help` output owns its current command-line interface.
 
-Official results are valid only when the runner and benchmark complete topology checks, disable
-C2/C3 and deeper states on assigned CPUs, verify the new state, and restore the original state.
+Official results are valid only when the runner and benchmark complete topology checks, permit
+only POLL and exact C1 on assigned CPUs, disable C1E and every other state including C2/C3+, verify
+the new state, and restore the original state.
 
 If a prior process was killed before restoration, do not start another run. Recover as the same
 user and with the same `SNOOZER_SYSFS_ROOT` value if you overrode it. The global dirty-owner record
