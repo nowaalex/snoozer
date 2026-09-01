@@ -1,11 +1,9 @@
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
-
 use std::ffi::OsStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use snoozer::{AmdMwaitx, WaitStrategy, WaitUntilTimeoutResult};
+use snoozer::{AmdMwaitx, WaitResult, WaitStrategy, WaitUntilTimeoutResult};
 
 const HARDWARE_TEST_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUIRE_AMD_MWAITX_ENV: &str = "SNOOZER_REQUIRE_AMD_MWAITX";
@@ -83,6 +81,34 @@ fn unsupported_hardware_is_skipped_by_default_and_fails_when_required() {
         assert!(message.contains("unsupported target"));
         assert!(message.contains(REQUIRE_AMD_MWAITX_ENV));
     }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[test]
+fn strict_gate_classifies_this_target_as_unsupported() {
+    let error = AmdMwaitx::new().expect_err("this target must reject the AMD hardware strategy");
+    assert!(matches!(
+        classify_unavailable_hardware(true, "portable_probe", &error.to_string()),
+        UnavailableHardware::Fail(_)
+    ));
+}
+
+#[test]
+fn supported_mwaitx_executes_one_bounded_raw_wait_on_an_equal_atomic() {
+    let Some(strategy) =
+        hardware_strategy("supported_mwaitx_executes_one_bounded_raw_wait_on_an_equal_atomic")
+    else {
+        return;
+    };
+    let state = AtomicU32::new(0);
+    let started = Instant::now();
+
+    assert_eq!(strategy.wait_if_equal(&state, 0), WaitResult::Unclassified);
+    assert!(
+        started.elapsed() < HARDWARE_TEST_TIMEOUT,
+        "raw MWAITX did not return within its safety bound"
+    );
+    assert_eq!(state.load(Ordering::Acquire), 0);
 }
 
 #[test]

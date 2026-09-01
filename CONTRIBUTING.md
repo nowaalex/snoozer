@@ -48,10 +48,17 @@ cross-compiled by CI.
 
 ## Hardware smoke tests
 
-The AMD hardware tests perform bounded real `MONITORX/MWAITX` waits when the host supports
-them. Ordinary test runs report an unsupported host without executing the instructions. To cite
-the command as target-hardware evidence, enable the strict gate so unsupported hardware is a test
-failure:
+The AMD hardware tests perform bounded real `MONITORX/MWAITX` waits when the host supports them.
+An ordinary optional probe prints a visible `SKIP` diagnostic and returns successfully on an
+unsupported host:
+
+```console
+cargo test --test amd_mwaitx -- --nocapture
+```
+
+To cite the command as target-hardware evidence, enable the strict gate so an unsupported target,
+CPU, or timer configuration is a test failure. The strict suite includes an equal-atomic raw wait
+that necessarily reaches one real MWAITX instruction and is bounded by its internal safety timer:
 
 ```console
 SNOOZER_REQUIRE_AMD_MWAITX=1 cargo test --test amd_mwaitx
