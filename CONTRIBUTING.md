@@ -27,9 +27,11 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace --all-features
 cargo test --workspace --all-features --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
-sh -n scripts/run_with_cpuidle.sh scripts/test_run_with_cpuidle.sh scripts/build_benchmark.sh scripts/test_build_benchmark.sh
-timeout 30s sh scripts/test_build_benchmark.sh
-timeout 240s sh scripts/test_run_with_cpuidle.sh
+for script in scripts/run_with_cpuidle.sh scripts/test_run_with_cpuidle.sh scripts/build_benchmark.sh scripts/test_build_benchmark.sh; do
+  sh -n "$script"
+done
+timeout --kill-after=5s 30s sh scripts/test_build_benchmark.sh
+timeout --kill-after=5s 240s sh scripts/test_run_with_cpuidle.sh
 ```
 
 The shell suites use only disposable fixtures and fake CPU sysfs trees. They do not invoke the

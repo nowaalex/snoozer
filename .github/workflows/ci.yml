@@ -50,13 +50,20 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Check benchmark shell syntax
-        run: sh -n scripts/run_with_cpuidle.sh scripts/test_run_with_cpuidle.sh scripts/build_benchmark.sh scripts/test_build_benchmark.sh
+        run: |
+          for script in \
+            scripts/run_with_cpuidle.sh \
+            scripts/test_run_with_cpuidle.sh \
+            scripts/build_benchmark.sh \
+            scripts/test_build_benchmark.sh; do
+            sh -n "$script"
+          done
 
       - name: Test benchmark build provenance
-        run: timeout 30s sh scripts/test_build_benchmark.sh
+        run: timeout --kill-after=5s 30s sh scripts/test_build_benchmark.sh
 
       - name: Test CPU-idle runner recovery
-        run: timeout 240s sh scripts/test_run_with_cpuidle.sh
+        run: timeout --kill-after=5s 240s sh scripts/test_run_with_cpuidle.sh
 
       - name: Run tests
         run: cargo nextest run --workspace --all-features --profile ci
