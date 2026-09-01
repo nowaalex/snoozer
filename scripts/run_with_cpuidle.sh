@@ -877,7 +877,7 @@ signal_child_group() {
     [ "$child_group_verified" -eq 1 ] || return 1
     # The verified, unreaped supervisor remains the group leader until this
     # function reaps it. Therefore this negative PGID cannot be recycled.
-    kill -"$child_signal" -- "-$inspected_pid" 2>/dev/null
+    kill -s "$child_signal" -- "-$inspected_pid" 2>/dev/null
 }
 
 terminate_child() {
@@ -1142,7 +1142,7 @@ setsid sh -c '
         [ ! -e "$release_file" ] || exit 0
         if ! runner_is_same_process; then
             if read_group; then
-                kill -KILL -- "-$active_group" 2>/dev/null || :
+                kill -s KILL -- "-$active_group" 2>/dev/null || :
                 prove_empty "$active_group"
             fi
             exit 0

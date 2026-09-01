@@ -13,6 +13,24 @@ MAX_NORMAL_RUN_SECONDS=6
 MIN_KILL_PATH_SECONDS=4
 MAX_KILL_PATH_SECONDS=8
 
+dash_shell=$(command -v dash 2>/dev/null || :)
+dash_bin=
+dash_runner=$runner
+if [ -n "$dash_shell" ]; then
+    dash_bin=$test_root/dash-bin
+    mkdir "$dash_bin"
+    ln -s "$dash_shell" "$dash_bin/sh"
+    dash_runner=$test_root/dash-runner
+    cat >"$dash_runner" <<'EOF'
+#!/bin/sh
+set -eu
+PATH=$SNOOZER_TEST_DASH_BIN:$PATH
+export PATH
+exec "$SNOOZER_TEST_DASH_SHELL" "$SNOOZER_TEST_RUNNER" "$@"
+EOF
+    chmod +x "$dash_runner"
+fi
+
 monotonic_seconds() {
     awk '{ print int($1) }' /proc/uptime
 }
@@ -114,6 +132,13 @@ run_benchmark() {
     runner_env "$runner" --binary "$benchmark" \
         --waiter-cpu 0 --victim-cpu 1 --producer-cpu 2 --controller-cpu 3 \
         --timeout-seconds 5
+}
+
+run_with_dash() {
+    SNOOZER_TEST_DASH_BIN=$dash_bin \
+    SNOOZER_TEST_DASH_SHELL=$dash_shell \
+    SNOOZER_TEST_RUNNER=$runner \
+    "$dash_runner" "$@"
 }
 
 assert_original() {
@@ -320,6 +345,25 @@ grep -q 'cannot publish the benchmark go-ahead' \
     "$test_root/go-publication-failure.out"
 assert_original
 assert_clean
+
+# Ubuntu uses dash for /bin/sh. Its kill builtin rejects `kill -KILL -- -PGID`
+# but accepts the POSIX-style `kill -s KILL -- -PGID`. Force dash for both the
+# runner and its nested shells when available so this runner-side regression
+# does not depend on the developer host's /bin/sh selection.
+if [ -n "$dash_shell" ]; then
+    set +e
+    SNOOZER_TEST_FAIL_GO_PUBLICATION=1 runner_env run_with_dash \
+        --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 \
+        --producer-cpu 2 --controller-cpu 3 --timeout-seconds 5 \
+        >"$test_root/dash-group-signal.out" 2>&1
+    dash_group_signal_status=$?
+    set -e
+    [ "$dash_group_signal_status" -ne 0 ]
+    grep -q 'cannot publish the benchmark go-ahead' \
+        "$test_root/dash-group-signal.out"
+    assert_original
+    assert_clean
+fi
 
 # A failed post-KILL inspection keeps the guardian and active lock alive. No
 # restore write occurs until the inspection fault clears and the guardian can
@@ -557,7 +601,8 @@ assert_clean
 # SIGKILL while the benchmark is active leaves mutation ownership durable but
 # not stuck in inherited FD 8/9. The guardian retains only active-run.lock,
 # KILLs the inner group, proves it empty, then lets an alternate-dir recovery
-# restore exact values without racing the old workload.
+# restore exact values without racing the old workload. When dash is available,
+# this forces both the runner and guardian through dash's group-signal path.
 crash_ready=$test_root/crash-ready
 crash_never_release=$test_root/crash-never-release
 crash_benchmark_pid_file=$test_root/crash-benchmark-pid
@@ -566,13 +611,15 @@ crash_guardian_block=$test_root/crash-guardian-block
 : >"$crash_guardian_block"
 env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
     SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    SNOOZER_TEST_DASH_BIN="$dash_bin" SNOOZER_TEST_DASH_SHELL="$dash_shell" \
+    SNOOZER_TEST_RUNNER="$runner" \
     SNOOZER_TEST_READY="$crash_ready" SNOOZER_TEST_RELEASE="$crash_never_release" \
     SNOOZER_TEST_IGNORE_TERM=1 \
     SNOOZER_TEST_BENCHMARK_PID="$crash_benchmark_pid_file" \
     SNOOZER_TEST_DESCENDANT_PID="$crash_descendant_pid_file" \
     SNOOZER_TEST_DESCENDANT_IGNORE_TERM=1 \
     SNOOZER_TEST_POST_KILL_BLOCK_FILE="$crash_guardian_block" \
-    "$runner" --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 \
+    "$dash_runner" --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 \
     --producer-cpu 2 --controller-cpu 3 --timeout-seconds 30 \
     >"$test_root/active-crash.out" 2>&1 &
 crash_runner_pid=$!
