@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-test_root=$(mktemp -d /tmp/snoozer-build-benchmark-test.XXXXXX)
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/snoozer-build-benchmark-test.XXXXXX")
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 repository=$test_root/repository
 fake_bin=$test_root/bin
