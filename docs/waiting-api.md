@@ -71,12 +71,17 @@ application protocol; the waiting primitive cannot infer it.
 `Parker`/`Unparker` wrap the same direct-wait protocol around an internal notification
 token:
 
-- `unpark` publishes one token with Release ordering;
+- `unpark` sets one token with a Release read-modify-write;
 - an available token makes a later park return without sleeping;
 - at most one token is stored, so repeated notifications coalesce;
 - consuming a token uses Acquire ordering;
 - `Unparker` is cloneable and can be shared by producers;
 - a `Parker` can move between threads but cannot be waited on concurrently.
+
+Each Release notification heads a release sequence that includes later notification
+read-modify-writes. Those sequences overlap, so the consumer's Acquire token consumption acquires
+the publications of every producer represented by that token, even though the notifications
+themselves collapse to one.
 
 `park` is the raw operation. It consumes a token if one is already available; otherwise it
 performs at most one conditional hardware wait, tries once more to consume the token, and may

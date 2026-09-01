@@ -33,6 +33,11 @@ Address monitoring is a sleep mechanism, not a Rust memory-ordering primitive.
 - `wait_until_different` returns only after an Acquire load observes a different value.
 - `park_until_notified` returns only after consuming the token with Acquire ordering.
 
+`Unparker::unpark` uses a Release read-modify-write even when the token is already notified.
+Each notification heads a release sequence that includes the later notification
+read-modify-writes. Those sequences overlap, so the consumer's Acquire consumption synchronizes
+with every producer publication represented by the coalesced token.
+
 A backend must not weaken these orderings based on the ordering properties of a particular
 instruction. Rust's atomic contract remains the portable source of truth.
 
@@ -41,9 +46,10 @@ instruction. Rust's atomic contract remains the portable source of truth.
 The monitor must be armed before the second load, and the hardware wait must occur only if that
 load still equals the expectation. Reordering or deleting the second load can create a lost wake.
 
-Tests use a fake backend to pause at each boundary: before arming, after arming, immediately before
-sleep, and during sleep. A hardware smoke test complements those deterministic tests but does not
-replace them.
+Tests use a gated fake strategy to pause after the simulated arm and before recheck, after recheck
+and before the simulated wait, and during that wait. A separate pre-notification test covers the
+token-before-park case. Hardware tests complement those deterministic tests but do not replace
+them.
 
 ## Monitor granularity and false sharing
 

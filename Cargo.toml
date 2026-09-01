@@ -18,6 +18,10 @@ repository = "https://github.com/nowaalex/snoozer"
 keywords = ["concurrency", "latency", "thread", "mwaitx"]
 categories = ["concurrency", "hardware-support"]
 
+[[bench]]
+name = "wake_latency"
+harness = false
+
 [features]
 default = []
 # This feature exists only so the repository benchmark can measure the C1

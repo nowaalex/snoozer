@@ -8,7 +8,7 @@
 The project must compare end-to-end wake latency under saturated and bursty publication while
 measuring interference with a compute-bound SMT sibling. A valid sample depends on a strict
 producer/consumer acknowledgement, fixed topology, ordered cycle reads, migration detection, and
-a paired victim control.
+a paired victim-only baseline.
 
 General microbenchmark frameworks are optimized for a different unit of work. Criterion measures
 iterated routines and can provide wall-clock statistics, but it does not define this coordinated
@@ -44,7 +44,7 @@ Use a custom Cargo benchmark binary with `harness = false`. It must:
 - run the versioned saturated, bursty, and SMT-neighbor protocols;
 - retain raw cycle data or a losslessly equivalent representation;
 - reject migrated or otherwise invalid timing samples;
-- alternate matched treatment/control order across repetitions;
+- alternate treatment and victim-only control order across repetitions;
 - emit a machine-readable record containing the measurement configuration and environment;
 - distinguish non-official smoke output from official controlled output;
 - fail closed when official CPU topology or idle-state preflight cannot be proven.

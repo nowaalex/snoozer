@@ -42,8 +42,11 @@ calls the raw operation repeatedly until its Acquire load sees a different value
 ## Parker adaptation
 
 The Parker owns an isolated atomic token with two logical states: empty and notified.
-`Unparker::unpark` stores the notified state with Release ordering. A Parker operation uses an
-Acquire read-modify-write to consume it.
+`Unparker::unpark` uses a Release read-modify-write to set the notified state. A Parker
+operation uses an Acquire read-modify-write to consume it. Repeated notifications form one
+set of overlapping release sequences: each Release notification is followed in modification
+order by the later notification read-modify-writes. The consumer therefore acquires every
+producer publication represented by the coalesced token.
 
 This gives a one-token mailbox:
 

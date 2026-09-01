@@ -56,20 +56,22 @@ Record the CPU model, kernel, and test output when reporting a hardware-only fai
 Read [Benchmarking](docs/benchmarking.md) before running measurements. In particular, an official
 run temporarily changes CPU-idle state controls and must preserve its recovery manifest.
 
-Build the custom benchmark and ask the binary for its current options:
+Run a short, non-official smoke measurement without changing CPU-idle state:
 
 ```console
-cargo bench --bench wake_latency --no-run
-cargo bench --bench wake_latency -- --help
+cargo bench --bench wake_latency --features benchmark-only -- --smoke
 ```
 
-The first command prints the executable path under `target/release/deps/`. Select four logical
-CPUs that satisfy the topology contract in [Benchmarking](docs/benchmarking.md), then pass that
-path and the CPU roles to the state-preserving runner. Run the script as your normal user; it
-invokes `sudo` only for the required sysfs writes.
+Smoke mode reads and reports the current CPU-idle configuration and prints a `NON-OFFICIAL`
+warning. It does not disable C2/C3 or deeper states and cannot produce a publishable result.
+
+For an official run, build the exact feature-enabled artifact, select four logical CPUs that
+satisfy the topology contract in [Benchmarking](docs/benchmarking.md), and use the
+state-preserving runner. Run the script as your normal user; it invokes `sudo` only for the
+required sysfs writes.
 
 ```sh
-SNOOZER_BENCH_BINARY=target/release/deps/wake_latency-HASH
+SNOOZER_BENCH_BINARY=$(scripts/build_benchmark.sh)
 SNOOZER_WAITER_CPU=CPU
 SNOOZER_VICTIM_CPU=CPU
 SNOOZER_PRODUCER_CPU=CPU
@@ -81,13 +83,15 @@ scripts/run_with_cpuidle.sh \
   --victim-cpu "$SNOOZER_VICTIM_CPU" \
   --producer-cpu "$SNOOZER_PRODUCER_CPU" \
   --controller-cpu "$SNOOZER_CONTROLLER_CPU" \
-  -- --smoke
+  -- --official
 ```
 
-Use `--official` instead of `--smoke` only for a publishable run. Never describe smoke
-output as official. Official results are valid only when the runner and benchmark complete
-topology checks, disable C2/C3 and deeper states on assigned CPUs, verify the new state, and
-restore the original state.
+`scripts/build_benchmark.sh` enables the repository-only `benchmark-only` feature so the
+C1 diagnostic comparison is present and prints the exact executable path. The runner's
+`--help` output owns its current command-line interface.
+
+Official results are valid only when the runner and benchmark complete topology checks, disable
+C2/C3 and deeper states on assigned CPUs, verify the new state, and restore the original state.
 
 If a prior process was killed before restoration, do not start another run. Recover the manifest
 as the same user and with the same `SNOOZER_STATE_DIR` and `SNOOZER_SYSFS_ROOT` values, if
