@@ -112,4 +112,5 @@ Snoozer does not make a logically racy application protocol correct. In particul
   responsibility.
 
 The benchmark runner has additional privileged-state recovery requirements documented in
-[Benchmarking](benchmarking.md). Those operations are not performed by the library.
+[Benchmarking](benchmarking.md), including the trust boundary for custom sysfs roots and write
+helpers. Those operations are not performed by the library.

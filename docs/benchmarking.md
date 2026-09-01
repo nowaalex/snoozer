@@ -142,6 +142,15 @@ a deeper state is enabled, even if it was launched without the runner.
 inspect the recorded manifest and use the runner's explicit recovery command. Never guess the
 original values.
 
+The path checks assume the real CPU sysfs tree remains kernel-owned and cannot be renamed by an
+unprivileged process while the runner is operating. `SNOOZER_SYSFS_ROOT` and
+`SNOOZER_WRITE_HELPER` exist for tests and controlled integrations; POSIX-shell `realpath` checks
+cannot make a concurrently modified custom tree safe against time-of-check/time-of-use attacks.
+Do not use an untrusted or concurrently mutable tree for an official run. A custom privileged
+helper that must support that threat model needs to open every component with kernel-enforced
+containment, for example Linux `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, and perform
+the write and readback through those retained descriptors.
+
 ## Result provenance
 
 Machine-readable output records at least:
