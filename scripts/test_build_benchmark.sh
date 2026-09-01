@@ -55,14 +55,12 @@ git -C "$repository" \
     -c user.name='Snoozer Test' -c user.email='snoozer@example.invalid' \
     commit -qm fixture
 
+run_clean() {
+    env -i HOME="$test_home" PATH="$fake_bin:$PATH" "$@"
+}
+
 run_helper() {
-    env -u CARGO_HOME -u CARGO_INCREMENTAL -u CARGO_BUILD_TARGET \
-        -u RUSTC -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
-        -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u RUSTUP_TOOLCHAIN \
-        -u RUSTC_BOOTSTRAP -u CARGO_BUILD_RUSTC -u CARGO_BUILD_RUSTFLAGS \
-        -u CARGO_BUILD_RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER \
-        HOME="$test_home" PATH="$fake_bin:$PATH" \
-        "$repository/scripts/build_benchmark.sh"
+    run_clean "$repository/scripts/build_benchmark.sh"
 }
 
 [ "$(run_helper)" = /tmp/fake-wake-latency ]
@@ -93,26 +91,14 @@ printf '[build]\nrustflags = ["-Ctarget-cpu=native"]\n' \
     >"$test_root/.cargo/config.toml"
 ln -s "$repository/scripts/build_benchmark.sh" "$test_root/invocation/build-benchmark"
 set +e
-physical_ancestor_output=$(env -u CARGO_HOME -u CARGO_INCREMENTAL -u CARGO_BUILD_TARGET \
-    -u RUSTC -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
-    -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u RUSTUP_TOOLCHAIN \
-    -u RUSTC_BOOTSTRAP -u CARGO_BUILD_RUSTC -u CARGO_BUILD_RUSTFLAGS \
-    -u CARGO_BUILD_RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER \
-    HOME="$test_home" PATH="$fake_bin:$PATH" \
-    "$test_root/invocation/build-benchmark" 2>&1)
+physical_ancestor_output=$(run_clean "$test_root/invocation/build-benchmark" 2>&1)
 physical_ancestor_status=$?
 set -e
 [ "$physical_ancestor_status" -ne 0 ]
 printf '%s\n' "$physical_ancestor_output" | grep -q 'outside the tracked repository'
 rm -f "$test_root/.cargo/config.toml"
 rmdir "$test_root/.cargo"
-[ "$(env -u CARGO_HOME -u CARGO_INCREMENTAL -u CARGO_BUILD_TARGET \
-    -u RUSTC -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
-    -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u RUSTUP_TOOLCHAIN \
-    -u RUSTC_BOOTSTRAP -u CARGO_BUILD_RUSTC -u CARGO_BUILD_RUSTFLAGS \
-    -u CARGO_BUILD_RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER \
-    HOME="$test_home" PATH="$fake_bin:$PATH" \
-    "$test_root/invocation/build-benchmark")" = /tmp/fake-wake-latency ]
+[ "$(run_clean "$test_root/invocation/build-benchmark")" = /tmp/fake-wake-latency ]
 
 mkdir -p "$repository/.cargo"
 printf '[build]\nrustflags = ["-Ctarget-cpu=native"]\n' \
@@ -127,15 +113,16 @@ rm -f "$repository/.cargo/config.toml"
 rmdir "$repository/.cargo"
 
 set +e
-override_output=$(env RUSTFLAGS=-Ctarget-cpu=native HOME="$test_home" \
-    PATH="$fake_bin:$PATH" "$repository/scripts/build_benchmark.sh" 2>&1)
+override_output=$(run_clean RUSTFLAGS=-Ctarget-cpu=native \
+    "$repository/scripts/build_benchmark.sh" 2>&1)
 override_status=$?
 set -e
 [ "$override_status" -ne 0 ]
 printf '%s\n' "$override_output" | grep -q 'RUSTFLAGS'
 
 set +e
-profile_output=$(CARGO_PROFILE_RELEASE_LTO=true run_helper 2>&1)
+profile_output=$(run_clean CARGO_PROFILE_RELEASE_LTO=true \
+    "$repository/scripts/build_benchmark.sh" 2>&1)
 profile_status=$?
 set -e
 [ "$profile_status" -ne 0 ]
@@ -153,31 +140,31 @@ printf '%s\n' "$external_config_output" | grep -q 'outside the tracked repositor
 rm -f "$test_home/.cargo/config.toml"
 
 set +e
-cargo_home_output=$(env CARGO_HOME="$test_root/alternate-cargo-home" \
-    RUSTUP_TOOLCHAIN=1.98.0-x86_64-unknown-linux-gnu HOME="$test_home" \
-    PATH="$fake_bin:$PATH" "$repository/scripts/build_benchmark.sh" 2>&1)
+cargo_home_output=$(run_clean CARGO_HOME="$test_root/alternate-cargo-home" \
+    RUSTUP_TOOLCHAIN=1.98.0-x86_64-unknown-linux-gnu \
+    "$repository/scripts/build_benchmark.sh" 2>&1)
 cargo_home_status=$?
 set -e
 [ "$cargo_home_status" -ne 0 ]
 printf '%s\n' "$cargo_home_output" | grep -q 'CARGO_HOME'
 
 set +e
-rustup_output=$(env -u CARGO_HOME RUSTUP_TOOLCHAIN=nightly HOME="$test_home" \
-    PATH="$fake_bin:$PATH" "$repository/scripts/build_benchmark.sh" 2>&1)
+rustup_output=$(run_clean RUSTUP_TOOLCHAIN=nightly \
+    "$repository/scripts/build_benchmark.sh" 2>&1)
 rustup_status=$?
 set -e
 [ "$rustup_status" -ne 0 ]
 printf '%s\n' "$rustup_output" | grep -q 'RUSTUP_TOOLCHAIN'
 
 set +e
-wrong_rustc_output=$(SNOOZER_TEST_RUSTC_VERSION=1.99.0 run_helper 2>&1)
+wrong_rustc_output=$(run_clean SNOOZER_TEST_RUSTC_VERSION=1.99.0 \
+    "$repository/scripts/build_benchmark.sh" 2>&1)
 wrong_rustc_status=$?
 set -e
 [ "$wrong_rustc_status" -ne 0 ]
 printf '%s\n' "$wrong_rustc_output" | grep -q 'does not match pinned Rust 1.98.0'
 
 SNOOZER_TEST_REAL_GIT=$(command -v git)
-export SNOOZER_TEST_REAL_GIT
 cat >"$fake_bin/git" <<'EOF'
 #!/bin/sh
 if [ "$1" = -C ] && [ "$3" = status ]; then
@@ -187,7 +174,8 @@ exec "$SNOOZER_TEST_REAL_GIT" "$@"
 EOF
 chmod +x "$fake_bin/git"
 set +e
-status_failure_output=$(run_helper 2>&1)
+status_failure_output=$(run_clean SNOOZER_TEST_REAL_GIT="$SNOOZER_TEST_REAL_GIT" \
+    "$repository/scripts/build_benchmark.sh" 2>&1)
 status_failure_status=$?
 set -e
 [ "$status_failure_status" -ne 0 ]
