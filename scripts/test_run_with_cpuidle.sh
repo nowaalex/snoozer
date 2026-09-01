@@ -135,6 +135,18 @@ set -e
 assert_original
 assert_clean
 
+# A failed apply/read-back path restores from the durable records and clears
+# both local and global dirty ownership only after exact restoration.
+set +e
+SNOOZER_TEST_FAIL_VALUE=1 SNOOZER_TEST_FAIL_PATH_SUFFIX=state2/disable \
+    run_benchmark >"$test_root/apply-failure.out" 2>&1
+apply_failure_status=$?
+set -e
+[ "$apply_failure_status" -ne 0 ]
+grep -q 'failed to apply' "$test_root/apply-failure.out"
+assert_original
+assert_clean
+
 # An external TERM has its own TERM-to-KILL deadline even if the workload
 # ignores TERM, and state restoration still completes.
 ready=$test_root/signal-ready
