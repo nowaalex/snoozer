@@ -68,6 +68,19 @@ if [ "${SNOOZER_TEST_MISMATCH_VALUE:-}" = "$value" ] \
     printf '%s\n' "$unexpected" >"$target"
     exit 0
 fi
+if [ "$value" = 1 ] && [ "${target##*/cpuidle/}" = state0/disable ]; then
+    for pid_file in "${SNOOZER_TEST_RESTORE_BENCHMARK_PID_FILE:-}" \
+        "${SNOOZER_TEST_RESTORE_DESCENDANT_PID_FILE:-}" \
+        "${SNOOZER_TEST_RESTORE_ANCHOR_PID_FILE:-}"; do
+        [ -n "$pid_file" ] || continue
+        [ -s "$pid_file" ] || exit 1
+        inspected_pid=$(tr -d "[:space:]" <"$pid_file")
+        case "$inspected_pid" in ""|*[!0-9]*) exit 1 ;; esac
+        inspected_state=$(ps -o stat= -p "$inspected_pid" 2>/dev/null \
+            | tr -d "[:space:]") || inspected_state=
+        case "$inspected_state" in ""|Z*) ;; *) exit 1 ;; esac
+    done
+fi
 printf '%s\n' "$value" >"$target"
 if [ -n "${SNOOZER_TEST_FIRST_RESTORE_FILE:-}" ] \
     && [ ! -e "$SNOOZER_TEST_FIRST_RESTORE_FILE" ] \
@@ -161,12 +174,23 @@ assert_clean() {
         [ ! -e "$supervisor_status" ] || return 1
     done
     for supervisor_handshake in "$state_root"/supervisor-ready.* \
-        "$state_root"/supervisor-go.* "$state_root"/guardian-ready.* \
+        "$state_root"/supervisor-go.* "$state_root"/supervisor-anchor-ready.* \
+        "$state_root"/supervisor-anchor-release.* "$state_root"/guardian-ready.* \
         "$state_root"/guardian-release.* "$state_root"/guardian-group.* \
         "$state_root"/guardian-proof-request.* \
         "$state_root"/guardian-proof-ready.*; do
         [ ! -e "$supervisor_handshake" ] || return 1
     done
+}
+
+assert_process_not_live() {
+    inspected_pid=$1
+    inspected_state=$(ps -o stat= -p "$inspected_pid" 2>/dev/null \
+        | tr -d '[:space:]') || inspected_state=
+    case "$inspected_state" in
+        ''|Z*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 assert_process_does_not_hold_runner_lock() {
@@ -219,6 +243,16 @@ grep -q '|.*/state0/disable$' "$write_log"
 grep -q '|.*/state4/disable$' "$write_log"
 ! grep -q '/cpu4/' "$write_log"
 [ "$(tr -d '[:space:]' <"$sysfs_root/cpu4/cpuidle/state0/disable")" = 0 ]
+
+# If the anchor dies immediately before release, the runner writes through its
+# already-open FIFO descriptor and completes without a blocking open race.
+anchor_release_death_start=$(monotonic_seconds)
+SNOOZER_TEST_ANCHOR_EXIT_BEFORE_RELEASE=1 run_benchmark \
+    >"$test_root/anchor-release-death.out" 2>&1
+anchor_release_death_elapsed=$(($(monotonic_seconds) - anchor_release_death_start))
+[ "$anchor_release_death_elapsed" -le "$MAX_NORMAL_RUN_SECONDS" ]
+assert_original
+assert_clean
 
 # Normal benchmark completion still drains a TERM-resistant descendant within
 # one bounded grace period before cpuidle restoration.
@@ -302,6 +336,22 @@ set -e
 [ "$supervisor_before_ready_status" -ne 0 ]
 grep -q 'exited before its startup handshake' \
     "$test_root/supervisor-before-ready.out"
+assert_original
+assert_clean
+
+# Anchor startup failure is visible before GO; no benchmark process is launched,
+# the failed anchor is reaped, and the applied CPU-idle policy is restored.
+anchor_startup_benchmark_ready=$test_root/anchor-startup-benchmark-ready
+set +e
+SNOOZER_TEST_ANCHOR_EXIT_BEFORE_READY=1 \
+    SNOOZER_TEST_READY=$anchor_startup_benchmark_ready \
+    run_benchmark >"$test_root/anchor-startup-failure.out" 2>&1
+anchor_startup_status=$?
+set -e
+[ "$anchor_startup_status" -ne 0 ]
+grep -q 'process-group anchor.*startup handshake' \
+    "$test_root/anchor-startup-failure.out"
+[ ! -e "$anchor_startup_benchmark_ready" ]
 assert_original
 assert_clean
 
@@ -418,8 +468,8 @@ set -e
 assert_original
 assert_clean
 
-# A status-write failure leaves the verified supervisor as the stopped PGID
-# anchor until the runner drains and reaps it.
+# A status-write failure leaves the supervisor stopped while the separate anchor
+# preserves the PGID until the runner drains and reaps the group.
 set +e
 SNOOZER_TEST_SUPERVISOR_SKIP_STATUS=1 \
     run_benchmark >"$test_root/supervisor-status-failure.out" 2>&1
@@ -569,6 +619,92 @@ for signal_specification in HUP:129 INT:130; do
     assert_original
     assert_clean
 done
+
+# Killing only the supervisor after GO cannot orphan a live benchmark group.
+# The stable in-group anchor preserves the PGID until the runner KILLs it and
+# the guardian proves every non-zombie member gone before the first restore.
+supervisor_death_ready=$test_root/supervisor-death-ready
+supervisor_death_never_release=$test_root/supervisor-death-never-release
+supervisor_death_supervisor_pid_file=$test_root/supervisor-death-supervisor-pid
+supervisor_death_anchor_pid_file=$test_root/supervisor-death-anchor-pid
+supervisor_death_benchmark_pid_file=$test_root/supervisor-death-benchmark-pid
+supervisor_death_descendant_pid_file=$test_root/supervisor-death-descendant-pid
+supervisor_death_first_restore=$test_root/supervisor-death-first-restore
+env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
+    SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    SNOOZER_TEST_READY="$supervisor_death_ready" \
+    SNOOZER_TEST_RELEASE="$supervisor_death_never_release" \
+    SNOOZER_TEST_IGNORE_TERM=1 SNOOZER_TEST_DESCENDANT_IGNORE_TERM=1 \
+    SNOOZER_TEST_SUPERVISOR_PID_FILE="$supervisor_death_supervisor_pid_file" \
+    SNOOZER_TEST_ANCHOR_PID_FILE="$supervisor_death_anchor_pid_file" \
+    SNOOZER_TEST_BENCHMARK_PID="$supervisor_death_benchmark_pid_file" \
+    SNOOZER_TEST_DESCENDANT_PID="$supervisor_death_descendant_pid_file" \
+    SNOOZER_TEST_RESTORE_BENCHMARK_PID_FILE="$supervisor_death_benchmark_pid_file" \
+    SNOOZER_TEST_RESTORE_DESCENDANT_PID_FILE="$supervisor_death_descendant_pid_file" \
+    SNOOZER_TEST_RESTORE_ANCHOR_PID_FILE="$supervisor_death_anchor_pid_file" \
+    SNOOZER_TEST_FIRST_RESTORE_FILE="$supervisor_death_first_restore" \
+    "$runner" --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 \
+    --producer-cpu 2 --controller-cpu 3 --timeout-seconds 30 \
+    >"$test_root/supervisor-death.out" 2>&1 &
+supervisor_death_runner_pid=$!
+attempt=0
+while [ ! -s "$supervisor_death_supervisor_pid_file" ] \
+    || [ ! -s "$supervisor_death_anchor_pid_file" ] \
+    || [ ! -s "$supervisor_death_benchmark_pid_file" ] \
+    || [ ! -s "$supervisor_death_descendant_pid_file" ]; do
+    if [ "$attempt" -ge 500 ]; then
+        printf 'supervisor=%s anchor=%s benchmark=%s descendant=%s\n' \
+            "$(test -s "$supervisor_death_supervisor_pid_file" && echo ready || echo missing)" \
+            "$(test -s "$supervisor_death_anchor_pid_file" && echo ready || echo missing)" \
+            "$(test -s "$supervisor_death_benchmark_pid_file" && echo ready || echo missing)" \
+            "$(test -s "$supervisor_death_descendant_pid_file" && echo ready || echo missing)" >&2
+        cat "$test_root/supervisor-death.out" >&2
+        kill -KILL "$supervisor_death_runner_pid" 2>/dev/null || true
+        exit 1
+    fi
+    sleep 0.01
+    attempt=$((attempt + 1))
+done
+supervisor_death_supervisor_pid=$(tr -d '[:space:]' \
+    <"$supervisor_death_supervisor_pid_file")
+supervisor_death_anchor_pid=$(tr -d '[:space:]' \
+    <"$supervisor_death_anchor_pid_file")
+supervisor_death_benchmark_pid=$(tr -d '[:space:]' \
+    <"$supervisor_death_benchmark_pid_file")
+supervisor_death_descendant_pid=$(tr -d '[:space:]' \
+    <"$supervisor_death_descendant_pid_file")
+supervisor_death_group=$(ps -o pgid= -p "$supervisor_death_anchor_pid" \
+    | tr -d '[:space:]')
+[ "$supervisor_death_group" = "$supervisor_death_supervisor_pid" ]
+assert_process_does_not_hold_runner_lock "$supervisor_death_anchor_pid"
+kill -KILL "$supervisor_death_supervisor_pid"
+attempt=0
+while kill -0 "$supervisor_death_runner_pid" 2>/dev/null \
+    && [ "$attempt" -lt 500 ]; do
+    sleep 0.01
+    attempt=$((attempt + 1))
+done
+if kill -0 "$supervisor_death_runner_pid" 2>/dev/null; then
+    cat "$test_root/supervisor-death.out" >&2
+    kill -KILL "$supervisor_death_runner_pid" 2>/dev/null || true
+    exit 1
+fi
+set +e
+wait "$supervisor_death_runner_pid"
+supervisor_death_status=$?
+set -e
+[ "$supervisor_death_status" -ne 0 ]
+if ! grep -q 'supervisor exited after go-ahead; its stable process group was killed and drained' \
+    "$test_root/supervisor-death.out"; then
+    cat "$test_root/supervisor-death.out" >&2
+    exit 1
+fi
+[ -s "$supervisor_death_first_restore" ]
+assert_process_not_live "$supervisor_death_benchmark_pid"
+assert_process_not_live "$supervisor_death_descendant_pid"
+assert_process_not_live "$supervisor_death_anchor_pid"
+assert_original
+assert_clean
 
 # The outer timeout terminates the workload and still restores exact state.
 ready=$test_root/timeout-ready

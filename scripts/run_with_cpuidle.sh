@@ -138,7 +138,7 @@ case "$timeout_seconds" in
     ''|*[!0-9]*|0) die "timeout must be a positive integer number of seconds" ;;
 esac
 
-for required in awk date flock id mktemp ps realpath setsid sleep stat sync timeout; do
+for required in awk date flock id mkfifo mktemp ps realpath setsid sleep stat sync timeout; do
     command -v "$required" >/dev/null 2>&1 || die "required command is unavailable: $required"
 done
 if [ -n "$write_helper" ]; then
@@ -593,6 +593,8 @@ clear_global_dirty_record() {
 remove_stale_runtime_files() {
     for runtime_file in "$state_root"/supervisor-status.* \
         "$state_root"/supervisor-ready.* "$state_root"/supervisor-go.* \
+        "$state_root"/supervisor-anchor-ready.* \
+        "$state_root"/supervisor-anchor-release.* \
         "$state_root"/guardian-ready.* "$state_root"/guardian-release.* \
         "$state_root"/guardian-group.* "$state_root"/guardian-proof-request.* \
         "$state_root"/guardian-proof-ready.*; do
@@ -682,7 +684,11 @@ manifest=$(mktemp "$state_root/manifest.XXXXXX")
 cleanup_manifest=1
 restored=0
 child_pid=
+child_group_id=
+child_anchor_pid=
 child_group_verified=0
+child_anchor_verified=0
+child_anchor_release_fd_open=0
 guardian_pid=
 guardian_group_verified=0
 guardian_ready_file=
@@ -693,23 +699,26 @@ guardian_proof_ready_file=
 supervisor_status_file=
 supervisor_ready_file=
 supervisor_go_file=
+supervisor_anchor_ready_file=
+supervisor_anchor_release_file=
 supervisor_launching=0
 signal_status=
 
 cleanup() {
     original_status=$?
     trap - EXIT HUP INT TERM
-    if [ -n "$child_pid" ]; then
-        if [ "$child_group_verified" -eq 1 ]; then
-            terminate_child "$child_pid" || {
-                echo "cpuidle runner: could not prove the benchmark process group was drained; recovery files are retained" >&2
-                exit 1
-            }
-        else
-            # Before the go-ahead handshake the supervisor cannot launch the
-            # benchmark and exits on its own after a fixed polling bound.
-            wait "$child_pid" 2>/dev/null || true
-        fi
+    if [ "$child_group_verified" -eq 1 ]; then
+        terminate_child "$child_pid" "$child_group_id" "$child_anchor_pid" || {
+            echo "cpuidle runner: could not prove the benchmark process group was drained; recovery files are retained" >&2
+            exit 1
+        }
+        child_pid=
+        child_group_id=
+        child_anchor_pid=
+    elif [ -n "$child_pid" ]; then
+        # Before the go-ahead handshake the supervisor cannot launch the
+        # benchmark and exits on its own after a fixed polling bound.
+        wait "$child_pid" 2>/dev/null || true
         child_pid=
     fi
     if [ -n "$guardian_pid" ]; then
@@ -724,14 +733,21 @@ cleanup() {
         guardian_pid=
         guardian_group_verified=0
     fi
+    if [ "$child_anchor_release_fd_open" -eq 1 ]; then
+        exec 6>&- || true
+        child_anchor_release_fd_open=0
+    fi
     rm -f "${supervisor_status_file:-}" "${supervisor_ready_file:-}" \
-        "${supervisor_go_file:-}" "${guardian_ready_file:-}" \
+        "${supervisor_go_file:-}" "${supervisor_anchor_ready_file:-}" \
+        "${supervisor_anchor_release_file:-}" "${guardian_ready_file:-}" \
         "${guardian_release_file:-}" "${guardian_group_file:-}" \
         "${guardian_proof_request_file:-}" "${guardian_proof_ready_file:-}" \
         2>/dev/null || true
     supervisor_status_file=
     supervisor_ready_file=
     supervisor_go_file=
+    supervisor_anchor_ready_file=
+    supervisor_anchor_release_file=
     if [ -e "$global_dirty_marker" ] && [ -z "$global_record" ]; then
         # A handled signal may arrive after ln(2) published the marker but
         # before the next shell assignment. Re-adopt only the exact record this
@@ -790,26 +806,45 @@ handle_signal() {
     if [ "$supervisor_launching" -eq 1 ]; then
         return
     fi
-    if [ -n "$child_pid" ]; then
-        terminate_child "$child_pid" || {
+    if [ "$child_group_verified" -eq 1 ]; then
+        terminate_child "$child_pid" "$child_group_id" "$child_anchor_pid" || {
             echo "cpuidle runner: could not prove the benchmark process group was drained; recovery files are retained" >&2
             exit 1
         }
         child_pid=
+        child_group_id=
+        child_anchor_pid=
     fi
     exit "$signal_status"
 }
 
 process_group_has_live_descendants() {
     inspected_group=$1
-    # The live supervisor owns the PGID until the runner releases it. Exclude
-    # only that known leader; every non-zombie descendant must leave first.
+    inspected_supervisor=$2
+    inspected_anchor=$3
+    # The verified anchor preserves the PGID independently of the supervisor.
+    # Exclude those two owned processes; every other non-zombie member must
+    # leave before the graceful release path can continue.
     # Inspection failure is treated as live and therefore takes the KILL path.
     group_processes=$(ps -eo pid=,pgid=,stat= 2>/dev/null) || return 0
-    printf '%s\n' "$group_processes" | awk -v expected_group="$inspected_group" '
-        $2 == expected_group && $1 != expected_group && $3 !~ /^Z/ { found = 1 }
+    printf '%s\n' "$group_processes" | awk \
+        -v expected_group="$inspected_group" \
+        -v expected_supervisor="$inspected_supervisor" \
+        -v expected_anchor="$inspected_anchor" '
+        $2 == expected_group && $1 != expected_supervisor \
+            && $1 != expected_anchor && $3 !~ /^Z/ { found = 1 }
         END { exit !found }
     '
+}
+
+process_is_live_non_zombie() {
+    inspected_pid=$1
+    inspected_state=$(ps -o stat= -p "$inspected_pid" 2>/dev/null | tr -d '[:space:]') \
+        || inspected_state=
+    case "$inspected_state" in
+        ''|Z*) return 1 ;;
+        *) return 0 ;;
+    esac
 }
 
 process_start_ticks() {
@@ -856,9 +891,9 @@ termination_budget_remaining() {
 }
 
 prove_killed_group_drained() {
-    inspected_pid=$1
+    inspected_group=$1
     [ -n "$guardian_pid" ] && [ "$guardian_group_verified" -eq 1 ] || return 1
-    printf '%s\n' "$inspected_pid" >"$guardian_proof_request_file" || return 1
+    printf '%s\n' "$inspected_group" >"$guardian_proof_request_file" || return 1
     while [ ! -s "$guardian_proof_ready_file" ]; do
         guardian_state=$(ps -o stat= -p "$guardian_pid" 2>/dev/null | tr -d '[:space:]') \
             || guardian_state=
@@ -868,67 +903,110 @@ prove_killed_group_drained() {
         sleep 0.05
     done
     proved_group=$(tr -d '[:space:]' <"$guardian_proof_ready_file") || return 1
-    [ "$proved_group" = "$inspected_pid" ]
+    [ "$proved_group" = "$inspected_group" ]
 }
 
 signal_child_group() {
     child_signal=$1
-    inspected_pid=$2
+    inspected_group=$2
     [ "$child_group_verified" -eq 1 ] || return 1
-    # The verified, unreaped supervisor remains the group leader until this
-    # function reaps it. Therefore this negative PGID cannot be recycled.
-    kill -s "$child_signal" -- "-$inspected_pid" 2>/dev/null
+    # The verified anchor keeps this PGID allocated even if the supervisor has
+    # already become a zombie, so this negative PGID cannot be recycled.
+    kill -s "$child_signal" -- "-$inspected_group" 2>/dev/null
+}
+
+release_child_anchor() {
+    inspected_anchor=$1
+    [ "$child_anchor_verified" -eq 1 ] || return 1
+    [ "$child_anchor_release_fd_open" -eq 1 ] || return 1
+    if [ "${SNOOZER_TEST_ANCHOR_EXIT_BEFORE_RELEASE:-}" = 1 ]; then
+        kill -KILL "$inspected_anchor" 2>/dev/null || true
+        release_test_attempt=0
+        while process_is_live_non_zombie "$inspected_anchor" \
+            && [ "$release_test_attempt" -lt "$SUPERVISOR_STARTUP_POLLS" ]; do
+            sleep 0.01
+            release_test_attempt=$((release_test_attempt + 1))
+        done
+        ! process_is_live_non_zombie "$inspected_anchor" || return 1
+    fi
+    printf 'release\n' >&6 || return 1
+    while process_is_live_non_zombie "$inspected_anchor" \
+        && termination_budget_remaining; do
+        sleep 0.05
+        termination_attempt=$((termination_attempt + 1))
+    done
+    ! process_is_live_non_zombie "$inspected_anchor"
 }
 
 terminate_child() {
-    inspected_pid=$1
-    termination_mode=${2:-graceful}
-    [ "$child_group_verified" -eq 1 ] || return 1
+    inspected_supervisor=$1
+    inspected_group=$2
+    inspected_anchor=$3
+    termination_mode=${4:-graceful}
+    [ "$child_group_verified" -eq 1 ] \
+        && [ "$child_anchor_verified" -eq 1 ] \
+        && [ -n "$inspected_group" ] \
+        && [ -n "$inspected_anchor" ] || return 1
     child_group_killed=0
-    if [ "$termination_mode" = immediate ]; then
-        signal_child_group KILL "$inspected_pid" || return 1
+    if [ "$termination_mode" = immediate ] \
+        || ! process_is_live_non_zombie "$inspected_supervisor" \
+        || ! process_is_live_non_zombie "$inspected_anchor"; then
+        signal_child_group KILL "$inspected_group" || true
         child_group_killed=1
     else
-        signal_child_group TERM "$inspected_pid" || true
+        signal_child_group TERM "$inspected_group" || true
         termination_attempt=0
         termination_started=$(monotonic_milliseconds) || termination_started=
         if [ -z "$termination_started" ]; then
-            signal_child_group KILL "$inspected_pid" || return 1
+            signal_child_group KILL "$inspected_group" || true
             child_group_killed=1
         else
             termination_deadline=$((termination_started + KILL_GRACE_MILLISECONDS))
-            while process_group_has_live_descendants "$inspected_pid" \
+            while process_group_has_live_descendants "$inspected_group" \
+                "$inspected_supervisor" "$inspected_anchor" \
                 && termination_budget_remaining; do
                 sleep 0.05
                 termination_attempt=$((termination_attempt + 1))
             done
-            if process_group_has_live_descendants "$inspected_pid"; then
-                signal_child_group KILL "$inspected_pid" || return 1
+            if process_group_has_live_descendants "$inspected_group" \
+                "$inspected_supervisor" "$inspected_anchor"; then
+                signal_child_group KILL "$inspected_group" || true
                 child_group_killed=1
             else
-                # Do not send CONT before the supervisor reaches its final STOP;
-                # otherwise a fast child exit could miss the wake and hang reap.
-                while ! supervisor_is_stopped "$inspected_pid" \
+                # Do not release the anchor or send CONT before the supervisor
+                # reaches its final STOP; otherwise a fast benchmark exit could
+                # miss the wake and release the stable group identity early.
+                while ! supervisor_is_stopped "$inspected_supervisor" \
+                    && process_is_live_non_zombie "$inspected_supervisor" \
                     && termination_budget_remaining; do
                     sleep 0.05
                     termination_attempt=$((termination_attempt + 1))
                 done
-                if supervisor_is_stopped "$inspected_pid"; then
-                    kill -CONT "$inspected_pid" 2>/dev/null || return 1
+                if supervisor_is_stopped "$inspected_supervisor" \
+                    && release_child_anchor "$inspected_anchor"; then
+                    kill -CONT "$inspected_supervisor" 2>/dev/null || {
+                        signal_child_group KILL "$inspected_group" || true
+                        child_group_killed=1
+                    }
                 else
-                    signal_child_group KILL "$inspected_pid" || return 1
+                    signal_child_group KILL "$inspected_group" || true
                     child_group_killed=1
                 fi
             fi
         fi
     fi
-    # Keep the unreaped supervisor as the PGID owner until no non-zombie member
-    # remains. Only then can reaping release the numeric process-group identity.
+    # Keep the verified group identity until the guardian proves every
+    # non-zombie member is gone. Only then may the supervisor be reaped.
     if [ "$child_group_killed" -eq 1 ]; then
-        prove_killed_group_drained "$inspected_pid" || return 1
+        prove_killed_group_drained "$inspected_group" || return 1
     fi
-    wait "$inspected_pid" 2>/dev/null || true
+    if [ -n "$inspected_supervisor" ]; then
+        wait "$inspected_supervisor" 2>/dev/null || true
+    fi
     child_group_verified=0
+    child_anchor_verified=0
+    child_group_id=
+    child_anchor_pid=
 }
 
 verify_child_process_group() {
@@ -947,6 +1025,7 @@ verify_child_process_group() {
         esac
         group=$(ps -o pgid= -p "$inspected_pid" 2>/dev/null | tr -d '[:space:]') || group=
         if [ "$group" = "$inspected_pid" ]; then
+            child_group_id=$group
             child_group_verified=1
             return 0
         fi
@@ -965,6 +1044,47 @@ verify_child_process_group() {
     child_pid=
     supervisor_launching=0
     die "benchmark supervisor did not acquire a dedicated process group"
+}
+
+verify_child_anchor() {
+    inspected_anchor=$1
+    inspected_group=$2
+    inspected_supervisor=$3
+    case "$inspected_anchor" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$inspected_anchor" != "$inspected_supervisor" ] || return 1
+    process_is_live_non_zombie "$inspected_anchor" || return 1
+    anchor_group=$(ps -o pgid= -p "$inspected_anchor" 2>/dev/null | tr -d '[:space:]') \
+        || anchor_group=
+    [ "$anchor_group" = "$inspected_group" ] || return 1
+    child_anchor_pid=$inspected_anchor
+    child_anchor_verified=1
+}
+
+process_group_has_live_members() {
+    inspected_group=$1
+    group_processes=$(ps -eo pgid=,stat= 2>/dev/null) || return 0
+    printf '%s\n' "$group_processes" | awk -v expected_group="$inspected_group" '
+        $1 == expected_group && $2 !~ /^Z/ { found = 1 }
+        END { exit !found }
+    '
+}
+
+drain_unpublished_child_group() {
+    inspected_supervisor=$1
+    inspected_group=$2
+    signal_child_group KILL "$inspected_group" || true
+    drain_attempt=0
+    while process_group_has_live_members "$inspected_group" \
+        && [ "$drain_attempt" -lt "$SUPERVISOR_STARTUP_POLLS" ]; do
+        sleep 0.01
+        drain_attempt=$((drain_attempt + 1))
+    done
+    process_group_has_live_members "$inspected_group" && return 1
+    wait "$inspected_supervisor" 2>/dev/null || true
+    child_group_verified=0
+    child_anchor_verified=0
+    child_group_id=
+    child_anchor_pid=
 }
 
 trap cleanup EXIT
@@ -1199,32 +1319,95 @@ guardian_group=$(ps -o pgid= -p "$guardian_pid" 2>/dev/null | tr -d '[:space:]')
     || die "benchmark crash guardian did not acquire a dedicated process group"
 guardian_group_verified=1
 
-# The supervisor remains the inner process-group leader after timeout exits and
-# until the runner drains that group. It closes all runner locks before READY.
+# The supervisor creates a separate in-group anchor before READY. The anchor
+# closes all runner locks by inheritance from the supervisor, preserves the
+# verified PGID if only the supervisor dies, and exits only after explicit
+# release or group KILL.
 supervisor_status_file=$(mktemp "$state_root/supervisor-status.XXXXXX") \
     || die "cannot allocate supervisor status file"
 supervisor_ready_file=$(mktemp "$state_root/supervisor-ready.XXXXXX") \
     || die "cannot allocate supervisor ready file"
 supervisor_go_file=$(mktemp "$state_root/supervisor-go.XXXXXX") \
     || die "cannot allocate supervisor go file"
+supervisor_anchor_ready_file=$(mktemp "$state_root/supervisor-anchor-ready.XXXXXX") \
+    || die "cannot allocate supervisor anchor ready file"
+supervisor_anchor_release_file=$(mktemp "$state_root/supervisor-anchor-release.XXXXXX") \
+    || die "cannot allocate supervisor anchor release file"
 rm -f "$supervisor_ready_file" "$supervisor_go_file" \
+    "$supervisor_anchor_ready_file" "$supervisor_anchor_release_file" \
     || die "cannot initialize supervisor handshake files"
+mkfifo "$supervisor_anchor_release_file" \
+    || die "cannot create supervisor anchor release channel"
+chmod 600 "$supervisor_anchor_release_file" \
+    || die "cannot protect supervisor anchor release channel"
+exec 6<>"$supervisor_anchor_release_file" \
+    || die "cannot open supervisor anchor release channel"
+child_anchor_release_fd_open=1
 
 set +e
 setsid sh -c '
     ready_file=$1
     go_file=$2
     status_file=$3
-    startup_polls=$4
-    kill_grace=$5
-    duration=$6
-    shift 6
-    exec 7>&- 8>&- 9>&- || exit 125
+    anchor_ready_file=$4
+    anchor_release_file=$5
+    startup_polls=$6
+    kill_grace=$7
+    duration=$8
+    shift 8
+    exec 6>&- 7>&- 8>&- 9>&- || exit 125
     trap "" TERM
     trap "exit 0" CONT
+    anchor_pid=
+    cleanup_anchor() {
+        [ -n "$anchor_pid" ] || return 0
+        kill -KILL "$anchor_pid" 2>/dev/null || :
+        wait "$anchor_pid" 2>/dev/null || :
+        anchor_pid=
+    }
+    anchor_startup_failed() {
+        printf "anchor-startup-failed\n" >"$status_file" || :
+        exit 125
+    }
+    trap "cleanup_anchor" EXIT
     [ "${SNOOZER_TEST_SUPERVISOR_EXIT_BEFORE_READY:-}" != 1 ] || exit 125
     own_group=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d "[:space:]") || exit 125
     [ "$own_group" = "$$" ] || exit 125
+    (
+        trap "" HUP INT TERM CONT
+        [ "${SNOOZER_TEST_ANCHOR_EXIT_BEFORE_READY:-}" != 1 ] || exit 125
+        # The runner already owns both FIFO ends, so opening this separate read
+        # descriptor cannot block. READY proves this read end is attached.
+        exec 6<"$anchor_release_file" || exit 125
+        : >"$anchor_ready_file" || exit 125
+        IFS= read -r anchor_release <&6 || exit 125
+        [ "$anchor_release" = release ] || exit 125
+        exec 6>&- || exit 125
+    ) &
+    anchor_pid=$!
+    anchor_attempt=0
+    while [ ! -e "$anchor_ready_file" ] \
+        && [ "$anchor_attempt" -lt "$startup_polls" ]; do
+        kill -0 "$anchor_pid" 2>/dev/null || anchor_startup_failed
+        sleep 0.01
+        anchor_attempt=$((anchor_attempt + 1))
+    done
+    [ -e "$anchor_ready_file" ] || anchor_startup_failed
+    anchor_state=$(ps -o stat= -p "$anchor_pid" 2>/dev/null | tr -d "[:space:]") \
+        || anchor_state=
+    case "$anchor_state" in ""|Z*) anchor_startup_failed ;; esac
+    anchor_group=$(ps -o pgid= -p "$anchor_pid" 2>/dev/null | tr -d "[:space:]") \
+        || anchor_group=
+    [ "$anchor_group" = "$own_group" ] || anchor_startup_failed
+    printf "%s\n" "$anchor_pid" >"$anchor_ready_file" || anchor_startup_failed
+    if [ -n "${SNOOZER_TEST_ANCHOR_PID_FILE:-}" ]; then
+        printf "%s\n" "$anchor_pid" >"$SNOOZER_TEST_ANCHOR_PID_FILE" \
+            || anchor_startup_failed
+    fi
+    if [ -n "${SNOOZER_TEST_SUPERVISOR_PID_FILE:-}" ]; then
+        printf "%s\n" "$$" >"$SNOOZER_TEST_SUPERVISOR_PID_FILE" \
+            || anchor_startup_failed
+    fi
     printf "%s\n" "$$" >"$ready_file" || exit 125
     [ "${SNOOZER_TEST_SUPERVISOR_EXIT_AFTER_READY:-}" != 1 ] || exit 125
     startup_attempt=0
@@ -1238,7 +1421,7 @@ setsid sh -c '
         exec timeout --foreground --signal=TERM --kill-after="${kill_grace}s" "$duration" "$@"
     )
     command_status=$?
-    # Even if status publication fails, remain as the owned, stopped group
+    # Even if status publication fails, stop without releasing the separate
     # anchor. The runner can then drain the verified PGID without guessing.
     if [ "${SNOOZER_TEST_SUPERVISOR_SKIP_STATUS:-}" != 1 ]; then
         printf "%s\n" "$command_status" >"$status_file" || :
@@ -1246,8 +1429,9 @@ setsid sh -c '
     kill -STOP "$$"
     exit 125
 ' snoozer-benchmark-supervisor "$supervisor_ready_file" "$supervisor_go_file" \
-    "$supervisor_status_file" "$SUPERVISOR_STARTUP_POLLS" "$KILL_GRACE_SECONDS" \
-    "$timeout_seconds" "$binary" \
+    "$supervisor_status_file" "$supervisor_anchor_ready_file" \
+    "$supervisor_anchor_release_file" "$SUPERVISOR_STARTUP_POLLS" \
+    "$KILL_GRACE_SECONDS" "$timeout_seconds" "$binary" \
     --waiter-cpu "$waiter_cpu" \
     --victim-cpu "$victim_cpu" \
     --producer-cpu "$producer_cpu" \
@@ -1262,6 +1446,9 @@ while [ ! -s "$supervisor_ready_file" ] \
         wait "$child_pid" 2>/dev/null || true
         child_pid=
         supervisor_launching=0
+        if grep -qx 'anchor-startup-failed' "$supervisor_status_file" 2>/dev/null; then
+            die "benchmark process-group anchor exited before its startup handshake"
+        fi
         die "benchmark supervisor exited before its startup handshake"
     fi
     sleep 0.01
@@ -1273,6 +1460,9 @@ if [ ! -s "$supervisor_ready_file" ]; then
     wait "$child_pid" 2>/dev/null || true
     child_pid=
     supervisor_launching=0
+    if grep -qx 'anchor-startup-failed' "$supervisor_status_file" 2>/dev/null; then
+        die "benchmark process-group anchor did not complete its startup handshake"
+    fi
     die "benchmark supervisor did not complete its startup handshake"
 fi
 reported_supervisor_pid=$(tr -d '[:space:]' <"$supervisor_ready_file")
@@ -1283,6 +1473,14 @@ reported_supervisor_pid=$(tr -d '[:space:]' <"$supervisor_ready_file")
     die "benchmark supervisor startup identity did not match its owned child PID"
 }
 verify_child_process_group "$child_pid"
+reported_anchor_pid=$(tr -d '[:space:]' <"$supervisor_anchor_ready_file") \
+    || reported_anchor_pid=
+if ! verify_child_anchor "$reported_anchor_pid" "$child_group_id" "$child_pid"; then
+    drain_unpublished_child_group "$child_pid" "$child_group_id" || exit 1
+    child_pid=
+    supervisor_launching=0
+    die "benchmark process-group anchor failed verification before benchmark authorization"
+fi
 guardian_state=$(ps -o stat= -p "$guardian_pid" 2>/dev/null | tr -d '[:space:]') \
     || guardian_state=
 guardian_group=$(ps -o pgid= -p "$guardian_pid" 2>/dev/null | tr -d '[:space:]') \
@@ -1292,10 +1490,8 @@ guardian_invalid=0
     || guardian_invalid=1
 case "$guardian_state" in Z*) guardian_invalid=1 ;; esac
 if [ "$guardian_invalid" -eq 1 ]; then
-    signal_child_group KILL "$child_pid" || true
-    wait "$child_pid" 2>/dev/null || true
+    drain_unpublished_child_group "$child_pid" "$child_group_id" || exit 1
     child_pid=
-    child_group_verified=0
     wait "$guardian_pid" 2>/dev/null || true
     guardian_pid=
     guardian_group_verified=0
@@ -1303,17 +1499,15 @@ if [ "$guardian_invalid" -eq 1 ]; then
     die "benchmark crash guardian exited before benchmark authorization"
 fi
 if [ "${SNOOZER_TEST_FAIL_GROUP_PUBLICATION:-}" = 1 ] \
-    || ! printf '%s\n' "$child_pid" >"$guardian_group_file"; then
-    signal_child_group KILL "$child_pid" || true
-    wait "$child_pid" 2>/dev/null || true
+    || ! printf '%s\n' "$child_group_id" >"$guardian_group_file"; then
+    drain_unpublished_child_group "$child_pid" "$child_group_id" || exit 1
     child_pid=
-    child_group_verified=0
     supervisor_launching=0
     die "cannot publish the verified benchmark process-group identity"
 fi
 supervisor_launching=0
 if [ -n "$signal_status" ]; then
-    terminate_child "$child_pid" immediate || exit 1
+    terminate_child "$child_pid" "$child_group_id" "$child_anchor_pid" immediate || exit 1
     child_pid=
     exit "$signal_status"
 fi
@@ -1324,7 +1518,7 @@ case "${SNOOZER_TEST_SIGNAL_AFTER_GROUP_VERIFY:-}" in
 esac
 if [ "${SNOOZER_TEST_FAIL_GO_PUBLICATION:-}" = 1 ] \
     || ! : >"$supervisor_go_file"; then
-    terminate_child "$child_pid" immediate || exit 1
+    terminate_child "$child_pid" "$child_group_id" "$child_anchor_pid" immediate || exit 1
     child_pid=
     die "cannot publish the benchmark go-ahead"
 fi
@@ -1334,10 +1528,12 @@ while :; do
         || supervisor_state=
     case "$supervisor_state" in
         ''|Z*)
-        wait "$child_pid" 2>/dev/null || true
+        if ! terminate_child "$child_pid" "$child_group_id" "$child_anchor_pid" immediate; then
+            echo "cpuidle runner: could not prove the benchmark process group was drained after supervisor death; recovery files are retained" >&2
+            exit 1
+        fi
         child_pid=
-        child_group_verified=0
-        die "benchmark supervisor exited without preserving its process-group anchor"
+        die "benchmark supervisor exited after go-ahead; its stable process group was killed and drained"
         ;;
     esac
     if [ -s "$supervisor_status_file" ]; then
@@ -1347,7 +1543,11 @@ while :; do
     else
         case "$supervisor_state" in
             T*)
-                terminate_child "$child_pid" immediate
+                terminate_child "$child_pid" "$child_group_id" "$child_anchor_pid" immediate \
+                    || {
+                        echo "cpuidle runner: could not prove the benchmark process group was drained after missing status; recovery files are retained" >&2
+                        exit 1
+                    }
                 child_pid=
                 die "benchmark supervisor stopped without reporting benchmark status"
                 ;;
@@ -1358,27 +1558,51 @@ done
 command_status=$(tr -d '[:space:]' <"$supervisor_status_file")
 case "$command_status" in
     ''|*[!0-9]*)
-        terminate_child "$child_pid"
+        terminate_child "$child_pid" "$child_group_id" "$child_anchor_pid" || {
+            echo "cpuidle runner: could not prove the benchmark process group was drained after invalid status; recovery files are retained" >&2
+            exit 1
+        }
         child_pid=
         die "benchmark supervisor reported an invalid status"
         ;;
 esac
 if [ "$command_status" -gt 255 ]; then
-    terminate_child "$child_pid"
+    terminate_child "$child_pid" "$child_group_id" "$child_anchor_pid" || {
+        echo "cpuidle runner: could not prove the benchmark process group was drained after invalid status; recovery files are retained" >&2
+        exit 1
+    }
     child_pid=
     die "benchmark supervisor reported an invalid status"
 fi
 # GNU timeout --foreground signals only the direct benchmark process. Drain the
 # still-owned process group before restoring cpuidle so no benchmark descendant
 # can outlive the measured run, including on the timeout path.
+drain_status=0
 case "$command_status" in
-    124|137) terminate_child "$child_pid" immediate ;;
-    *) terminate_child "$child_pid" ;;
+    124|137)
+        terminate_child "$child_pid" "$child_group_id" "$child_anchor_pid" immediate \
+            || drain_status=$?
+        ;;
+    *)
+        terminate_child "$child_pid" "$child_group_id" "$child_anchor_pid" \
+            || drain_status=$?
+        ;;
 esac
+[ "$drain_status" -eq 0 ] || {
+    echo "cpuidle runner: could not prove the benchmark process group was drained; recovery files are retained" >&2
+    exit 1
+}
 child_pid=
-rm -f "$supervisor_status_file" "$supervisor_ready_file" "$supervisor_go_file"
+if [ "$child_anchor_release_fd_open" -eq 1 ]; then
+    exec 6>&- || true
+    child_anchor_release_fd_open=0
+fi
+rm -f "$supervisor_status_file" "$supervisor_ready_file" "$supervisor_go_file" \
+    "$supervisor_anchor_ready_file" "$supervisor_anchor_release_file"
 supervisor_status_file=
 supervisor_ready_file=
 supervisor_go_file=
+supervisor_anchor_ready_file=
+supervisor_anchor_release_file=
 set -e
 exit "$command_status"
