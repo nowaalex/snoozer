@@ -22,6 +22,12 @@ categories = ["concurrency", "hardware-support"]
 name = "wake_latency"
 harness = false
 
+[workspace.dependencies]
+loom = "0.7.2"
+
+[dev-dependencies]
+loom.workspace = true
+
 [features]
 default = []
 # This feature exists only so the repository benchmark can measure the C1

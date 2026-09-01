@@ -11,6 +11,12 @@ use crate::{WaitStrategy, WaitTimeoutResult};
 const EMPTY_TOKEN: u32 = 0;
 const NOTIFIED_TOKEN: u32 = 1;
 
+macro_rules! publish_token {
+    ($token:expr, $notification_bits:expr, $release_ordering:expr) => {
+        $token.fetch_or($notification_bits, $release_ordering)
+    };
+}
+
 #[repr(align(128))]
 struct CacheLineToken(AtomicU32);
 
@@ -193,10 +199,63 @@ impl Unparker {
         // Consecutive RMWs form a release sequence, so the consumer's Acquire
         // CAS synchronizes with every coalesced producer publication rather
         // than only the last producer to overwrite the token.
-        self.shared
-            .token
-            .0
-            .fetch_or(NOTIFIED_TOKEN, Ordering::Release);
+        publish_token!(self.shared.token.0, NOTIFIED_TOKEN, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod loom_tests {
+    use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use loom::thread;
+
+    const FIRST_PRODUCER: u32 = 1 << 0;
+    const SECOND_PRODUCER: u32 = 1 << 1;
+    const BOTH_PRODUCERS: u32 = FIRST_PRODUCER | SECOND_PRODUCER;
+
+    #[test]
+    fn coalesced_release_sequence_carries_every_producer_publication() {
+        loom::model(|| {
+            let token = Arc::new(AtomicU32::new(0));
+            let completed = Arc::new(AtomicU32::new(0));
+            let first_payload = Arc::new(AtomicUsize::new(0));
+            let second_payload = Arc::new(AtomicUsize::new(0));
+
+            let first_token = Arc::clone(&token);
+            let first_completed = Arc::clone(&completed);
+            let first_value = Arc::clone(&first_payload);
+            let first = thread::spawn(move || {
+                first_value.store(11, Ordering::Relaxed);
+                publish_token!(first_token, FIRST_PRODUCER, Ordering::Release);
+                first_completed.fetch_or(FIRST_PRODUCER, Ordering::Relaxed);
+            });
+
+            let second_token = Arc::clone(&token);
+            let second_completed = Arc::clone(&completed);
+            let second_value = Arc::clone(&second_payload);
+            let second = thread::spawn(move || {
+                second_value.store(22, Ordering::Relaxed);
+                publish_token!(second_token, SECOND_PRODUCER, Ordering::Release);
+                second_completed.fetch_or(SECOND_PRODUCER, Ordering::Relaxed);
+            });
+
+            // This Relaxed test-only marker guarantees progress but creates no
+            // synchronization edge to either payload. Only the token's final
+            // Acquire may make both Relaxed publications visible.
+            while completed.load(Ordering::Relaxed) != BOTH_PRODUCERS {
+                thread::yield_now();
+            }
+
+            assert_eq!(
+                token.compare_exchange(BOTH_PRODUCERS, 0, Ordering::Acquire, Ordering::Relaxed,),
+                Ok(BOTH_PRODUCERS)
+            );
+            assert_eq!(first_payload.load(Ordering::Relaxed), 11);
+            assert_eq!(second_payload.load(Ordering::Relaxed), 22);
+
+            assert!(first.join().is_ok());
+            assert!(second.join().is_ok());
+        });
     }
 }
 
