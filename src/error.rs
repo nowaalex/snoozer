@@ -65,3 +65,23 @@ impl Display for UnsupportedStrategy {
 }
 
 impl Error for UnsupportedStrategy {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_error_exposes_typed_fields_and_display_context() {
+        let error = UnsupportedStrategy {
+            strategy: Strategy::AmdMwaitx,
+            reason: UnsupportedReason::MissingMonitorxMwaitx,
+        };
+
+        assert_eq!(error.strategy(), Strategy::AmdMwaitx);
+        assert_eq!(error.reason(), UnsupportedReason::MissingMonitorxMwaitx);
+        assert_eq!(
+            error.to_string(),
+            "strategy AmdMwaitx is unavailable: MissingMonitorxMwaitx"
+        );
+    }
+}

@@ -36,8 +36,11 @@ cargo mutants
 ```
 
 The checked-in [cargo-mutants configuration](.cargo/mutants.toml) selects nextest, the workspace,
-and all features. An assembly encoding that cargo-mutants cannot vary still needs a focused
-encoding or hardware test.
+and all features. It mutation-tests the portable strategy and token protocols with a bounded
+nextest profile. CPUID/TSC calibration, the inline-assembly module, and methods that directly cross
+the MWAITX instruction boundary are excluded because their result depends on the CI host; those
+paths instead require focused capability, encoding/safety-review, and bounded target-hardware
+tests.
 
 ## Hardware smoke tests
 

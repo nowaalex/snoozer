@@ -617,6 +617,51 @@ impl StrategyImpl for TestGateStrategy {
 impl_wait_strategy!(TestGateStrategy);
 
 #[cfg(test)]
+pub(crate) struct TestTimeoutStrategy {
+    pause: Duration,
+    observed_budgets: std::sync::Arc<std::sync::Mutex<Vec<Duration>>>,
+}
+
+#[cfg(test)]
+impl TestTimeoutStrategy {
+    pub(crate) fn new(pause: Duration) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Duration>>>) {
+        let observed_budgets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                pause,
+                observed_budgets: std::sync::Arc::clone(&observed_budgets),
+            },
+            observed_budgets,
+        )
+    }
+}
+
+#[cfg(test)]
+impl StrategyImpl for TestTimeoutStrategy {
+    fn strategy(&self) -> Strategy {
+        Strategy::BusySpin
+    }
+
+    fn wait_raw<A: WaitableAtomic>(
+        &self,
+        atomic: &A,
+        expected: A::Value,
+        deadline: Option<Deadline>,
+    ) -> WaitTimeoutResult<A::Value> {
+        let budget = deadline.and_then(Deadline::remaining).unwrap_or_default();
+        match self.observed_budgets.lock() {
+            Ok(mut observed) => observed.push(budget),
+            Err(poisoned) => poisoned.into_inner().push(budget),
+        }
+        std::thread::sleep(self.pause.min(budget));
+        classify_after_wait(atomic, expected, deadline)
+    }
+}
+
+#[cfg(test)]
+impl_wait_strategy!(TestTimeoutStrategy);
+
+#[cfg(test)]
 mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     use std::sync::atomic::AtomicBool;
@@ -626,10 +671,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deadlines_report_a_bounded_remaining_interval_and_expire() {
+        let timeout = Duration::from_secs(60);
+        let deadline = Deadline::new(timeout);
+        let remaining = deadline
+            .remaining()
+            .expect("fresh deadline must remain live");
+        assert!(remaining <= timeout);
+        assert!(!remaining.is_zero());
+
+        let expired = Deadline {
+            started: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("one second must be representable"),
+            timeout: Duration::from_millis(1),
+        };
+        assert_eq!(expired.remaining(), None);
+    }
+
+    #[test]
+    fn public_strategy_identity_and_spin_configuration_are_exact() {
+        let yielding = SpinThenYield::new(17);
+        assert_eq!(yielding.spin_iterations(), 17);
+        assert_eq!(WaitStrategy::strategy(&BusySpin), Strategy::BusySpin);
+        assert_eq!(WaitStrategy::strategy(&yielding), Strategy::SpinThenYield);
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let amd = AmdMwaitx {
+                config: AmdConfig { timer_hz: 1 },
+            };
+            let hybrid = SpinThenAmdMwaitx {
+                spin_iterations: 19,
+                amd,
+            };
+            assert_eq!(hybrid.spin_iterations(), 19);
+            assert_eq!(StrategyImpl::strategy(&amd), Strategy::AmdMwaitx);
+            assert_eq!(StrategyImpl::strategy(&hybrid), Strategy::SpinThenAmdMwaitx);
+
+            #[cfg(feature = "benchmark-only")]
+            {
+                let diagnostic = AmdMwaitxC1 { config: amd.config };
+                assert_eq!(StrategyImpl::strategy(&diagnostic), Strategy::AmdMwaitx);
+            }
+        }
+    }
+
+    #[test]
+    fn pure_wait_classification_helpers_preserve_the_contract() {
+        let changed = AtomicU32::new(7);
+        assert_eq!(
+            spin_prefix(&changed, 6, 0, None),
+            Some(WaitTimeoutResult::Changed(7))
+        );
+        assert_eq!(
+            classify_after_wait(&changed, 6, None),
+            WaitTimeoutResult::Changed(7)
+        );
+
+        let equal = AtomicU32::new(7);
+        assert_eq!(spin_prefix(&equal, 7, 0, None), None);
+        assert_eq!(
+            classify_after_wait(&equal, 7, None),
+            WaitTimeoutResult::Unclassified
+        );
+        assert_eq!(
+            spin_prefix(&equal, 7, 0, Some(Deadline::new(Duration::ZERO))),
+            Some(WaitTimeoutResult::TimedOut)
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn mwaitx_duration_conversion_is_bounded_and_scaled() {
+        assert_eq!(duration_to_cycles(Duration::ZERO, 1_000_000_000), 1);
+        assert_eq!(
+            duration_to_cycles(Duration::from_nanos(37), 1_000_000_000),
+            37
+        );
+        assert_eq!(
+            duration_to_cycles(Duration::from_secs(u64::MAX), u64::MAX),
+            u32::MAX
+        );
+    }
+
+    #[test]
     fn raw_yield_exposes_an_unclassified_wake() {
         let value = AtomicU32::new(7);
         assert_eq!(
             SpinThenYield::new(0).wait_if_equal(&value, 7),
+            WaitResult::Unclassified
+        );
+        assert_eq!(
+            SpinThenYield::new(1).wait_if_equal(&value, 7),
             WaitResult::Unclassified
         );
     }

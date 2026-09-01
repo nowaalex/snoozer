@@ -264,7 +264,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
 
-    use crate::strategy::{TestGatePoint, TestGateStrategy};
+    use crate::strategy::{TestGatePoint, TestGateStrategy, TestTimeoutStrategy};
     use crate::{BusySpin, SpinThenYield};
 
     use super::*;
@@ -351,5 +351,23 @@ mod tests {
             parker.park_until_notified_timeout(Duration::ZERO),
             NotificationTimeoutResult::TimedOut
         );
+    }
+
+    #[test]
+    fn filtered_timeout_passes_only_the_remaining_budget() {
+        let timeout = Duration::from_millis(50);
+        let (strategy, observed_budgets) = TestTimeoutStrategy::new(Duration::from_millis(2));
+        let (mut parker, _unparker) = pair(strategy);
+
+        assert_eq!(
+            parker.park_until_notified_timeout(timeout),
+            NotificationTimeoutResult::TimedOut
+        );
+        let observed = match observed_budgets.lock() {
+            Ok(observed) => observed,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(observed.len() >= 2);
+        assert!(observed.iter().all(|budget| *budget <= timeout));
     }
 }

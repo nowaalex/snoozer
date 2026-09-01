@@ -1,3 +1,19 @@
 test_tool = "nextest"
 test_workspace = true
 all_features = true
+additional_cargo_test_args = ["--profile", "mutants"]
+
+# CPUID, TSC calibration, and inline-assembly mutations are host-dependent and
+# cannot be judged by the portable CI runner. They have focused capability,
+# encoding/safety review, and bounded target-hardware tests instead.
+exclude_globs = ["src/arch/**"]
+
+# These methods cross the same target-hardware instruction boundary. Their
+# protocol before/after that boundary remains mutation-tested through the pure
+# strategy helpers and fake gate strategy.
+exclude_re = [
+  "<impl StrategyImpl for AmdMwaitx>::wait_raw",
+  "<impl StrategyImpl for SpinThenAmdMwaitx>::wait_raw",
+  "<impl StrategyImpl for AmdMwaitxC1>::wait_raw",
+  "mwaitx_raw",
+]
