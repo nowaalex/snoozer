@@ -83,6 +83,23 @@ printf '%s\n' "$external_config_output" | grep -q 'outside the tracked repositor
 rm -f "$test_home/.cargo/config.toml"
 
 set +e
+cargo_home_output=$(env CARGO_HOME="$test_root/alternate-cargo-home" \
+    RUSTUP_TOOLCHAIN=1.98.0-x86_64-unknown-linux-gnu HOME="$test_home" \
+    PATH="$fake_bin:$PATH" "$repository/scripts/build_benchmark.sh" 2>&1)
+cargo_home_status=$?
+set -e
+[ "$cargo_home_status" -ne 0 ]
+printf '%s\n' "$cargo_home_output" | grep -q 'CARGO_HOME'
+
+set +e
+rustup_output=$(env -u CARGO_HOME RUSTUP_TOOLCHAIN=nightly HOME="$test_home" \
+    PATH="$fake_bin:$PATH" "$repository/scripts/build_benchmark.sh" 2>&1)
+rustup_status=$?
+set -e
+[ "$rustup_status" -ne 0 ]
+printf '%s\n' "$rustup_output" | grep -q 'RUSTUP_TOOLCHAIN'
+
+set +e
 wrong_rustc_output=$(SNOOZER_TEST_RUSTC_VERSION=1.99.0 run_helper 2>&1)
 wrong_rustc_status=$?
 set -e

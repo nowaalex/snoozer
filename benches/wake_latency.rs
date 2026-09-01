@@ -54,6 +54,8 @@ mod linux {
     const COMPILED_COMMIT: Option<&str> = option_env!("SNOOZER_BENCHMARK_COMMIT");
     const COMPILED_REPOSITORY: Option<&str> = option_env!("SNOOZER_BENCHMARK_REPOSITORY");
     const COMPILED_RUSTC: Option<&str> = option_env!("SNOOZER_BENCHMARK_RUSTC");
+    const COMPILED_RUSTUP_TOOLCHAIN: Option<&str> =
+        option_env!("SNOOZER_BENCHMARK_RUSTUP_TOOLCHAIN");
     const COMPILED_DIRTY: Option<&str> = option_env!("SNOOZER_BENCHMARK_DIRTY");
 
     pub(crate) fn main() -> AnyResult<()> {
@@ -95,6 +97,7 @@ mod linux {
             && (provenance.compiled_commit == "unknown"
                 || provenance.compiled_dirty != Some(false)
                 || COMPILED_RUSTC.is_none()
+                || COMPILED_RUSTUP_TOOLCHAIN.is_none()
                 || provenance.checkout_commit != provenance.compiled_commit
                 || provenance.checkout_dirty != Some(false))
         {
@@ -1593,7 +1596,7 @@ mod linux {
                 .map_or_else(|| "null".to_owned(), |value| value.to_string());
             writeln!(
                 self.writer,
-                "{{\"type\":\"metadata\",\"schema\":\"{}\",\"mode\":\"{}\",\"warning\":\"{}\",\"benchmark_commit\":\"{}\",\"compiled_working_tree_dirty\":{},\"checkout_commit\":\"{}\",\"checkout_working_tree_dirty\":{},\"rustc\":\"{}\",\"benchmark_features\":{},\"schedule_version\":\"{}\",\"schedule_seed\":\"0x{:016x}\",\"bursty_gap_us_weight_percent\":[[0,30],[1,15],[5,12],[10,10],[25,10],[50,8],[100,7],[250,5],[1000,3]],\"duration_ms\":{},\"repetitions\":{},\"warmup_events\":{},\"max_samples\":{},\"acceptance_limits\":{{\"max_victim_throughput_loss_percent\":{:.6},\"max_victim_p99_degradation_percent\":{:.6}}},\"clocksource\":\"tsc\",\"cycles_per_ns\":{:.9},\"calibration_spread_percent\":{:.6},\"mwaitx_timer_hz\":{},\"tsc_skew\":{{\"producer_offset_cycles\":{},\"waiter_offset_cycles\":{},\"producer_uncertainty_cycles\":{},\"waiter_uncertainty_cycles\":{},\"producer_to_waiter_bound_ns\":{:.6},\"applied_waiter_minus_producer_cycles\":{}}},\"matched_control\":\"victim-only baseline; reported loss conservatively includes producer and waiter activity\",\"cpu_model\":\"{}\",\"microcode\":\"{}\",\"kernel\":\"{}\",\"power_policy\":[{}],\"roles\":{{\"waiter\":{},\"victim\":{},\"producer\":{},\"controller\":{}}},\"topology\":[{}],\"cpuidle\":[{}]}}",
+                "{{\"type\":\"metadata\",\"schema\":\"{}\",\"mode\":\"{}\",\"warning\":\"{}\",\"benchmark_commit\":\"{}\",\"compiled_working_tree_dirty\":{},\"checkout_commit\":\"{}\",\"checkout_working_tree_dirty\":{},\"rustc\":\"{}\",\"rustup_toolchain\":\"{}\",\"benchmark_features\":{},\"schedule_version\":\"{}\",\"schedule_seed\":\"0x{:016x}\",\"bursty_gap_us_weight_percent\":[[0,30],[1,15],[5,12],[10,10],[25,10],[50,8],[100,7],[250,5],[1000,3]],\"duration_ms\":{},\"repetitions\":{},\"warmup_events\":{},\"max_samples\":{},\"acceptance_limits\":{{\"max_victim_throughput_loss_percent\":{:.6},\"max_victim_p99_degradation_percent\":{:.6}}},\"clocksource\":\"tsc\",\"cycles_per_ns\":{:.9},\"calibration_spread_percent\":{:.6},\"mwaitx_timer_hz\":{},\"tsc_skew\":{{\"producer_offset_cycles\":{},\"waiter_offset_cycles\":{},\"producer_uncertainty_cycles\":{},\"waiter_uncertainty_cycles\":{},\"producer_to_waiter_bound_ns\":{:.6},\"applied_waiter_minus_producer_cycles\":{}}},\"matched_control\":\"victim-only baseline; reported loss conservatively includes producer and waiter activity\",\"cpu_model\":\"{}\",\"microcode\":\"{}\",\"kernel\":\"{}\",\"power_policy\":[{}],\"roles\":{{\"waiter\":{},\"victim\":{},\"producer\":{},\"controller\":{}}},\"topology\":[{}],\"cpuidle\":[{}]}}",
                 RESULT_SCHEMA_VERSION,
                 input.arguments.mode.as_str(),
                 json_escape(input.cstate_warning),
@@ -1602,6 +1605,7 @@ mod linux {
                 json_escape(&input.provenance.checkout_commit),
                 checkout_dirty,
                 json_escape(COMPILED_RUSTC.unwrap_or("unknown")),
+                json_escape(COMPILED_RUSTUP_TOOLCHAIN.unwrap_or("unknown")),
                 if cfg!(feature = "benchmark-only") {
                     "[\"benchmark-only\"]"
                 } else {

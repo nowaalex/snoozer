@@ -27,9 +27,7 @@ reject_override() {
 [ "${CARGO_ENCODED_RUSTFLAGS+x}" != x ] || reject_override CARGO_ENCODED_RUSTFLAGS
 [ "${RUSTC_WRAPPER+x}" != x ] || reject_override RUSTC_WRAPPER
 [ "${RUSTC_WORKSPACE_WRAPPER+x}" != x ] || reject_override RUSTC_WORKSPACE_WRAPPER
-[ "${RUSTUP_TOOLCHAIN+x}" != x ] || reject_override RUSTUP_TOOLCHAIN
 [ "${RUSTC_BOOTSTRAP+x}" != x ] || reject_override RUSTC_BOOTSTRAP
-[ "${CARGO_HOME+x}" != x ] || reject_override CARGO_HOME
 [ "${CARGO_INCREMENTAL+x}" != x ] || reject_override CARGO_INCREMENTAL
 [ "${CARGO_BUILD_TARGET+x}" != x ] || reject_override CARGO_BUILD_TARGET
 [ "${CARGO_BUILD_RUSTC+x}" != x ] || reject_override CARGO_BUILD_RUSTC
@@ -60,7 +58,10 @@ done
     echo "HOME must be set so the benchmark can verify Cargo configuration provenance" >&2
     exit 2
 }
-for cargo_home_config in "$HOME/.cargo/config" "$HOME/.cargo/config.toml"; do
+default_cargo_home=$HOME/.cargo
+cargo_home=${CARGO_HOME:-$default_cargo_home}
+[ "$cargo_home" = "$default_cargo_home" ] || reject_override CARGO_HOME
+for cargo_home_config in "$cargo_home/config" "$cargo_home/config.toml"; do
     [ ! -e "$cargo_home_config" ] || {
         echo "benchmark rejects Cargo configuration outside the tracked repository: $cargo_home_config" >&2
         exit 2
@@ -91,6 +92,15 @@ toolchain_channel=$(awk -F '"' '
     echo "benchmark requires the repository Rust 1.98.0 toolchain" >&2
     exit 2
 }
+if [ "${RUSTUP_TOOLCHAIN+x}" = x ]; then
+    case "$RUSTUP_TOOLCHAIN" in
+        "$toolchain_channel"|"$toolchain_channel"-*) ;;
+        *) reject_override RUSTUP_TOOLCHAIN ;;
+    esac
+    benchmark_rustup_toolchain=$RUSTUP_TOOLCHAIN
+else
+    benchmark_rustup_toolchain=repository-toolchain-file
+fi
 benchmark_commit=$(git -C "$repository" rev-parse --verify HEAD) || {
     echo "cannot determine the benchmark source commit" >&2
     exit 2
@@ -107,6 +117,7 @@ fi
 export SNOOZER_BENCHMARK_COMMIT=$benchmark_commit
 export SNOOZER_BENCHMARK_REPOSITORY=$repository
 export SNOOZER_BENCHMARK_DIRTY=$benchmark_dirty
+export SNOOZER_BENCHMARK_RUSTUP_TOOLCHAIN=$benchmark_rustup_toolchain
 SNOOZER_BENCHMARK_RUSTC=$(rustc --version) || {
     echo "cannot determine the benchmark compiler version" >&2
     exit 2
