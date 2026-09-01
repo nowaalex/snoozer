@@ -37,8 +37,8 @@ mod linux {
         pin_current, stamp,
     };
     use crate::pure::{
-        GapSchedule, RESULT_SCHEMA_VERSION, capture_generation_before_start, correct_latency,
-        json_escape, latency_rank_key, percentile_sorted, resolve_cpu_sysfs_root,
+        GapSchedule, RESULT_SCHEMA_VERSION, WaiterStartup, capture_generation_before_start,
+        correct_latency, json_escape, latency_rank_key, percentile_sorted, resolve_cpu_sysfs_root,
     };
     use crate::snoozer_api::{
         Observation, wait_direct_filtered, wait_direct_raw, wait_parker_filtered, wait_parker_raw,
@@ -650,8 +650,18 @@ mod linux {
             }
         }
 
-        fn waiter_ready(&self) -> u64 {
-            capture_generation_before_start(&self.generation.0, &self.ready.0, &self.go.0)
+        fn waiter_ready(&self) -> AnyResult<u64> {
+            match capture_generation_before_start(
+                &self.generation.0,
+                &self.ready.0,
+                &self.go.0,
+                &self.stop.0,
+            ) {
+                WaiterStartup::Observed(generation) => Ok(generation),
+                WaiterStartup::Aborted => {
+                    Err("benchmark startup aborted before waiter began waiting".into())
+                }
+            }
         }
 
         fn abort_startup(&self) {
@@ -843,7 +853,7 @@ mod linux {
                 return Err(error.into());
             }
             let (_, expected_aux) = stamp();
-            let mut observed = waiter_shared.waiter_ready();
+            let mut observed = waiter_shared.waiter_ready()?;
             let mut metrics = WaiterMetrics {
                 latencies_cycles: Vec::with_capacity(max_samples.min(1_000_000)),
                 unclassified_wakes: (filtering == Filtering::Raw).then_some(0),
@@ -930,7 +940,7 @@ mod linux {
                 return Err(error.into());
             }
             let (_, expected_aux) = stamp();
-            let mut observed = waiter_shared.waiter_ready();
+            let mut observed = waiter_shared.waiter_ready()?;
             let mut metrics = WaiterMetrics {
                 latencies_cycles: Vec::with_capacity(max_samples.min(1_000_000)),
                 unclassified_wakes: (filtering == Filtering::Raw).then_some(0),
@@ -1015,7 +1025,7 @@ mod linux {
             }
             let (_, expected_aux) = stamp();
             handle_sender.send(thread::current())?;
-            let mut observed = waiter_shared.waiter_ready();
+            let mut observed = waiter_shared.waiter_ready()?;
             let mut metrics = WaiterMetrics {
                 latencies_cycles: Vec::with_capacity(max_samples.min(1_000_000)),
                 unclassified_wakes: Some(0),

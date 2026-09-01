@@ -42,17 +42,28 @@ pub(crate) fn correct_latency(raw_cycles: i64, waiter_minus_producer_cycles: i64
     u64::try_from(corrected).ok()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaiterStartup {
+    Aborted,
+    Observed(u64),
+}
+
 pub(crate) fn capture_generation_before_start(
     generation: &AtomicU64,
     ready: &AtomicUsize,
     go: &AtomicBool,
-) -> u64 {
+    stop: &AtomicBool,
+) -> WaiterStartup {
     let observed = generation.load(Ordering::Acquire);
     ready.fetch_add(1, Ordering::Release);
     while !go.load(Ordering::Acquire) {
         std::hint::spin_loop();
     }
-    observed
+    if stop.load(Ordering::Acquire) {
+        WaiterStartup::Aborted
+    } else {
+        WaiterStartup::Observed(observed)
+    }
 }
 
 pub(crate) fn resolve_cpu_sysfs_root(

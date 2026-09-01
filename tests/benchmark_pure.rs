@@ -5,9 +5,9 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use pure::{
-    CPU_SYSFS_ROOT, GapSchedule, RESULT_SCHEMA_VERSION, capture_generation_before_start,
-    correct_latency, json_escape, latency_rank_key, parse_cpu_list, percentile_sorted,
-    resolve_cpu_sysfs_root,
+    CPU_SYSFS_ROOT, GapSchedule, RESULT_SCHEMA_VERSION, WaiterStartup,
+    capture_generation_before_start, correct_latency, json_escape, latency_rank_key,
+    parse_cpu_list, percentile_sorted, resolve_cpu_sysfs_root,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,11 +25,13 @@ fn waiter_captures_generation_before_announcing_ready() {
     let generation = Arc::new(AtomicU64::new(0));
     let ready = Arc::new(AtomicUsize::new(0));
     let go = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
     let worker_generation = Arc::clone(&generation);
     let worker_ready = Arc::clone(&ready);
     let worker_go = Arc::clone(&go);
+    let worker_stop = Arc::clone(&stop);
     let worker = std::thread::spawn(move || {
-        capture_generation_before_start(&worker_generation, &worker_ready, &worker_go)
+        capture_generation_before_start(&worker_generation, &worker_ready, &worker_go, &worker_stop)
     });
 
     while ready.load(Ordering::Acquire) != 1 {
@@ -38,7 +40,28 @@ fn waiter_captures_generation_before_announcing_ready() {
     generation.store(1, Ordering::Release);
     go.store(true, Ordering::Release);
 
-    assert_eq!(worker.join().expect("waiter startup thread"), 0);
+    assert_eq!(
+        worker.join().expect("waiter startup thread"),
+        WaiterStartup::Observed(0)
+    );
+}
+
+#[test]
+fn waiter_rejects_abort_completed_before_it_arrives() {
+    let generation = AtomicU64::new(0);
+    let ready = AtomicUsize::new(0);
+    let go = AtomicBool::new(false);
+    let stop = AtomicBool::new(false);
+
+    stop.store(true, Ordering::Release);
+    go.store(true, Ordering::Release);
+    generation.fetch_add(1, Ordering::Release);
+
+    assert_eq!(
+        capture_generation_before_start(&generation, &ready, &go, &stop),
+        WaiterStartup::Aborted
+    );
+    assert_eq!(ready.load(Ordering::Acquire), 1);
 }
 
 #[test]
