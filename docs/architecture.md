@@ -10,7 +10,8 @@ Snoozer separates four concerns:
 1. Caller-owned state is represented by `AtomicU32` or `AtomicU64` through the sealed
    `WaitableAtomic` contract.
 2. `WaitStrategy` owns the raw and filtered state-wait loops.
-3. `Parker`/`Unparker` adapt those loops to a private, coalescing token.
+3. `SingleParker`/`SingleUnparker` and `MultiParker`/`MultiUnparker` adapt those loops to a
+   private, coalescing token with an explicit producer-ownership contract.
 4. An architecture backend owns capability detection and the smallest possible
    arm/recheck/hardware-wait boundary.
 
@@ -41,12 +42,18 @@ calls the raw operation repeatedly until its Acquire load sees a different value
 
 ## Parker adaptation
 
-The Parker owns an isolated atomic token with two logical states: empty and notified.
-`Unparker::unpark` uses a Release read-modify-write to set the notified state. A Parker
-operation uses an Acquire read-modify-write to consume it. Repeated notifications form one
-set of overlapping release sequences: each Release notification is followed in modification
-order by the later notification read-modify-writes. The consumer therefore acquires every
-producer publication represented by the coalesced token.
+Both public Parker pairs use one private consumer core and an isolated atomic token with two
+logical states: empty and notified. A Relaxed load avoids an unnecessary locked operation while
+the token is empty; an Acquire compare-exchange consumes a token that is present.
+
+The producer operation is the deliberate difference:
+
+- `SingleUnparker` has exclusive ownership and uses a Release store;
+- every `MultiUnparker` clone uses a Release read-modify-write, preserving overlapping release
+  sequences across concurrent producers.
+
+This keeps the one-producer path free of a producer-side locked RMW without weakening the
+multi-producer publication contract.
 
 This gives a one-token mailbox:
 
@@ -66,10 +73,14 @@ The first hardware backend targets AMD `MONITORX/MWAITX` on Linux x86-64.
 - Construction checks the architectural capability before any instruction is reachable.
 - `MONITORX` arms address monitoring.
 - The common protocol performs the required recheck.
-- `MWAITX` uses `EAX = 0xF`, the no-C-state hint, for the minimum-latency production
-  path.
+- `MWAITX` uses `EAX = 0xF0`, placing `0xF` in `EAX[7:4]` to request the optimized C0
+  no-C-state path. Linux names the same encoding
+  [`MWAITX_DISABLE_CSTATES`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/include/asm/mwait.h).
 - The hardware timer is enabled with a bounded, nonzero interval so unrelated missed progress
   cannot leave the thread asleep forever.
+- The fixed safety-timer cycle budget is computed during construction. An untimed public wait
+  reuses it without wall-clock reads or duration division in the hot path; a timed public wait
+  still computes a shorter remaining budget when required.
 - Timer expiry and any other return from `MWAITX` are unclassified until Rust reloads the
   atomic.
 

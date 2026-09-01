@@ -79,22 +79,30 @@ operation is allowed to keep waiting because the current value again equals the 
 Use a generation counter when every transition matters. Define overflow behavior as part of the
 application protocol; the waiting primitive cannot infer it.
 
-## Parker and Unparker
+## Single- and multi-producer Parker pairs
 
-`Parker`/`Unparker` wrap the same direct-wait protocol around an internal notification
-token:
+Both Parker pairs wrap the direct-wait protocol around an internal, coalescing notification token.
+The prefix selects producer ownership and the cost of publishing that token:
 
-- `unpark` sets one token with a Release read-modify-write;
+| Constructor | Consumer | Producer contract | Publication operation | Choose it when |
+| ----------- | -------- | ----------------- | --------------------- | -------------- |
+| `single_pair` | `SingleParker` | One non-clonable `SingleUnparker`; `unpark` needs exclusive access | Release store | One producer owns the wake handle and minimum producer overhead matters |
+| `multi_pair` | `MultiParker` | Clonable, shareable `MultiUnparker` | Release read-modify-write | Multiple producers can notify concurrently or the handle must be cloned |
+
+Both Parker types are single-consumer. They can move between threads, but cannot be waited on
+concurrently. The `multi` prefix means multiple producers, never multiple consumers.
+
+The single-producer restriction lets `SingleUnparker::unpark` publish with an ordinary Release
+store. `MultiUnparker::unpark` uses a Release read-modify-write even when the token is already set.
+Consecutive producer RMWs form overlapping release sequences, so the consumer's Acquire token
+consumption acquires every publication represented by the coalesced token.
+
+The remaining behavior is shared:
+
 - an available token makes a later park return without sleeping;
 - at most one token is stored, so repeated notifications coalesce;
 - consuming a token uses Acquire ordering;
-- `Unparker` is cloneable and can be shared by producers;
-- a `Parker` can move between threads but cannot be waited on concurrently.
-
-Each Release notification heads a release sequence that includes later notification
-read-modify-writes. Those sequences overlap, so the consumer's Acquire token consumption acquires
-the publications of every producer represented by that token, even though the notifications
-themselves collapse to one.
+- the consumer checks for a token before and after waiting.
 
 `park` is the raw operation. It consumes a token if one is already available; otherwise it
 delegates one `wait_if_equal` attempt on the internal token to the selected strategy, then tries
@@ -111,7 +119,8 @@ The raw results are `ParkResult::{Notified, Unclassified}` and
 `NotificationTimeoutResult::{Notified, TimedOut}`.
 
 A notification token is not a queue item and is not evidence that application work still exists.
-Even after a filtered park, use the application's condition loop:
+Even after a filtered park, use the application's condition loop. For example, with the consumer
+returned by `single_pair`:
 
 ```rust
 loop {
@@ -155,10 +164,13 @@ snapshot.
 - Choose raw direct waiting when an application atomic already represents readiness and an extra
   event-loop iteration is cheap.
 - Choose filtered direct waiting when the call should not return while the value remains equal.
-- Choose raw Parker when a coalescing token is convenient and the caller always checks its own
-  readiness state.
-- Choose filtered Parker when the caller wants to absorb hardware wakes that did not deliver a
-  token.
+- Choose `single_pair` when one producer owns the notification handle; it is the primary
+  low-overhead Parker API.
+- Choose `multi_pair` only when producers must clone or concurrently share the notification
+  handle; its Release RMW buys the stronger multi-producer publication guarantee.
+- On either pair, choose raw `park` when the caller always checks its own readiness state.
+- On either pair, choose filtered `park_until_notified` when the caller wants to absorb hardware
+  wakes that did not deliver a token.
 - Choose a counting primitive rather than either Parker operation when every notification must be
   preserved.
 

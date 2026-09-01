@@ -13,8 +13,8 @@ The address passed to an architecture monitor must remain valid for the entire m
 sequence. A public wait borrows the atomic for the call, which prevents safe Rust from destroying
 or moving it during that sequence. A backend must not retain the pointer after returning.
 
-The Parker token is reference-counted with its Unparker handles. Its allocation must remain alive
-until no Parker or Unparker can access it.
+Each Parker token is reference-counted with its Unparker handle or handles. Its allocation must
+remain alive until no endpoint can access it.
 
 Only naturally aligned `AtomicU32` and `AtomicU64` are supported in the first version. The
 sealed atomic trait prevents downstream implementations from supplying a type with incompatible
@@ -25,7 +25,7 @@ layout, load semantics, or pointer provenance.
 Address monitoring is a sleep mechanism, not a Rust memory-ordering primitive.
 
 - A producer publishes application data before a Release update to the watched atomic or before
-  `Unparker::unpark`.
+  calling an `unpark` method.
 - The consumer must observe the relevant atomic state through an Acquire operation before reading
   the published data.
 - `wait_if_equal` may return after an unclassified wake. That return alone establishes no
@@ -33,10 +33,18 @@ Address monitoring is a sleep mechanism, not a Rust memory-ordering primitive.
 - `wait_until_different` returns only after an Acquire load observes a different value.
 - `park_until_notified` returns only after consuming the token with Acquire ordering.
 
-`Unparker::unpark` uses a Release read-modify-write even when the token is already notified.
-Each notification heads a release sequence that includes the later notification
-read-modify-writes. Those sequences overlap, so the consumer's Acquire consumption synchronizes
-with every producer publication represented by the coalesced token.
+The Parker variants use different publication proofs:
+
+- `SingleUnparker` is `Send` but not `Sync` or `Clone`, and `unpark` requires exclusive access.
+  Its Release store is therefore ordered after every earlier publication by that sole producer.
+  The consumer's Acquire token consumption synchronizes with the latest represented store.
+- `MultiUnparker` is clonable and shareable. Every `unpark` performs a Release
+  read-modify-write, even when the token is already notified. Each notification heads a release
+  sequence containing later notification RMWs. Those sequences overlap, so one Acquire token
+  consumption synchronizes with every producer publication represented by the coalesced token.
+
+Replacing the multi-producer RMW with a store would weaken that guarantee. Allowing concurrent
+use of `SingleUnparker` would invalidate its store-based proof, so safe Rust prevents it.
 
 A backend must not weaken these orderings based on the ordering properties of a particular
 instruction. Rust's atomic contract remains the portable source of truth.

@@ -11,16 +11,16 @@
 - **Critical invariants:** arm-then-recheck closes the lost-wake window; the watched atomic
   remains alive and suitably aligned throughout a wait; filtered operations return only after an
   Acquire load observes their stated condition; raw operations may return after an unclassified
-  wake.
+  wake; `Single*` notification handles have one producer, while `Multi*` handles preserve every
+  coalesced producer publication.
 - **Configuration owners:** crate metadata and build profiles live in
   [`Cargo.toml`](Cargo.toml), the compiler version in
   [`rust-toolchain.toml`](rust-toolchain.toml), test policy in
   [`.config/nextest.toml`](.config/nextest.toml), mutation policy in
   [`.cargo/mutants.toml`](.cargo/mutants.toml), and measurement parameters in the
   [benchmark source](benches/wake_latency.rs).
-- **Targeted check:** run `cargo nextest run --workspace --all-features`. Hardware-specific
-  and official benchmark checks are separate because ordinary CI must not depend on privileged
-  CPU configuration or a particular processor.
+- **Targeted check:** run `just ci`. Hardware-specific and official benchmark checks are separate
+  because ordinary CI must not depend on privileged CPU configuration or a particular processor.
 
 Snoozer explores the shortest practical path from a published state change to a running
 consumer thread. It exposes both the raw hardware-wake boundary and stronger filtered operations,
@@ -60,12 +60,12 @@ assert_eq!(next, 1);
 assert_eq!(strategy.wait_until_different(&generation, observed), 1);
 ```
 
-Use `Parker`/`Unparker` when an owned, coalescing notification token is a better fit:
+Use `single_pair` when one producer owns the wake handle. This is the lowest-overhead Parker path:
 
 ```rust
-use snoozer::{pair, BusySpin, ParkResult};
+use snoozer::{BusySpin, ParkResult, single_pair};
 
-let (mut parker, unparker) = pair(BusySpin);
+let (mut parker, mut unparker) = single_pair(BusySpin);
 
 // Another thread publishes work, then calls:
 unparker.unpark();
@@ -78,6 +78,10 @@ assert!(matches!(outcome, ParkResult::Notified));
 unparker.unpark();
 parker.park_until_notified();
 ```
+
+Use `multi_pair` when multiple producers must clone or concurrently share the wake handle. It uses
+a more expensive atomic read-modify-write so one consumed token acquires every coalesced producer
+publication. Both forms have exactly one consumer; `multi` describes producers, not parkers.
 
 The exact exported constructors and strategy types are documented in the crate API. The behavior
 and selection rules live in [Waiting API](docs/waiting-api.md).
