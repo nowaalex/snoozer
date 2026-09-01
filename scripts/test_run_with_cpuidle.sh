@@ -9,7 +9,7 @@ write_helper=$test_root/write-helper
 benchmark=$test_root/benchmark
 runner=$(CDPATH= cd -- "$(dirname "$0")" && pwd)/run_with_cpuidle.sh
 write_log=$test_root/writes
-MAX_NORMAL_RUN_SECONDS=3
+MAX_NORMAL_RUN_SECONDS=6
 MIN_KILL_PATH_SECONDS=4
 MAX_KILL_PATH_SECONDS=8
 
@@ -51,6 +51,19 @@ if [ "${SNOOZER_TEST_MISMATCH_VALUE:-}" = "$value" ] \
     exit 0
 fi
 printf '%s\n' "$value" >"$target"
+if [ -n "${SNOOZER_TEST_FIRST_RESTORE_FILE:-}" ] \
+    && [ ! -e "$SNOOZER_TEST_FIRST_RESTORE_FILE" ] \
+    && [ "$value" = 1 ] && [ "${target##*/cpuidle/}" = state0/disable ]; then
+    awk '{ printf "%.0f\n", $1 * 1000 }' /proc/uptime \
+        >"$SNOOZER_TEST_FIRST_RESTORE_FILE"
+fi
+if [ "${SNOOZER_TEST_ADD_STATE_ON_RESTORE:-}" = 1 ] \
+    && [ "$value" = 1 ] && [ "${target##*/cpuidle/}" = state0/disable ]; then
+    added_state=${target%/state0/disable}/state5
+    mkdir -p "$added_state"
+    printf 'C4\n' >"$added_state/name"
+    printf '0\n' >"$added_state/disable"
+fi
 EOF
 chmod +x "$write_helper"
 
@@ -81,6 +94,10 @@ if [ -n "${SNOOZER_TEST_READY:-}" ]; then
         trap '' TERM
     fi
     while [ ! -e "$SNOOZER_TEST_RELEASE" ]; do sleep 0.01; done
+fi
+if [ -n "${SNOOZER_TEST_BENCHMARK_EXIT_FILE:-}" ]; then
+    awk '{ printf "%.0f\n", $1 * 1000 }' /proc/uptime \
+        >"$SNOOZER_TEST_BENCHMARK_EXIT_FILE"
 fi
 EOF
 chmod +x "$benchmark"
@@ -119,17 +136,58 @@ assert_clean() {
         [ ! -e "$supervisor_status" ] || return 1
     done
     for supervisor_handshake in "$state_root"/supervisor-ready.* \
-        "$state_root"/supervisor-go.*; do
+        "$state_root"/supervisor-go.* "$state_root"/guardian-ready.* \
+        "$state_root"/guardian-release.* "$state_root"/guardian-group.* \
+        "$state_root"/guardian-proof-request.* \
+        "$state_root"/guardian-proof-ready.*; do
         [ ! -e "$supervisor_handshake" ] || return 1
     done
 }
 
+assert_process_does_not_hold_runner_lock() {
+    inspected_pid=$1
+    for descriptor in "/proc/$inspected_pid/fd"/*; do
+        [ -e "$descriptor" ] || continue
+        descriptor_target=$(readlink "$descriptor") || continue
+        case "$descriptor_target" in
+            "$sysfs_root/.snoozer-cpuidle.lock"|"$state_root/runner.lock"|"$state_root/active-run.lock")
+                return 1
+                ;;
+        esac
+    done
+}
+
+assert_guardian_lock_contract() {
+    inspected_pid=$1
+    active_seen=0
+    for descriptor in "/proc/$inspected_pid/fd"/*; do
+        [ -e "$descriptor" ] || continue
+        descriptor_target=$(readlink "$descriptor") || continue
+        case "$descriptor_target" in
+            "$sysfs_root/.snoozer-cpuidle.lock"|"$state_root/runner.lock") return 1 ;;
+            "$state_root/active-run.lock") active_seen=1 ;;
+        esac
+    done
+    [ "$active_seen" -eq 1 ]
+}
+
 # First apply enables exact POLL/C1, disables every other state, then restores.
 : >"$write_log"
+normal_benchmark_exit=$test_root/normal-benchmark-exit-ms
+normal_first_restore=$test_root/normal-first-restore-ms
 normal_start_epoch=$(monotonic_seconds)
-run_benchmark >/dev/null
+SNOOZER_TEST_BENCHMARK_EXIT_FILE=$normal_benchmark_exit \
+    SNOOZER_TEST_FIRST_RESTORE_FILE=$normal_first_restore \
+    run_benchmark >/dev/null
 normal_elapsed_seconds=$(($(monotonic_seconds) - normal_start_epoch))
 [ "$normal_elapsed_seconds" -le "$MAX_NORMAL_RUN_SECONDS" ]
+[ -s "$normal_benchmark_exit" ]
+[ -s "$normal_first_restore" ]
+normal_benchmark_exit_ms=$(tr -d '[:space:]' <"$normal_benchmark_exit")
+normal_first_restore_ms=$(tr -d '[:space:]' <"$normal_first_restore")
+normal_drain_milliseconds=$((normal_first_restore_ms - normal_benchmark_exit_ms))
+[ "$normal_drain_milliseconds" -ge 0 ]
+[ "$normal_drain_milliseconds" -lt 2000 ]
 assert_original
 assert_clean
 grep -q '|.*/state0/disable$' "$write_log"
@@ -147,7 +205,7 @@ normal_descendant_start_epoch=$(monotonic_seconds)
 SNOOZER_TEST_READY=$normal_descendant_ready \
     SNOOZER_TEST_RELEASE=$normal_descendant_release \
     SNOOZER_TEST_DESCENDANT_PID=$normal_descendant_pid_file \
-    SNOOZER_TEST_DESCENDANT_IGNORE_TERM=1 run_benchmark >/dev/null
+    SNOOZER_TEST_DESCENDANT_IGNORE_TERM=1 run_benchmark >/dev/null 2>&1
 normal_descendant_elapsed=$(($(monotonic_seconds) - normal_descendant_start_epoch))
 [ "$normal_descendant_elapsed" -ge "$MIN_KILL_PATH_SECONDS" ]
 [ "$normal_descendant_elapsed" -le "$MAX_KILL_PATH_SECONDS" ]
@@ -198,6 +256,17 @@ set -e
 assert_original
 assert_clean
 
+# TERM in the exact hard-link-to-assignment window re-adopts the expected global
+# record, restores exact state, and removes both durable ownership records.
+set +e
+SNOOZER_TEST_SIGNAL_AFTER_GLOBAL_LINK=TERM \
+    run_benchmark >"$test_root/global-link-term.out" 2>&1
+global_link_term_status=$?
+set -e
+[ "$global_link_term_status" -eq 143 ]
+assert_original
+assert_clean
+
 # Supervisor setup failure occurs before the benchmark go-ahead, is reaped
 # without signaling an unverified numeric PID, and restores exact state.
 set +e
@@ -208,6 +277,100 @@ set -e
 [ "$supervisor_before_ready_status" -ne 0 ]
 grep -q 'exited before its startup handshake' \
     "$test_root/supervisor-before-ready.out"
+assert_original
+assert_clean
+
+# Exit after publishing READY is classified as terminal immediately; no
+# benchmark go-ahead can be consumed and state is restored without startup wait.
+guardian_exit_start=$(monotonic_seconds)
+set +e
+SNOOZER_TEST_GUARDIAN_EXIT_AFTER_READY=1 \
+    run_benchmark >"$test_root/guardian-after-ready.out" 2>&1
+guardian_exit_status=$?
+set -e
+[ "$guardian_exit_status" -ne 0 ]
+[ "$(($(monotonic_seconds) - guardian_exit_start))" -le "$MAX_NORMAL_RUN_SECONDS" ]
+grep -q 'guardian exited after its startup handshake' \
+    "$test_root/guardian-after-ready.out"
+assert_original
+assert_clean
+
+supervisor_exit_start=$(monotonic_seconds)
+set +e
+SNOOZER_TEST_SUPERVISOR_EXIT_AFTER_READY=1 \
+    run_benchmark >"$test_root/supervisor-after-ready.out" 2>&1
+supervisor_exit_status=$?
+set -e
+[ "$supervisor_exit_status" -ne 0 ]
+[ "$(($(monotonic_seconds) - supervisor_exit_start))" -le "$MAX_NORMAL_RUN_SECONDS" ]
+grep -Eq 'exited before acquiring|exited without preserving' \
+    "$test_root/supervisor-after-ready.out"
+assert_original
+assert_clean
+
+# Checked go-ahead failure KILLs and proves the verified inner group empty
+# before restoration instead of waiting for a zombie supervisor.
+set +e
+SNOOZER_TEST_FAIL_GO_PUBLICATION=1 \
+    run_benchmark >"$test_root/go-publication-failure.out" 2>&1
+go_publication_status=$?
+set -e
+[ "$go_publication_status" -ne 0 ]
+grep -q 'cannot publish the benchmark go-ahead' \
+    "$test_root/go-publication-failure.out"
+assert_original
+assert_clean
+
+# A failed post-KILL inspection keeps the guardian and active lock alive. No
+# restore write occurs until the inspection fault clears and the guardian can
+# prove that the already-KILLed group has no non-zombie members.
+post_kill_block=$test_root/post-kill-inspection-block
+: >"$post_kill_block"
+writes_before_post_kill=$(wc -l <"$write_log")
+env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
+    SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    SNOOZER_TEST_FAIL_GO_PUBLICATION=1 \
+    SNOOZER_TEST_POST_KILL_BLOCK_FILE="$post_kill_block" \
+    "$runner" --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 \
+    --producer-cpu 2 --controller-cpu 3 --timeout-seconds 5 \
+    >"$test_root/post-kill-inspection.out" 2>&1 &
+post_kill_runner_pid=$!
+attempt=0
+while :; do
+    proof_published=0
+    for proof_request in "$state_root"/guardian-proof-request.*; do
+        if [ -s "$proof_request" ]; then proof_published=1; break; fi
+    done
+    [ "$proof_published" -eq 0 ] || break
+    [ "$attempt" -lt 500 ] \
+        || { kill -KILL "$post_kill_runner_pid" 2>/dev/null || true; exit 1; }
+    sleep 0.01
+    attempt=$((attempt + 1))
+done
+sleep 0.1
+kill -0 "$post_kill_runner_pid"
+[ -f "$state_root/dirty" ]
+[ -f "$sysfs_root/.snoozer-cpuidle.dirty" ]
+[ "$(tr -d '[:space:]' <"$sysfs_root/cpu0/cpuidle/state0/disable")" = 0 ]
+# Only apply writes have happened; the blocked proof precedes every restore.
+[ "$(wc -l <"$write_log")" -eq "$((writes_before_post_kill + 20))" ]
+rm "$post_kill_block"
+set +e
+wait "$post_kill_runner_pid"
+post_kill_runner_status=$?
+set -e
+[ "$post_kill_runner_status" -ne 0 ]
+assert_original
+assert_clean
+
+# Once the verified group identity is published, a deferred TERM is no longer
+# latched: the ordinary bounded termination path runs immediately.
+set +e
+SNOOZER_TEST_SIGNAL_AFTER_GROUP_VERIFY=TERM \
+    run_benchmark >"$test_root/post-group-term.out" 2>&1
+post_group_term_status=$?
+set -e
+[ "$post_group_term_status" -eq 143 ]
 assert_original
 assert_clean
 
@@ -246,6 +409,23 @@ apply_failure_status=$?
 set -e
 [ "$apply_failure_status" -ne 0 ]
 grep -q 'failed to apply' "$test_root/apply-failure.out"
+assert_original
+assert_clean
+
+# If the cpuidle inventory changes during restoration, the next write is
+# refused and both recovery records remain authoritative for an explicit retry.
+set +e
+SNOOZER_TEST_ADD_STATE_ON_RESTORE=1 \
+    run_benchmark >"$test_root/restore-inventory-change.out" 2>&1
+restore_inventory_status=$?
+set -e
+[ "$restore_inventory_status" -ne 0 ]
+grep -q 'does not exactly cover the current CPU state inventory' \
+    "$test_root/restore-inventory-change.out"
+[ -f "$state_root/dirty" ]
+[ -f "$sysfs_root/.snoozer-cpuidle.dirty" ]
+rm -rf "$sysfs_root/cpu0/cpuidle/state5"
+runner_env "$runner" --recover >/dev/null
 assert_original
 assert_clean
 
@@ -371,6 +551,70 @@ timeout_benchmark_pid=$(tr -d '[:space:]' <"$timeout_benchmark_pid_file")
 timeout_descendant_pid=$(tr -d '[:space:]' <"$timeout_descendant_pid_file")
 ! kill -0 "$timeout_benchmark_pid" 2>/dev/null
 ! kill -0 "$timeout_descendant_pid" 2>/dev/null
+assert_original
+assert_clean
+
+# SIGKILL while the benchmark is active leaves mutation ownership durable but
+# not stuck in inherited FD 8/9. The guardian retains only active-run.lock,
+# KILLs the inner group, proves it empty, then lets an alternate-dir recovery
+# restore exact values without racing the old workload.
+crash_ready=$test_root/crash-ready
+crash_never_release=$test_root/crash-never-release
+crash_benchmark_pid_file=$test_root/crash-benchmark-pid
+crash_descendant_pid_file=$test_root/crash-descendant-pid
+crash_guardian_block=$test_root/crash-guardian-block
+: >"$crash_guardian_block"
+env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
+    SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    SNOOZER_TEST_READY="$crash_ready" SNOOZER_TEST_RELEASE="$crash_never_release" \
+    SNOOZER_TEST_IGNORE_TERM=1 \
+    SNOOZER_TEST_BENCHMARK_PID="$crash_benchmark_pid_file" \
+    SNOOZER_TEST_DESCENDANT_PID="$crash_descendant_pid_file" \
+    SNOOZER_TEST_DESCENDANT_IGNORE_TERM=1 \
+    SNOOZER_TEST_POST_KILL_BLOCK_FILE="$crash_guardian_block" \
+    "$runner" --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 \
+    --producer-cpu 2 --controller-cpu 3 --timeout-seconds 30 \
+    >"$test_root/active-crash.out" 2>&1 &
+crash_runner_pid=$!
+attempt=0
+while [ ! -s "$crash_benchmark_pid_file" ] \
+    || [ ! -s "$crash_descendant_pid_file" ]; do
+    [ "$attempt" -lt 500 ] \
+        || { kill -KILL "$crash_runner_pid" 2>/dev/null || true; exit 1; }
+    sleep 0.01
+    attempt=$((attempt + 1))
+done
+crash_benchmark_pid=$(tr -d '[:space:]' <"$crash_benchmark_pid_file")
+crash_descendant_pid=$(tr -d '[:space:]' <"$crash_descendant_pid_file")
+for guardian_ready in "$state_root"/guardian-ready.*; do
+    [ -s "$guardian_ready" ] || continue
+    crash_guardian_pid=$(tr -d '[:space:]' <"$guardian_ready")
+done
+[ -n "${crash_guardian_pid:-}" ]
+assert_guardian_lock_contract "$crash_guardian_pid"
+assert_process_does_not_hold_runner_lock "$crash_benchmark_pid"
+assert_process_does_not_hold_runner_lock "$crash_descendant_pid"
+kill -KILL "$crash_runner_pid"
+set +e
+wait "$crash_runner_pid" 2>/dev/null
+crash_runner_status=$?
+set -e
+[ "$crash_runner_status" -eq 137 ]
+
+crash_recovery_state=$test_root/crash-recovery-state
+crash_writes_before_recovery=$(wc -l <"$write_log")
+env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$crash_recovery_state" \
+    SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    "$runner" --recover >"$test_root/active-crash-recovery.out" 2>&1 &
+crash_recovery_pid=$!
+sleep 0.1
+kill -0 "$crash_recovery_pid"
+[ "$(wc -l <"$write_log")" -eq "$crash_writes_before_recovery" ]
+[ "$(tr -d '[:space:]' <"$sysfs_root/cpu0/cpuidle/state0/disable")" = 0 ]
+rm "$crash_guardian_block"
+wait "$crash_recovery_pid"
+! kill -0 "$crash_benchmark_pid" 2>/dev/null
+! kill -0 "$crash_descendant_pid" 2>/dev/null
 assert_original
 assert_clean
 

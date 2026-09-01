@@ -16,10 +16,10 @@
 # - The manifest is durable before the marker is published. Normal exit, command
 #   failure, timeout, HUP, INT, and TERM restore synchronously. SIGKILL cannot run
 #   cleanup; the next operator uses `--recover`.
-# - The benchmark has one outer timeout (default 900 seconds) and a five-second
-#   TERM-to-KILL grace period. Its owned process group is drained before cpuidle
-#   restoration, so the benchmark and its descendants cannot survive the run.
-#   There are no hidden intermediary timeouts.
+# - The benchmark has one outer timeout (default 900 seconds) and one five-second
+#   TERM-to-KILL grace period. After KILL, a separate crash guardian must prove
+#   the group empty before cpuidle restoration; inspection failure waits safely
+#   with the active lock held instead of restoring under a possible survivor.
 set -eu
 
 MANIFEST_VERSION=SNOOZER_CPUIDLE_V2
@@ -28,6 +28,7 @@ DEFAULT_TIMEOUT_SECONDS=900
 KILL_GRACE_SECONDS=5
 KILL_GRACE_POLLS=$((KILL_GRACE_SECONDS * 20))
 KILL_GRACE_MILLISECONDS=$((KILL_GRACE_SECONDS * 1000))
+ACTIVE_RECOVERY_WAIT_SECONDS=10
 SUPERVISOR_STARTUP_POLLS=500
 
 sysfs_root=${SNOOZER_SYSFS_ROOT:-/sys/devices/system/cpu}
@@ -307,6 +308,17 @@ exec 9>>"$lock_file"
 validate_private_file "$lock_file" "lock file"
 flock -n 9 || die "another cpuidle runner holds $lock_file"
 
+# This third, stable lock belongs to the crash guardian while a benchmark may
+# still be alive. Unlike the mutation locks, it is intentionally inherited by
+# the guardian and explicitly closed by the benchmark process group.
+active_lock_file=$state_root/active-run.lock
+reject_symlink "$active_lock_file" "active-run lock file"
+if [ -e "$active_lock_file" ]; then
+    validate_private_file "$active_lock_file" "active-run lock file"
+fi
+exec 7>>"$active_lock_file"
+validate_private_file "$active_lock_file" "active-run lock file"
+
 write_and_verify() {
     target=$1
     expected=$2
@@ -340,18 +352,12 @@ validate_manifest_entry() {
     case "$entry_name" in ''|*'|'*|*"$newline"*) return 1 ;; esac
     state_directory=${entry_path%/disable}
     canonical_state_directory=$(realpath "$state_directory") || return 1
-    canonical_state_name=$(realpath "$state_directory/name") || return 1
-    canonical_disable=$(realpath "$entry_path") || return 1
-    [ "$canonical_state_directory" = "$state_directory" ] \
-        && [ "$canonical_state_name" = "$state_directory/name" ] \
-        && [ "$canonical_disable" = "$entry_path" ] \
-        || return 1
+    [ "$canonical_state_directory" = "$state_directory" ] || return 1
     reject_symlink "$state_directory" "cpuidle state directory"
     reject_symlink "$state_directory/name" "cpuidle state name"
     reject_symlink "$entry_path" "cpuidle disable file"
     [ -f "$state_directory/name" ] && [ -f "$entry_path" ] || return 1
-    current_name=$(tr '[:lower:]' '[:upper:]' <"$state_directory/name" | tr -d '\r\n') \
-        || return 1
+    IFS= read -r current_name <"$state_directory/name" || return 1
     [ "$current_name" = "$entry_name" ]
 }
 
@@ -387,6 +393,49 @@ check_manifest_header() {
     recorded_root=$(sed -n '2s/^sysfs_root=//p' "$checked_manifest")
     [ "$version" = "$MANIFEST_VERSION" ] || die "unsupported recovery manifest version: ${version:-missing}"
     [ "$recorded_root" = "$sysfs_root" ] || die "recovery sysfs root differs from the recorded root"
+}
+
+validate_manifest_inventory() {
+    inventory_manifest=$1
+    inventory_cpus=$(sed -n '6s/^cpus=//p' "$inventory_manifest")
+    inventory_paths=
+    previous_ifs=$IFS
+    IFS=,
+    for inventory_cpu in $inventory_cpus; do
+        found_inventory_state=0
+        for state_directory in "$sysfs_root/cpu$inventory_cpu/cpuidle"/state*; do
+            [ -d "$state_directory" ] || continue
+            found_inventory_state=1
+            inventory_state=${state_directory##*state}
+            case "$inventory_state" in
+                ''|*[!0-9]*) die "invalid current cpuidle state directory" ;;
+            esac
+            inventory_paths="${inventory_paths}${state_directory}/disable
+"
+        done
+        [ "$found_inventory_state" -eq 1 ] \
+            || die "selected CPU exposes no current cpuidle states during recovery"
+    done
+    IFS=$previous_ifs
+    if ! awk -F '|' -v inventory="$inventory_paths" '
+        BEGIN {
+            count = split(inventory, path, "\n")
+            for (inventory_index = 1; inventory_index <= count; inventory_index++) {
+                if (path[inventory_index] != "") current[path[inventory_index]]++
+            }
+        }
+        $1 == "state" { recorded[$2]++ }
+        END {
+            for (candidate in current) {
+                if (current[candidate] != 1 || recorded[candidate] != 1) exit 1
+            }
+            for (candidate in recorded) {
+                if (recorded[candidate] != 1 || current[candidate] != 1) exit 1
+            }
+        }
+    ' "$inventory_manifest"; then
+        die "recovery manifest does not exactly cover the current CPU state inventory"
+    fi
 }
 
 validate_manifest() {
@@ -427,41 +476,33 @@ validate_manifest() {
         validate_manifest_entry "$path" "$original" "$desired" "$name" "$cpu" "$state" \
             || die "recovery manifest has an invalid state entry"
     done <"$validated_manifest"
-    previous_ifs=$IFS
-    IFS=,
-    for cpu in $recorded_cpus; do
-        found_inventory_state=0
-        for state_directory in "$sysfs_root/cpu$cpu/cpuidle"/state*; do
-            [ -d "$state_directory" ] || continue
-            found_inventory_state=1
-            state=${state_directory##*state}
-            case "$state" in ''|*[!0-9]*) die "invalid current cpuidle state directory" ;; esac
-            inventory_path=$state_directory/disable
-            if ! awk -F '|' -v expected="$inventory_path" '
-                $1 == "state" && $2 == expected { count++ }
-                END { exit count != 1 }
-            ' "$validated_manifest"; then
-                die "recovery manifest does not exactly cover the current CPU state inventory"
-            fi
-        done
-        [ "$found_inventory_state" -eq 1 ] \
-            || die "selected CPU exposes no current cpuidle states during recovery"
-    done
-    IFS=$previous_ifs
+    validate_manifest_inventory "$validated_manifest"
 }
 
 restore_manifest() {
     restore_manifest_path=$1
     restore_failed=0
+    # Recheck the complete state inventory before restoration and again before
+    # each write. A hotplugged/reindexed state must retain the recovery records
+    # instead of allowing a partial restore to be mistaken for exact recovery.
+    validate_manifest "$restore_manifest_path"
     while IFS='|' read -r kind path original desired name cpu state; do
         [ "$kind" = state ] || continue
-        if ! validate_manifest_entry "$path" "$original" "$desired" "$name" "$cpu" "$state"; then
-            echo "cpuidle runner: invalid recovery entry for CPU $cpu state$state" >&2
+        restore_path=$path
+        restore_original=$original
+        restore_desired=$desired
+        restore_name=$name
+        restore_cpu=$cpu
+        restore_state=$state
+        validate_manifest_inventory "$restore_manifest_path"
+        if ! validate_manifest_entry "$restore_path" "$restore_original" "$restore_desired" \
+            "$restore_name" "$restore_cpu" "$restore_state"; then
+            echo "cpuidle runner: invalid recovery entry for CPU $restore_cpu state$restore_state" >&2
             restore_failed=1
             continue
         fi
-        if ! write_and_verify "$path" "$original"; then
-            echo "cpuidle runner: failed to restore CPU $cpu state$state ($name) to $original" >&2
+        if ! write_and_verify "$restore_path" "$restore_original"; then
+            echo "cpuidle runner: failed to restore CPU $restore_cpu state$restore_state ($restore_name) to $restore_original" >&2
             restore_failed=1
         fi
     done <"$restore_manifest_path"
@@ -505,6 +546,11 @@ boot_id=$boot_id"
         sync -f "$global_marker_candidate" || return 1
         ln "$global_marker_candidate" "$global_dirty_marker" || return 1
     fi
+    case "${SNOOZER_TEST_SIGNAL_AFTER_GLOBAL_LINK:-}" in
+        '') ;;
+        TERM) kill -TERM "$$" ;;
+        *) return 1 ;;
+    esac
     # From the instant the atomic link succeeds, cleanup must treat the global
     # record as authoritative even if candidate removal, sync, or read-back
     # fails. Keeping the trusted in-memory record prevents a dangling global
@@ -544,6 +590,18 @@ clear_global_dirty_record() {
     global_record=
 }
 
+remove_stale_runtime_files() {
+    for runtime_file in "$state_root"/supervisor-status.* \
+        "$state_root"/supervisor-ready.* "$state_root"/supervisor-go.* \
+        "$state_root"/guardian-ready.* "$state_root"/guardian-release.* \
+        "$state_root"/guardian-group.* "$state_root"/guardian-proof-request.* \
+        "$state_root"/guardian-proof-ready.*; do
+        if [ -e "$runtime_file" ] || [ -L "$runtime_file" ]; then
+            rm -f "$runtime_file" || die "cannot remove stale benchmark runtime file"
+        fi
+    done
+}
+
 finish_recovery() {
     recovered_manifest=$1
     if [ -e "$dirty_marker" ]; then
@@ -561,6 +619,7 @@ finish_recovery() {
         clear_global_dirty_record
     fi
     rm -f "$recovered_manifest" || die "restored state but could not remove manifest"
+    remove_stale_runtime_files
 }
 
 reject_symlink "$dirty_marker" "dirty marker"
@@ -580,6 +639,8 @@ if [ "$recover" -eq 1 ]; then
         recovery_manifest=$(manifest_from_marker)
     fi
     validate_manifest "$recovery_manifest"
+    flock -w "$ACTIVE_RECOVERY_WAIT_SECONDS" 7 \
+        || die "active benchmark cleanup did not release $active_lock_file"
     if ! restore_manifest "$recovery_manifest"; then
         echo "cpuidle runner: RECOVERY FAILED; marker and manifest are retained" >&2
         exit 1
@@ -588,6 +649,8 @@ if [ "$recover" -eq 1 ]; then
     echo "cpuidle runner: recovery complete"
     exit 0
 fi
+
+flock -n 7 || die "an earlier benchmark guardian still owns $active_lock_file"
 
 [ ! -e "$dirty_marker" ] || {
     stale_manifest=$(manifest_from_marker)
@@ -620,6 +683,13 @@ cleanup_manifest=1
 restored=0
 child_pid=
 child_group_verified=0
+guardian_pid=
+guardian_group_verified=0
+guardian_ready_file=
+guardian_release_file=
+guardian_group_file=
+guardian_proof_request_file=
+guardian_proof_ready_file=
 supervisor_status_file=
 supervisor_ready_file=
 supervisor_go_file=
@@ -631,7 +701,10 @@ cleanup() {
     trap - EXIT HUP INT TERM
     if [ -n "$child_pid" ]; then
         if [ "$child_group_verified" -eq 1 ]; then
-            terminate_child "$child_pid"
+            terminate_child "$child_pid" || {
+                echo "cpuidle runner: could not prove the benchmark process group was drained; recovery files are retained" >&2
+                exit 1
+            }
         else
             # Before the go-ahead handshake the supervisor cannot launch the
             # benchmark and exits on its own after a fixed polling bound.
@@ -639,8 +712,23 @@ cleanup() {
         fi
         child_pid=
     fi
+    if [ -n "$guardian_pid" ]; then
+        if ! : >"$guardian_release_file"; then
+            echo "cpuidle runner: could not release the benchmark crash guardian; recovery files are retained" >&2
+            exit 1
+        fi
+        wait "$guardian_pid" 2>/dev/null || {
+            echo "cpuidle runner: benchmark crash guardian failed; recovery files are retained" >&2
+            exit 1
+        }
+        guardian_pid=
+        guardian_group_verified=0
+    fi
     rm -f "${supervisor_status_file:-}" "${supervisor_ready_file:-}" \
-        "${supervisor_go_file:-}" 2>/dev/null || true
+        "${supervisor_go_file:-}" "${guardian_ready_file:-}" \
+        "${guardian_release_file:-}" "${guardian_group_file:-}" \
+        "${guardian_proof_request_file:-}" "${guardian_proof_ready_file:-}" \
+        2>/dev/null || true
     supervisor_status_file=
     supervisor_ready_file=
     supervisor_go_file=
@@ -703,7 +791,10 @@ handle_signal() {
         return
     fi
     if [ -n "$child_pid" ]; then
-        terminate_child "$child_pid"
+        terminate_child "$child_pid" || {
+            echo "cpuidle runner: could not prove the benchmark process group was drained; recovery files are retained" >&2
+            exit 1
+        }
         child_pid=
     fi
     exit "$signal_status"
@@ -719,6 +810,21 @@ process_group_has_live_descendants() {
         $2 == expected_group && $1 != expected_group && $3 !~ /^Z/ { found = 1 }
         END { exit !found }
     '
+}
+
+process_start_ticks() {
+    inspected_pid=$1
+    awk '
+        NR == 1 {
+            line = $0
+            sub(/^.*\) /, "", line)
+            fields = split(line, value, " ")
+            if (fields < 20 || value[20] !~ /^[0-9]+$/) exit 1
+            print value[20]
+            found = 1
+        }
+        END { if (!found) exit 1 }
+    ' "/proc/$inspected_pid/stat"
 }
 
 supervisor_is_stopped() {
@@ -749,6 +855,22 @@ termination_budget_remaining() {
     [ "$termination_now" -lt "$termination_deadline" ]
 }
 
+prove_killed_group_drained() {
+    inspected_pid=$1
+    [ -n "$guardian_pid" ] && [ "$guardian_group_verified" -eq 1 ] || return 1
+    printf '%s\n' "$inspected_pid" >"$guardian_proof_request_file" || return 1
+    while [ ! -s "$guardian_proof_ready_file" ]; do
+        guardian_state=$(ps -o stat= -p "$guardian_pid" 2>/dev/null | tr -d '[:space:]') \
+            || guardian_state=
+        case "$guardian_state" in
+            ''|Z*) return 1 ;;
+        esac
+        sleep 0.05
+    done
+    proved_group=$(tr -d '[:space:]' <"$guardian_proof_ready_file") || return 1
+    [ "$proved_group" = "$inspected_pid" ]
+}
+
 signal_child_group() {
     child_signal=$1
     inspected_pid=$2
@@ -762,40 +884,48 @@ terminate_child() {
     inspected_pid=$1
     termination_mode=${2:-graceful}
     [ "$child_group_verified" -eq 1 ] || return 1
+    child_group_killed=0
     if [ "$termination_mode" = immediate ]; then
-        signal_child_group KILL "$inspected_pid" || true
+        signal_child_group KILL "$inspected_pid" || return 1
+        child_group_killed=1
     else
         signal_child_group TERM "$inspected_pid" || true
         termination_attempt=0
         termination_started=$(monotonic_milliseconds) || termination_started=
         if [ -z "$termination_started" ]; then
-            signal_child_group KILL "$inspected_pid" || true
-            wait "$inspected_pid" 2>/dev/null || true
-            child_group_verified=0
-            return
-        fi
-        termination_deadline=$((termination_started + KILL_GRACE_MILLISECONDS))
-        while process_group_has_live_descendants "$inspected_pid" \
-            && termination_budget_remaining; do
-            sleep 0.05
-            termination_attempt=$((termination_attempt + 1))
-        done
-        if process_group_has_live_descendants "$inspected_pid"; then
-            signal_child_group KILL "$inspected_pid" || true
+            signal_child_group KILL "$inspected_pid" || return 1
+            child_group_killed=1
         else
-            # Do not send CONT before the supervisor reaches its final STOP;
-            # otherwise a fast child exit could miss the wake and hang reap.
-            while ! supervisor_is_stopped "$inspected_pid" \
+            termination_deadline=$((termination_started + KILL_GRACE_MILLISECONDS))
+            while process_group_has_live_descendants "$inspected_pid" \
                 && termination_budget_remaining; do
                 sleep 0.05
                 termination_attempt=$((termination_attempt + 1))
             done
-            if supervisor_is_stopped "$inspected_pid"; then
-                kill -CONT "$inspected_pid" 2>/dev/null || true
+            if process_group_has_live_descendants "$inspected_pid"; then
+                signal_child_group KILL "$inspected_pid" || return 1
+                child_group_killed=1
             else
-                signal_child_group KILL "$inspected_pid" || true
+                # Do not send CONT before the supervisor reaches its final STOP;
+                # otherwise a fast child exit could miss the wake and hang reap.
+                while ! supervisor_is_stopped "$inspected_pid" \
+                    && termination_budget_remaining; do
+                    sleep 0.05
+                    termination_attempt=$((termination_attempt + 1))
+                done
+                if supervisor_is_stopped "$inspected_pid"; then
+                    kill -CONT "$inspected_pid" 2>/dev/null || return 1
+                else
+                    signal_child_group KILL "$inspected_pid" || return 1
+                    child_group_killed=1
+                fi
             fi
         fi
+    fi
+    # Keep the unreaped supervisor as the PGID owner until no non-zombie member
+    # remains. Only then can reaping release the numeric process-group identity.
+    if [ "$child_group_killed" -eq 1 ]; then
+        prove_killed_group_drained "$inspected_pid" || return 1
     fi
     wait "$inspected_pid" 2>/dev/null || true
     child_group_verified=0
@@ -805,6 +935,16 @@ verify_child_process_group() {
     inspected_pid=$1
     group_attempt=0
     while [ "$group_attempt" -lt 100 ]; do
+        inspected_state=$(ps -o stat= -p "$inspected_pid" 2>/dev/null | tr -d '[:space:]') \
+            || inspected_state=
+        case "$inspected_state" in
+            ''|Z*)
+                wait "$inspected_pid" 2>/dev/null || true
+                child_pid=
+                supervisor_launching=0
+                die "benchmark supervisor exited before acquiring a dedicated process group"
+                ;;
+        esac
         group=$(ps -o pgid= -p "$inspected_pid" 2>/dev/null | tr -d '[:space:]') || group=
         if [ "$group" = "$inspected_pid" ]; then
             child_group_verified=1
@@ -854,8 +994,10 @@ for cpu in "$waiter_cpu" "$victim_cpu" "$producer_cpu" "$controller_cpu"; do
         reject_symlink "$state_dir" "cpuidle state directory"
         state=${state_dir##*state}
         case "$state" in ''|*[!0-9]*) die "invalid cpuidle state directory: $state_dir" ;; esac
-        name=$(tr '[:lower:]' '[:upper:]' <"$state_dir/name" | tr -d '\r\n') \
+        recorded_name=$(tr -d '\r\n' <"$state_dir/name") \
             || die "cannot read state name: $state_dir"
+        name=$(printf '%s\n' "$recorded_name" | tr '[:lower:]' '[:upper:]') \
+            || die "cannot normalize state name: $state_dir"
         original=$(tr -d '[:space:]' <"$state_dir/disable") \
             || die "cannot read disable value: $state_dir"
         case "$original" in 0|1) ;; *) die "invalid disable value '$original': $state_dir" ;; esac
@@ -865,7 +1007,7 @@ for cpu in "$waiter_cpu" "$victim_cpu" "$producer_cpu" "$controller_cpu"; do
             *) desired=1 ;;
         esac
         printf 'state|%s|%s|%s|%s|%s|%s\n' \
-            "$state_dir/disable" "$original" "$desired" "$name" "$cpu" "$state" >>"$manifest"
+            "$state_dir/disable" "$original" "$desired" "$recorded_name" "$cpu" "$state" >>"$manifest"
         recorded_states=$((recorded_states + 1))
     done
     [ "$found_state" -eq 1 ] || die "CPU $cpu exposes no cpuidle states"
@@ -890,6 +1032,7 @@ echo "cpuidle runner: recovery manifest $manifest"
 
 while IFS='|' read -r kind path original desired name cpu state; do
     [ "$kind" = state ] || continue
+    validate_manifest_inventory "$manifest"
     validate_manifest_entry "$path" "$original" "$desired" "$name" "$cpu" "$state" \
         || die "manifest validation failed before apply"
     if ! write_and_verify "$path" "$desired"; then
@@ -905,18 +1048,169 @@ case "${SNOOZER_TEST_SIGNAL_AFTER_APPLY:-}" in
     *) die "unsupported test signal after apply" ;;
 esac
 
-echo "C2/C3 and every deeper CPU idle state are disabled because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration."
+echo "C2/C3 and every deeper CPU idle state are disabled on the assigned CPUs because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration."
+
+supervisor_launching=1
+runner_start_ticks=$(process_start_ticks "$$") \
+    || die "cannot read runner process identity"
+guardian_ready_file=$(mktemp "$state_root/guardian-ready.XXXXXX") \
+    || die "cannot allocate guardian ready file"
+guardian_release_file=$(mktemp "$state_root/guardian-release.XXXXXX") \
+    || die "cannot allocate guardian release file"
+guardian_group_file=$(mktemp "$state_root/guardian-group.XXXXXX") \
+    || die "cannot allocate guardian group file"
+guardian_proof_request_file=$(mktemp "$state_root/guardian-proof-request.XXXXXX") \
+    || die "cannot allocate guardian proof request file"
+guardian_proof_ready_file=$(mktemp "$state_root/guardian-proof-ready.XXXXXX") \
+    || die "cannot allocate guardian proof result file"
+rm -f "$guardian_ready_file" "$guardian_release_file" "$guardian_group_file" \
+    "$guardian_proof_request_file" "$guardian_proof_ready_file" \
+    || die "cannot initialize guardian handshake files"
+
+# The guardian is deliberately outside the benchmark PGID. It alone inherits
+# active-run.lock, while closing the mutation locks before publishing READY.
+# If the runner is SIGKILLed, recovery waits on FD 7 until this guardian KILLs
+# and proves the benchmark group empty.
+setsid sh -c '
+    ready_file=$1
+    release_file=$2
+    group_file=$3
+    proof_request_file=$4
+    proof_ready_file=$5
+    runner_pid=$6
+    runner_ticks=$7
+    exec 8>&- 9>&- || exit 125
+    trap "" HUP INT TERM
+
+    process_ticks() {
+        awk '\''
+            NR == 1 {
+                line = $0
+                sub(/^.*\) /, "", line)
+                fields = split(line, value, " ")
+                if (fields < 20 || value[20] !~ /^[0-9]+$/) exit 1
+                print value[20]
+                found = 1
+            }
+            END { if (!found) exit 1 }
+        '\'' "/proc/$1/stat"
+    }
+    runner_is_same_process() {
+        observed_parent=$(ps -o ppid= -p "$$" 2>/dev/null | tr -d "[:space:]") \
+            || return 1
+        [ "$observed_parent" = "$runner_pid" ] || return 1
+        observed_ticks=$(process_ticks "$runner_pid") || return 1
+        [ "$observed_ticks" = "$runner_ticks" ]
+    }
+    group_scan() {
+        inspected_group=$1
+        if [ -n "${SNOOZER_TEST_POST_KILL_BLOCK_FILE:-}" ] \
+            && [ -e "$SNOOZER_TEST_POST_KILL_BLOCK_FILE" ]; then
+            return 2
+        fi
+        processes=$(ps -eo pgid=,stat= 2>/dev/null) || return 2
+        printf "%s\n" "$processes" | awk -v expected_group="$inspected_group" '\''
+            $1 == expected_group && $2 !~ /^Z/ { found = 1 }
+            END { exit !found }
+        '\''
+    }
+    prove_empty() {
+        inspected_group=$1
+        while :; do
+            group_scan "$inspected_group"
+            scan_status=$?
+            case "$scan_status" in
+                1) return 0 ;;
+                0|2) sleep 0.05 ;;
+                *) sleep 0.05 ;;
+            esac
+        done
+    }
+    read_group() {
+        [ -s "$group_file" ] || return 1
+        active_group=$(tr -d "[:space:]" <"$group_file") || return 1
+        case "$active_group" in ""|*[!0-9]*) return 1 ;; esac
+    }
+
+    own_group=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d "[:space:]") || exit 125
+    [ "$own_group" = "$$" ] || exit 125
+    runner_is_same_process || exit 125
+    printf "%s\n" "$$" >"$ready_file" || exit 125
+    [ "${SNOOZER_TEST_GUARDIAN_EXIT_AFTER_READY:-}" != 1 ] || exit 0
+
+    while :; do
+        [ ! -e "$release_file" ] || exit 0
+        if ! runner_is_same_process; then
+            if read_group; then
+                kill -KILL -- "-$active_group" 2>/dev/null || :
+                prove_empty "$active_group"
+            fi
+            exit 0
+        fi
+        if [ -s "$proof_request_file" ]; then
+            requested_group=$(tr -d "[:space:]" <"$proof_request_file") || exit 125
+            read_group || exit 125
+            [ "$requested_group" = "$active_group" ] || exit 125
+            prove_empty "$active_group"
+            printf "%s\n" "$active_group" >"$proof_ready_file" || exit 125
+        fi
+        sleep 0.05
+    done
+' snoozer-benchmark-guardian "$guardian_ready_file" "$guardian_release_file" \
+    "$guardian_group_file" "$guardian_proof_request_file" \
+    "$guardian_proof_ready_file" "$$" "$runner_start_ticks" &
+guardian_pid=$!
+
+guardian_attempt=0
+while [ ! -s "$guardian_ready_file" ] \
+    && [ "$guardian_attempt" -lt "$SUPERVISOR_STARTUP_POLLS" ]; do
+    guardian_state=$(ps -o stat= -p "$guardian_pid" 2>/dev/null | tr -d '[:space:]') \
+        || guardian_state=
+    case "$guardian_state" in
+        ''|Z*)
+            wait "$guardian_pid" 2>/dev/null || true
+            guardian_pid=
+            supervisor_launching=0
+            die "benchmark crash guardian exited before its startup handshake"
+            ;;
+    esac
+    sleep 0.01
+    guardian_attempt=$((guardian_attempt + 1))
+done
+[ -s "$guardian_ready_file" ] \
+    || die "benchmark crash guardian did not complete its startup handshake"
+reported_guardian_pid=$(tr -d '[:space:]' <"$guardian_ready_file") \
+    || die "cannot read benchmark crash guardian identity"
+[ "$reported_guardian_pid" = "$guardian_pid" ] \
+    || die "benchmark crash guardian startup identity did not match its child PID"
+guardian_state=$(ps -o stat= -p "$guardian_pid" 2>/dev/null | tr -d '[:space:]') \
+    || guardian_state=
+case "$guardian_state" in
+    ''|Z*)
+        wait "$guardian_pid" 2>/dev/null || true
+        guardian_pid=
+        supervisor_launching=0
+        die "benchmark crash guardian exited after its startup handshake"
+        ;;
+esac
+guardian_group=$(ps -o pgid= -p "$guardian_pid" 2>/dev/null | tr -d '[:space:]') \
+    || guardian_group=
+[ "$guardian_group" = "$guardian_pid" ] \
+    || die "benchmark crash guardian did not acquire a dedicated process group"
+guardian_group_verified=1
+
+# The supervisor remains the inner process-group leader after timeout exits and
+# until the runner drains that group. It closes all runner locks before READY.
+supervisor_status_file=$(mktemp "$state_root/supervisor-status.XXXXXX") \
+    || die "cannot allocate supervisor status file"
+supervisor_ready_file=$(mktemp "$state_root/supervisor-ready.XXXXXX") \
+    || die "cannot allocate supervisor ready file"
+supervisor_go_file=$(mktemp "$state_root/supervisor-go.XXXXXX") \
+    || die "cannot allocate supervisor go file"
+rm -f "$supervisor_ready_file" "$supervisor_go_file" \
+    || die "cannot initialize supervisor handshake files"
 
 set +e
-# The supervisor remains the process-group leader after timeout exits and until
-# the runner drains the group. Keeping that PID owned prevents a recycled PID
-# or process-group ID from becoming a signal target between status collection
-# and cleanup.
-supervisor_status_file=$(mktemp "$state_root/supervisor-status.XXXXXX")
-supervisor_ready_file=$(mktemp "$state_root/supervisor-ready.XXXXXX")
-supervisor_go_file=$(mktemp "$state_root/supervisor-go.XXXXXX")
-rm -f "$supervisor_ready_file" "$supervisor_go_file"
-supervisor_launching=1
 setsid sh -c '
     ready_file=$1
     go_file=$2
@@ -925,12 +1219,14 @@ setsid sh -c '
     kill_grace=$5
     duration=$6
     shift 6
+    exec 7>&- 8>&- 9>&- || exit 125
     trap "" TERM
     trap "exit 0" CONT
     [ "${SNOOZER_TEST_SUPERVISOR_EXIT_BEFORE_READY:-}" != 1 ] || exit 125
     own_group=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d "[:space:]") || exit 125
     [ "$own_group" = "$$" ] || exit 125
     printf "%s\n" "$$" >"$ready_file" || exit 125
+    [ "${SNOOZER_TEST_SUPERVISOR_EXIT_AFTER_READY:-}" != 1 ] || exit 125
     startup_attempt=0
     while [ ! -e "$go_file" ] && [ "$startup_attempt" -lt "$startup_polls" ]; do
         sleep 0.01
@@ -987,24 +1283,63 @@ reported_supervisor_pid=$(tr -d '[:space:]' <"$supervisor_ready_file")
     die "benchmark supervisor startup identity did not match its owned child PID"
 }
 verify_child_process_group "$child_pid"
-if [ -n "$signal_status" ]; then
+guardian_state=$(ps -o stat= -p "$guardian_pid" 2>/dev/null | tr -d '[:space:]') \
+    || guardian_state=
+guardian_group=$(ps -o pgid= -p "$guardian_pid" 2>/dev/null | tr -d '[:space:]') \
+    || guardian_group=
+guardian_invalid=0
+[ -n "$guardian_state" ] && [ "$guardian_group" = "$guardian_pid" ] \
+    || guardian_invalid=1
+case "$guardian_state" in Z*) guardian_invalid=1 ;; esac
+if [ "$guardian_invalid" -eq 1 ]; then
+    signal_child_group KILL "$child_pid" || true
+    wait "$child_pid" 2>/dev/null || true
+    child_pid=
+    child_group_verified=0
+    wait "$guardian_pid" 2>/dev/null || true
+    guardian_pid=
+    guardian_group_verified=0
     supervisor_launching=0
-    terminate_child "$child_pid" immediate
+    die "benchmark crash guardian exited before benchmark authorization"
+fi
+if [ "${SNOOZER_TEST_FAIL_GROUP_PUBLICATION:-}" = 1 ] \
+    || ! printf '%s\n' "$child_pid" >"$guardian_group_file"; then
+    signal_child_group KILL "$child_pid" || true
+    wait "$child_pid" 2>/dev/null || true
+    child_pid=
+    child_group_verified=0
+    supervisor_launching=0
+    die "cannot publish the verified benchmark process-group identity"
+fi
+supervisor_launching=0
+if [ -n "$signal_status" ]; then
+    terminate_child "$child_pid" immediate || exit 1
     child_pid=
     exit "$signal_status"
 fi
-: >"$supervisor_go_file"
-supervisor_launching=0
+case "${SNOOZER_TEST_SIGNAL_AFTER_GROUP_VERIFY:-}" in
+    '') ;;
+    TERM) kill -TERM "$$" ;;
+    *) die "unsupported test signal after group verification" ;;
+esac
+if [ "${SNOOZER_TEST_FAIL_GO_PUBLICATION:-}" = 1 ] \
+    || ! : >"$supervisor_go_file"; then
+    terminate_child "$child_pid" immediate || exit 1
+    child_pid=
+    die "cannot publish the benchmark go-ahead"
+fi
 
 while :; do
     supervisor_state=$(ps -o stat= -p "$child_pid" 2>/dev/null | tr -d '[:space:]') \
         || supervisor_state=
-    if [ -z "$supervisor_state" ]; then
+    case "$supervisor_state" in
+        ''|Z*)
         wait "$child_pid" 2>/dev/null || true
         child_pid=
         child_group_verified=0
         die "benchmark supervisor exited without preserving its process-group anchor"
-    fi
+        ;;
+    esac
     if [ -s "$supervisor_status_file" ]; then
         case "$supervisor_state" in
             T*) break ;;

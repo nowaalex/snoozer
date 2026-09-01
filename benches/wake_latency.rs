@@ -33,7 +33,9 @@ mod linux {
         CpuIdleState, CpuPowerPolicy, Topology, TscClock, TscSkew, cpu_metadata, cpu_power_policy,
         pin_current, stamp,
     };
-    use crate::pure::{GapSchedule, correct_latency, json_escape, percentile_sorted};
+    use crate::pure::{
+        GapSchedule, RESULT_SCHEMA_VERSION, correct_latency, json_escape, percentile_sorted,
+    };
     use crate::snoozer_api::{
         Observation, wait_direct_filtered, wait_direct_raw, wait_parker_filtered, wait_parker_raw,
     };
@@ -43,7 +45,6 @@ mod linux {
 
     const CSTATE_WARNING: &str = "C2/C3 and every deeper CPU idle state are disabled because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration.";
     const SMOKE_CSTATE_WARNING: &str = "NON-OFFICIAL SMOKE: C2/C3 and deeper CPU idle states may be enabled. Official runs disable them because their exit latency conflicts with the minimum-wake-latency objective.";
-    const RESULT_SCHEMA_VERSION: &str = "snoozer-wake-latency-v1";
     const BURSTY_SCHEDULE_VERSION: &str = "bursty-v1";
     const BURSTY_SEED: u64 = 0x5a17_9d3c_e821_4b6f;
     const SPIN_SWEEP: [usize; 4] = [32, 128, 512, 2_048];

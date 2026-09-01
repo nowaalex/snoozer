@@ -4,7 +4,10 @@ mod pure;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use pure::{GapSchedule, correct_latency, json_escape, parse_cpu_list, percentile_sorted};
+use pure::{
+    GapSchedule, RESULT_SCHEMA_VERSION, correct_latency, json_escape, parse_cpu_list,
+    percentile_sorted,
+};
 
 const BURSTY_SEED: u64 = 0x5a17_9d3c_e821_4b6f;
 
@@ -52,4 +55,10 @@ fn parses_linux_cpu_lists() {
 #[test]
 fn rejects_descending_cpu_range() {
     assert!(parse_cpu_list("4-2").is_err());
+}
+
+#[test]
+fn metadata_schema_is_v2() {
+    assert_eq!(RESULT_SCHEMA_VERSION, "snoozer-wake-latency-v2");
+    assert_ne!(RESULT_SCHEMA_VERSION, "snoozer-wake-latency-v1");
 }

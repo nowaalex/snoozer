@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+pub(crate) const RESULT_SCHEMA_VERSION: &str = "snoozer-wake-latency-v2";
+
 pub(crate) struct GapSchedule {
     state: u64,
 }

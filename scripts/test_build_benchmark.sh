@@ -44,6 +44,25 @@ run_helper() {
 
 [ "$(run_helper)" = /tmp/fake-wake-latency ]
 
+printf 'untracked\n' >"$repository/untracked-input"
+set +e
+untracked_tree_output=$(run_helper 2>&1)
+untracked_tree_status=$?
+set -e
+[ "$untracked_tree_status" -ne 0 ]
+printf '%s\n' "$untracked_tree_output" | grep -q 'clean working tree'
+rm "$repository/untracked-input"
+
+cp "$repository/Cargo.toml" "$test_root/Cargo.toml.clean"
+printf '# tracked modification\n' >>"$repository/Cargo.toml"
+set +e
+tracked_tree_output=$(run_helper 2>&1)
+tracked_tree_status=$?
+set -e
+[ "$tracked_tree_status" -ne 0 ]
+printf '%s\n' "$tracked_tree_output" | grep -q 'clean working tree'
+cp "$test_root/Cargo.toml.clean" "$repository/Cargo.toml"
+
 # A symlinked invocation still resolves the physical repository and checks its
 # physical ancestor chain for Cargo configuration.
 mkdir -p "$test_root/.cargo" "$test_root/invocation"
@@ -133,5 +152,24 @@ wrong_rustc_status=$?
 set -e
 [ "$wrong_rustc_status" -ne 0 ]
 printf '%s\n' "$wrong_rustc_output" | grep -q 'does not match pinned Rust 1.98.0'
+
+SNOOZER_TEST_REAL_GIT=$(command -v git)
+export SNOOZER_TEST_REAL_GIT
+cat >"$fake_bin/git" <<'EOF'
+#!/bin/sh
+if [ "$1" = -C ] && [ "$3" = status ]; then
+    exit 74
+fi
+exec "$SNOOZER_TEST_REAL_GIT" "$@"
+EOF
+chmod +x "$fake_bin/git"
+set +e
+status_failure_output=$(run_helper 2>&1)
+status_failure_status=$?
+set -e
+[ "$status_failure_status" -ne 0 ]
+printf '%s\n' "$status_failure_output" \
+    | grep -q 'cannot verify that the benchmark working tree is clean'
+rm "$fake_bin/git"
 
 echo "benchmark build provenance preflight tests: PASS"

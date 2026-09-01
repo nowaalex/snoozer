@@ -128,11 +128,15 @@ benchmark_commit=$(git -C "$repository" rev-parse --verify HEAD) || {
     echo "the benchmark source commit is empty" >&2
     exit 2
 }
-if [ -n "$(git -C "$repository" status --porcelain --untracked-files=all)" ]; then
-    benchmark_dirty=true
-else
-    benchmark_dirty=false
-fi
+benchmark_status=$(git -C "$repository" status --porcelain --untracked-files=all) || {
+    echo "cannot verify that the benchmark working tree is clean" >&2
+    exit 2
+}
+[ -z "$benchmark_status" ] || {
+    echo "official benchmark builds require a clean working tree, including no untracked files" >&2
+    exit 2
+}
+benchmark_dirty=false
 export SNOOZER_BENCHMARK_COMMIT=$benchmark_commit
 export SNOOZER_BENCHMARK_REPOSITORY=$repository
 export SNOOZER_BENCHMARK_DIRTY=$benchmark_dirty
