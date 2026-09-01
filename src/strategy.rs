@@ -5,13 +5,16 @@ use std::convert::Infallible;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::arch;
 use crate::{Strategy, UnsupportedReason, UnsupportedStrategy, WaitableAtomic, capabilities};
 
 const NO_C_STATE_HINT: u32 = 0x0f;
 #[cfg(feature = "benchmark-only")]
 const C1_STATE_HINT: u32 = 0;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const MWAITX_SAFETY_TIMEOUT: Duration = Duration::from_millis(1);
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 /// Result of one unbounded raw wait attempt.
@@ -615,6 +618,8 @@ impl_wait_strategy!(TestGateStrategy);
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
 
@@ -735,5 +740,53 @@ mod tests {
         for (capabilities, expected) in cases {
             assert_eq!(amd_unavailable_reason(&capabilities), Some(expected));
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn monitored_store_after_recheck_prevents_the_long_safety_wait() {
+        const TEST_SAFETY_TIMEOUT: Duration = Duration::from_millis(200);
+        const DISCRIMINATING_BOUND: Duration = Duration::from_millis(100);
+
+        #[repr(align(128))]
+        struct IsolatedState(AtomicU32);
+
+        let Ok(strategy) = AmdMwaitx::new() else {
+            return;
+        };
+        let state = Arc::new(IsolatedState(AtomicU32::new(0)));
+        let producer_state = Arc::clone(&state);
+        let producer_may_store = Arc::new(AtomicBool::new(false));
+        let producer_has_stored = Arc::new(AtomicBool::new(false));
+        let producer_gate = Arc::clone(&producer_may_store);
+        let producer_done = Arc::clone(&producer_has_stored);
+        let producer = std::thread::spawn(move || {
+            while !producer_gate.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            producer_state.0.store(1, Ordering::Release);
+            producer_done.store(true, Ordering::Release);
+        });
+
+        arch::monitorx(state.0.__monitored_address());
+        assert_eq!(state.0.load(Ordering::Acquire), 0);
+        producer_may_store.store(true, Ordering::Release);
+        while !producer_has_stored.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+
+        let started = Instant::now();
+        arch::mwaitx(
+            duration_to_cycles(TEST_SAFETY_TIMEOUT, strategy.config.timer_hz),
+            NO_C_STATE_HINT,
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(state.0.load(Ordering::Acquire), 1);
+        assert!(
+            elapsed < DISCRIMINATING_BOUND,
+            "monitored store did not wake MWAITX before its safety timer: {elapsed:?}"
+        );
+        assert!(producer.join().is_ok());
     }
 }

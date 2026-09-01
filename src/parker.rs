@@ -189,7 +189,14 @@ impl Unparker {
     /// Multiple calls before the consumer takes the token coalesce into one.
     #[inline]
     pub fn unpark(&self) {
-        self.shared.token.0.store(NOTIFIED_TOKEN, Ordering::Release);
+        // Every producer performs an RMW even when the token is already set.
+        // Consecutive RMWs form a release sequence, so the consumer's Acquire
+        // CAS synchronizes with every coalesced producer publication rather
+        // than only the last producer to overwrite the token.
+        self.shared
+            .token
+            .0
+            .fetch_or(NOTIFIED_TOKEN, Ordering::Release);
     }
 }
 
