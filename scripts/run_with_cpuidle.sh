@@ -19,7 +19,7 @@
 #   TERM-to-KILL child grace period. There are no hidden intermediary timeouts.
 set -eu
 
-MANIFEST_VERSION=SNOOZER_CPUIDLE_V1
+MANIFEST_VERSION=SNOOZER_CPUIDLE_V2
 DEFAULT_TIMEOUT_SECONDS=900
 KILL_GRACE_SECONDS=5
 
@@ -130,7 +130,7 @@ case "$timeout_seconds" in
     ''|*[!0-9]*|0) die "timeout must be a positive integer number of seconds" ;;
 esac
 
-for required in awk date flock id mktemp stat sync timeout; do
+for required in awk date flock id mktemp ps realpath setsid sleep stat sync timeout; do
     command -v "$required" >/dev/null 2>&1 || die "required command is unavailable: $required"
 done
 if [ -n "$write_helper" ]; then
@@ -138,6 +138,9 @@ if [ -n "$write_helper" ]; then
 else
     command -v sudo >/dev/null 2>&1 || die "sudo is required when no write helper is configured"
 fi
+
+sysfs_root=$(realpath "$sysfs_root") || die "cannot canonicalize sysfs root"
+[ "$sysfs_root" != / ] || die "sysfs root must not be root"
 
 reject_symlink() {
     candidate=$1
@@ -157,6 +160,28 @@ validate_private_file() {
 }
 
 umask 077
+if [ "$sysfs_root" = /sys/devices/system/cpu ]; then
+    global_lock_file=/run/lock/snoozer-cpuidle.lock
+    if [ ! -e "$global_lock_file" ]; then
+        sudo touch "$global_lock_file" || die "cannot create global cpuidle lock"
+        sudo chown 0:0 "$global_lock_file" || die "cannot secure global cpuidle lock ownership"
+        sudo chmod 0666 "$global_lock_file" || die "cannot make the global cpuidle lock shareable"
+    fi
+    reject_symlink "$global_lock_file" "global cpuidle lock"
+    [ -f "$global_lock_file" ] \
+        && [ "$(stat -c '%u' "$global_lock_file")" = 0 ] \
+        && [ "$(stat -c '%a' "$global_lock_file")" = 666 ] \
+        || die "global cpuidle lock must be a root-owned regular file with mode 666"
+else
+    # Fake/custom sysfs roots use a root-local lock so tests and simulations do
+    # not contend with the host, while distinct state directories still share it.
+    global_lock_file=$sysfs_root/.snoozer-cpuidle.lock
+    reject_symlink "$global_lock_file" "custom-root cpuidle lock"
+fi
+exec 8>>"$global_lock_file"
+reject_symlink "$global_lock_file" "global cpuidle lock"
+flock -n 8 || die "another cpuidle runner is mutating this sysfs CPU tree"
+
 reject_symlink "$state_root" "state directory"
 if [ -e "$state_root" ]; then
     [ -d "$state_root" ] || die "state path is not a directory: $state_root"
@@ -196,8 +221,9 @@ validate_manifest_entry() {
     entry_path=$1
     original=$2
     desired=$3
-    entry_cpu=$4
-    entry_state=$5
+    entry_name=$4
+    entry_cpu=$5
+    entry_state=$6
     case "$original:$desired" in
         0:0|0:1|1:0|1:1) ;;
         *) return 1 ;;
@@ -207,8 +233,15 @@ validate_manifest_entry() {
     esac
     expected_path=$sysfs_root/cpu$entry_cpu/cpuidle/state$entry_state/disable
     [ "$entry_path" = "$expected_path" ] || return 1
+    case "$entry_name" in ''|*'|'*|*"$newline"*) return 1 ;; esac
+    state_directory=${entry_path%/disable}
+    reject_symlink "$state_directory" "cpuidle state directory"
+    reject_symlink "$state_directory/name" "cpuidle state name"
     reject_symlink "$entry_path" "cpuidle disable file"
-    [ -f "$entry_path" ] || return 1
+    [ -f "$state_directory/name" ] && [ -f "$entry_path" ] || return 1
+    current_name=$(tr '[:lower:]' '[:upper:]' <"$state_directory/name" | tr -d '\r\n') \
+        || return 1
+    [ "$current_name" = "$entry_name" ]
 }
 
 manifest_from_marker() {
@@ -238,23 +271,59 @@ validate_manifest() {
     pid_value=$(sed -n '3s/^pid=//p' "$validated_manifest")
     uid_value=$(sed -n '4s/^uid=//p' "$validated_manifest")
     time_value=$(sed -n '5s/^started_epoch=//p' "$validated_manifest")
+    recorded_cpus=$(sed -n '6s/^cpus=//p' "$validated_manifest")
     case "$pid_value:$uid_value:$time_value" in
         *[!0-9:]*|:*|*:) die "recovery manifest has invalid provenance" ;;
     esac
     [ -n "$pid_value" ] && [ -n "$uid_value" ] && [ -n "$time_value" ] \
         || die "recovery manifest has incomplete provenance"
+    if ! printf '%s\n' "$recorded_cpus" | awk -F ',' '
+        NF != 4 { exit 1 }
+        {
+            for (field_index = 1; field_index <= NF; field_index++) {
+                if ($field_index !~ /^[0-9]+$/ || seen[$field_index]++) exit 1
+            }
+        }
+    '; then
+        die "recovery manifest must name four distinct numeric CPUs"
+    fi
     if ! awk -F '|' '
-        NR <= 5 { next }
+        NR <= 6 { next }
         NF != 7 || $1 != "state" || seen[$2]++ { exit 1 }
-        END { if (NR <= 5) exit 1 }
+        END { if (NR <= 6) exit 1 }
     ' "$validated_manifest"; then
         die "recovery manifest has malformed or duplicate state entries"
     fi
     while IFS='|' read -r kind path original desired name cpu state; do
         [ "$kind" = state ] || continue
-        validate_manifest_entry "$path" "$original" "$desired" "$cpu" "$state" \
+        case ",$recorded_cpus," in
+            *",$cpu,"*) ;;
+            *) die "recovery manifest contains an unselected CPU" ;;
+        esac
+        validate_manifest_entry "$path" "$original" "$desired" "$name" "$cpu" "$state" \
             || die "recovery manifest has an invalid state entry"
     done <"$validated_manifest"
+    previous_ifs=$IFS
+    IFS=,
+    for cpu in $recorded_cpus; do
+        found_inventory_state=0
+        for state_directory in "$sysfs_root/cpu$cpu/cpuidle"/state*; do
+            [ -d "$state_directory" ] || continue
+            found_inventory_state=1
+            state=${state_directory##*state}
+            case "$state" in ''|*[!0-9]*) die "invalid current cpuidle state directory" ;; esac
+            inventory_path=$state_directory/disable
+            if ! awk -F '|' -v expected="$inventory_path" '
+                $1 == "state" && $2 == expected { count++ }
+                END { exit count != 1 }
+            ' "$validated_manifest"; then
+                die "recovery manifest does not exactly cover the current CPU state inventory"
+            fi
+        done
+        [ "$found_inventory_state" -eq 1 ] \
+            || die "selected CPU exposes no current cpuidle states during recovery"
+    done
+    IFS=$previous_ifs
 }
 
 restore_manifest() {
@@ -262,7 +331,7 @@ restore_manifest() {
     restore_failed=0
     while IFS='|' read -r kind path original desired name cpu state; do
         [ "$kind" = state ] || continue
-        if ! validate_manifest_entry "$path" "$original" "$desired" "$cpu" "$state"; then
+        if ! validate_manifest_entry "$path" "$original" "$desired" "$name" "$cpu" "$state"; then
             echo "cpuidle runner: invalid recovery entry for CPU $cpu state$state" >&2
             restore_failed=1
             continue
@@ -360,11 +429,53 @@ cleanup() {
 handle_signal() {
     signal_status=$1
     if [ -n "$child_pid" ]; then
-        kill -TERM "$child_pid" 2>/dev/null || true
-        wait "$child_pid" 2>/dev/null || true
+        terminate_child "$child_pid"
         child_pid=
     fi
     exit "$signal_status"
+}
+
+child_tree_alive() {
+    inspected_pid=$1
+    kill -0 "$inspected_pid" 2>/dev/null || kill -0 -- "-$inspected_pid" 2>/dev/null
+}
+
+signal_child_tree() {
+    child_signal=$1
+    inspected_pid=$2
+    kill -"$child_signal" -- "-$inspected_pid" 2>/dev/null \
+        || kill -"$child_signal" "$inspected_pid" 2>/dev/null \
+        || true
+}
+
+terminate_child() {
+    inspected_pid=$1
+    signal_child_tree TERM "$inspected_pid"
+    termination_deadline=$(($(date +%s) + KILL_GRACE_SECONDS))
+    while child_tree_alive "$inspected_pid" \
+        && [ "$(date +%s)" -lt "$termination_deadline" ]; do
+        sleep 0.05
+    done
+    if child_tree_alive "$inspected_pid"; then
+        signal_child_tree KILL "$inspected_pid"
+    fi
+    wait "$inspected_pid" 2>/dev/null || true
+}
+
+verify_child_process_group() {
+    inspected_pid=$1
+    group_attempt=0
+    while [ "$group_attempt" -lt 100 ]; do
+        group=$(ps -o pgid= -p "$inspected_pid" 2>/dev/null | tr -d '[:space:]') || group=
+        [ "$group" = "$inspected_pid" ] && return 0
+        if ! kill -0 "$inspected_pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.01
+        group_attempt=$((group_attempt + 1))
+    done
+    signal_child_tree KILL "$inspected_pid"
+    die "benchmark supervisor did not acquire a dedicated process group"
 }
 
 trap cleanup EXIT
@@ -379,6 +490,8 @@ started_epoch=$(date +%s)
     printf 'pid=%s\n' "$$"
     printf 'uid=%s\n' "$current_uid"
     printf 'started_epoch=%s\n' "$started_epoch"
+    printf 'cpus=%s,%s,%s,%s\n' \
+        "$waiter_cpu" "$victim_cpu" "$producer_cpu" "$controller_cpu"
 } >"$manifest"
 
 recorded_states=0
@@ -424,7 +537,7 @@ echo "cpuidle runner: recovery manifest $manifest"
 
 while IFS='|' read -r kind path original desired name cpu state; do
     [ "$kind" = state ] || continue
-    validate_manifest_entry "$path" "$original" "$desired" "$cpu" "$state" \
+    validate_manifest_entry "$path" "$original" "$desired" "$name" "$cpu" "$state" \
         || die "manifest validation failed before apply"
     if ! write_and_verify "$path" "$desired"; then
         echo "cpuidle runner: failed to apply CPU $cpu state$state ($name)=$desired" >&2
@@ -439,7 +552,7 @@ fi
 echo "C2/C3 and every deeper CPU idle state are disabled because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration."
 
 set +e
-timeout --foreground --signal=TERM --kill-after="${KILL_GRACE_SECONDS}s" "$timeout_seconds" \
+setsid timeout --foreground --signal=TERM --kill-after="${KILL_GRACE_SECONDS}s" "$timeout_seconds" \
     "$binary" \
     --waiter-cpu "$waiter_cpu" \
     --victim-cpu "$victim_cpu" \
@@ -447,6 +560,7 @@ timeout --foreground --signal=TERM --kill-after="${KILL_GRACE_SECONDS}s" "$timeo
     --controller-cpu "$controller_cpu" \
     "$@" &
 child_pid=$!
+verify_child_process_group "$child_pid"
 wait "$child_pid"
 command_status=$?
 child_pid=

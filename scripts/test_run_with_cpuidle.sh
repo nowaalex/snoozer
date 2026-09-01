@@ -52,7 +52,20 @@ for cpu in 0 1 2 3; do
     [ "$(tr -d '[:space:]' <"$SNOOZER_SYSFS_ROOT/cpu$cpu/cpuidle/state4/disable")" = 1 ]
 done
 if [ -n "${SNOOZER_TEST_READY:-}" ]; then
+    if [ -n "${SNOOZER_TEST_BENCHMARK_PID:-}" ]; then
+        printf '%s\n' "$$" >"$SNOOZER_TEST_BENCHMARK_PID"
+    fi
     : >"$SNOOZER_TEST_READY"
+    if [ "${SNOOZER_TEST_IGNORE_TERM:-}" = 1 ]; then
+        trap '' TERM
+        if [ -n "${SNOOZER_TEST_DESCENDANT_PID:-}" ]; then
+            sh -c '
+                trap "" TERM
+                printf "%s\n" "$$" >"$1"
+                while :; do sleep 1; done
+            ' sh "$SNOOZER_TEST_DESCENDANT_PID" &
+        fi
+    fi
     while [ ! -e "$SNOOZER_TEST_RELEASE" ]; do sleep 0.01; done
 fi
 EOF
@@ -111,6 +124,98 @@ set -e
 assert_original
 assert_clean
 
+# An external TERM has its own TERM-to-KILL deadline even if the workload
+# ignores TERM, and state restoration still completes.
+ready=$test_root/signal-ready
+never_release=$test_root/signal-never-release
+benchmark_pid_file=$test_root/signal-benchmark-pid
+descendant_pid_file=$test_root/signal-descendant-pid
+env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
+    SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    SNOOZER_TEST_READY="$ready" SNOOZER_TEST_RELEASE="$never_release" \
+    SNOOZER_TEST_IGNORE_TERM=1 SNOOZER_TEST_BENCHMARK_PID="$benchmark_pid_file" \
+    SNOOZER_TEST_DESCENDANT_PID="$descendant_pid_file" \
+    "$runner" --binary "$benchmark" \
+    --waiter-cpu 0 --victim-cpu 1 --producer-cpu 2 --controller-cpu 3 \
+    --timeout-seconds 5 >"$test_root/signal.out" 2>&1 &
+signal_runner_pid=$!
+attempt=0
+while [ ! -e "$ready" ] && [ "$attempt" -lt 300 ]; do
+    sleep 0.01
+    attempt=$((attempt + 1))
+done
+[ -e "$ready" ] || { kill "$signal_runner_pid" 2>/dev/null || true; exit 1; }
+benchmark_pid=$(tr -d '[:space:]' <"$benchmark_pid_file")
+attempt=0
+while [ ! -e "$descendant_pid_file" ] && [ "$attempt" -lt 300 ]; do
+    sleep 0.01
+    attempt=$((attempt + 1))
+done
+[ -e "$descendant_pid_file" ] || { kill "$signal_runner_pid" 2>/dev/null || true; exit 1; }
+descendant_pid=$(tr -d '[:space:]' <"$descendant_pid_file")
+kill -TERM "$signal_runner_pid"
+attempt=0
+while kill -0 "$signal_runner_pid" 2>/dev/null && [ "$attempt" -lt 800 ]; do
+    sleep 0.01
+    attempt=$((attempt + 1))
+done
+if kill -0 "$signal_runner_pid" 2>/dev/null; then
+    kill -KILL "$signal_runner_pid" 2>/dev/null || true
+    exit 1
+fi
+set +e
+wait "$signal_runner_pid"
+signal_status=$?
+set -e
+[ "$signal_status" -eq 143 ]
+! kill -0 "$benchmark_pid" 2>/dev/null
+! kill -0 "$descendant_pid" 2>/dev/null
+assert_original
+assert_clean
+
+# HUP and INT while the benchmark is active use the same bounded group cleanup.
+for signal_specification in HUP:129 INT:130; do
+    active_signal=${signal_specification%%:*}
+    expected_status=${signal_specification##*:}
+    ready=$test_root/active-$active_signal-ready
+    never_release=$test_root/active-$active_signal-never-release
+    benchmark_pid_file=$test_root/active-$active_signal-benchmark-pid
+    env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
+        SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+        SNOOZER_TEST_READY="$ready" SNOOZER_TEST_RELEASE="$never_release" \
+        SNOOZER_TEST_BENCHMARK_PID="$benchmark_pid_file" \
+        python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execv(sys.argv[1], sys.argv[1:])' \
+        "$runner" --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 \
+        --producer-cpu 2 --controller-cpu 3 --timeout-seconds 5 \
+        >"$test_root/active-$active_signal.out" 2>&1 &
+    active_runner_pid=$!
+    attempt=0
+    while [ ! -e "$ready" ] && [ "$attempt" -lt 300 ]; do
+        sleep 0.01
+        attempt=$((attempt + 1))
+    done
+    [ -e "$ready" ] || { kill "$active_runner_pid" 2>/dev/null || true; exit 1; }
+    active_benchmark_pid=$(tr -d '[:space:]' <"$benchmark_pid_file")
+    kill -"$active_signal" "$active_runner_pid"
+    attempt=0
+    while kill -0 "$active_runner_pid" 2>/dev/null && [ "$attempt" -lt 800 ]; do
+        sleep 0.01
+        attempt=$((attempt + 1))
+    done
+    if kill -0 "$active_runner_pid" 2>/dev/null; then
+        kill -KILL "$active_runner_pid" 2>/dev/null || true
+        exit 1
+    fi
+    set +e
+    wait "$active_runner_pid"
+    active_status=$?
+    set -e
+    [ "$active_status" -eq "$expected_status" ]
+    ! kill -0 "$active_benchmark_pid" 2>/dev/null
+    assert_original
+    assert_clean
+done
+
 # The outer timeout terminates the workload and still restores exact state.
 ready=$test_root/timeout-ready
 never_release=$test_root/timeout-never-release
@@ -129,9 +234,10 @@ mkdir -p "$state_root"
 chmod 700 "$state_root"
 manifest=$state_root/manifest.recovery
 {
-    printf 'version=SNOOZER_CPUIDLE_V1\n'
+    printf 'version=SNOOZER_CPUIDLE_V2\n'
     printf 'sysfs_root=%s\n' "$sysfs_root"
     printf 'pid=999999\nuid=%s\nstarted_epoch=0\n' "$(id -u)"
+    printf 'cpus=0,1,2,3\n'
     for cpu in 0 1 2 3; do
         for specification in 0:POLL:1:0 1:C1:1:0 2:C1E:0:1 3:C2:0:1 4:C3:0:1; do
             state=${specification%%:*}
@@ -158,6 +264,33 @@ set -e
 [ "$retry_status" -ne 0 ]
 printf '%s\n' "$retry_output" | grep -q 'unfinished run detected'
 [ ! -s "$write_log" ]
+
+# Recovery rechecks the recorded idle-state name before its first write, so a
+# reused state index cannot restore a different C-state.
+printf 'MWAIT\n' >"$sysfs_root/cpu0/cpuidle/state0/name"
+set +e
+name_output=$(runner_env "$runner" --recover 2>&1)
+name_status=$?
+set -e
+[ "$name_status" -ne 0 ]
+printf '%s\n' "$name_output" | grep -q 'invalid state entry'
+[ ! -s "$write_log" ]
+[ -f "$state_root/dirty" ]
+printf 'POLL\n' >"$sysfs_root/cpu0/cpuidle/state0/name"
+
+# A truncated manifest cannot restore a partial CPU state inventory.
+cp "$manifest" "$test_root/complete-manifest"
+sed '$d' "$test_root/complete-manifest" >"$manifest"
+chmod 600 "$manifest"
+set +e
+inventory_output=$(runner_env "$runner" --recover 2>&1)
+inventory_status=$?
+set -e
+[ "$inventory_status" -ne 0 ]
+printf '%s\n' "$inventory_output" | grep -q 'does not exactly cover'
+[ ! -s "$write_log" ]
+cp "$test_root/complete-manifest" "$manifest"
+chmod 600 "$manifest"
 runner_env "$runner" --recover >/dev/null
 assert_original
 assert_clean
@@ -178,7 +311,22 @@ concurrent_output=$(run_benchmark 2>&1)
 concurrent_status=$?
 set -e
 [ "$concurrent_status" -ne 0 ]
-printf '%s\n' "$concurrent_output" | grep -q 'another cpuidle runner holds'
+printf '%s\n' "$concurrent_output" | grep -q 'another cpuidle runner is mutating'
+
+# A different private state directory still contends on the sysfs-root lock.
+second_state_root=$test_root/second-state
+writes_before=$(wc -l <"$write_log")
+set +e
+global_output=$(env SNOOZER_SYSFS_ROOT="$sysfs_root" \
+    SNOOZER_STATE_DIR="$second_state_root" SNOOZER_WRITE_HELPER="$write_helper" \
+    SNOOZER_TEST_WRITE_LOG="$write_log" "$runner" --binary "$benchmark" \
+    --waiter-cpu 0 --victim-cpu 1 --producer-cpu 2 --controller-cpu 3 \
+    --timeout-seconds 5 2>&1)
+global_status=$?
+set -e
+[ "$global_status" -ne 0 ]
+printf '%s\n' "$global_output" | grep -q 'another cpuidle runner is mutating'
+[ "$(wc -l <"$write_log")" -eq "$writes_before" ]
 : >"$release"
 wait "$first_pid"
 assert_original

@@ -8,6 +8,9 @@ fn main() {
 #[path = "support/platform.rs"]
 mod platform;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "support/pure.rs"]
+mod pure;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[path = "support/snoozer_api.rs"]
 mod snoozer_api;
 
@@ -29,6 +32,7 @@ mod linux {
     use crate::platform::{
         CpuIdleState, Topology, TscClock, TscSkew, cpu_metadata, pin_current, stamp,
     };
+    use crate::pure::{GapSchedule, correct_latency, json_escape, percentile_sorted};
     use crate::snoozer_api::{
         Observation, wait_direct_filtered, wait_direct_raw, wait_parker_filtered, wait_parker_raw,
     };
@@ -46,9 +50,16 @@ mod linux {
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
     const MAX_THROUGHPUT_LOSS_PERCENT: f64 = 5.0;
     const MAX_P99_DEGRADATION_PERCENT: f64 = 10.0;
+    const COMPILED_COMMIT: Option<&str> = option_env!("SNOOZER_BENCHMARK_COMMIT");
+    const COMPILED_REPOSITORY: Option<&str> = option_env!("SNOOZER_BENCHMARK_REPOSITORY");
+    const COMPILED_RUSTC: Option<&str> = option_env!("SNOOZER_BENCHMARK_RUSTC");
+    const COMPILED_TRACKED_DIRTY: Option<&str> = option_env!("SNOOZER_BENCHMARK_TRACKED_DIRTY");
 
     pub(crate) fn main() -> AnyResult<()> {
         let arguments = Arguments::parse()?;
+        if arguments.mode == Mode::Official && !cfg!(feature = "benchmark-only") {
+            return Err("official mode requires --features benchmark-only for the complete diagnostic matrix".into());
+        }
         let cstate_warning = match arguments.mode {
             Mode::Official => CSTATE_WARNING,
             Mode::Smoke => SMOKE_CSTATE_WARNING,
@@ -80,11 +91,18 @@ mod linux {
         )?;
         let provenance = repository_provenance();
         if arguments.mode == Mode::Official
-            && (provenance.commit == "unknown" || provenance.working_tree_dirty != Some(false))
+            && (provenance.compiled_commit == "unknown"
+                || provenance.compiled_tracked_dirty != Some(false)
+                || COMPILED_RUSTC.is_none()
+                || provenance.checkout_commit != provenance.compiled_commit
+                || provenance.checkout_tracked_dirty != Some(false))
         {
-            return Err(
-                "official mode requires a known commit and a clean Git working tree".into(),
-            );
+            return Err("official mode requires a build stamped by scripts/build_benchmark.sh, the same commit still checked out, and no tracked working-tree changes".into());
+        }
+        if arguments.mode == Mode::Official {
+            drop(AmdMwaitx::new().map_err(|error| {
+                format!("official mode requires the complete AMD MWAITX comparison matrix: {error}")
+            })?);
         }
         let metadata = cpu_metadata(topology.waiter, &sysfs_root);
         let mut output = JsonlOutput::create(&arguments.output)?;
@@ -148,6 +166,13 @@ mod linux {
                     let (control, contender) = match pair_result {
                         Ok(pair) => pair,
                         Err(reason) => {
+                            if arguments.mode == Mode::Official {
+                                return Err(format!(
+                                    "official mode requires every benchmark case; {} is unsupported: {reason}",
+                                    case.name()
+                                )
+                                .into());
+                            }
                             unsupported = Some(reason);
                             break;
                         }
@@ -324,6 +349,9 @@ mod linux {
             {
                 return Err("official mode requires duration>=250ms, repetitions>=7, warmup-events>=1000, and max-samples>=10000".into());
             }
+            if mode == Mode::Official && case_filter.is_some() {
+                return Err("--case is available only for non-official smoke runs; official mode always measures the complete matrix".into());
+            }
             let role_count = [waiter_cpu, victim_cpu, producer_cpu, controller_cpu]
                 .iter()
                 .filter(|value| value.is_some())
@@ -391,34 +419,45 @@ mod linux {
 
     #[derive(Debug)]
     struct RepositoryProvenance {
-        commit: String,
-        working_tree_dirty: Option<bool>,
+        compiled_commit: String,
+        compiled_tracked_dirty: Option<bool>,
+        checkout_commit: String,
+        checkout_tracked_dirty: Option<bool>,
     }
 
     fn repository_provenance() -> RepositoryProvenance {
-        let commit = std::env::var("SNOOZER_BENCHMARK_COMMIT")
-            .ok()
+        let compiled_commit = COMPILED_COMMIT
             .filter(|value| !value.is_empty())
-            .or_else(|| {
-                let output = Command::new("git")
-                    .args(["rev-parse", "--verify", "HEAD"])
-                    .output()
-                    .ok()?;
-                output
-                    .status
-                    .success()
-                    .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            })
+            .map(str::to_owned)
             .unwrap_or_else(|| "unknown".to_owned());
-        let working_tree_dirty = Command::new("git")
-            .args(["status", "--porcelain", "--untracked-files=no"])
-            .output()
-            .ok()
-            .and_then(|output| output.status.success().then_some(!output.stdout.is_empty()));
+        let compiled_tracked_dirty = match COMPILED_TRACKED_DIRTY {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        };
+        let checkout_commit = git_in_compiled_repository(&["rev-parse", "--verify", "HEAD"])
+            .map(|output| String::from_utf8_lossy(&output).trim().to_owned())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let checkout_tracked_dirty =
+            git_in_compiled_repository(&["status", "--porcelain", "--untracked-files=no"])
+                .map(|output| !output.is_empty());
         RepositoryProvenance {
-            commit,
-            working_tree_dirty,
+            compiled_commit,
+            compiled_tracked_dirty,
+            checkout_commit,
+            checkout_tracked_dirty,
         }
+    }
+
+    fn git_in_compiled_repository(arguments: &[&str]) -> Option<Vec<u8>> {
+        let repository = COMPILED_REPOSITORY.filter(|value| !value.is_empty())?;
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(arguments)
+            .output()
+            .ok()?;
+        output.status.success().then_some(output.stdout)
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -990,8 +1029,10 @@ mod linux {
         } else if let Ok(raw_cycles) = i64::try_from(i128::from(received) - i128::from(sent)) {
             if *events >= warmup_events && metrics.latencies_cycles.len() < max_samples {
                 metrics.latencies_cycles.push(raw_cycles);
-            } else if metrics.latencies_cycles.len() >= max_samples {
-                metrics.sample_limit_reached = true;
+                if metrics.latencies_cycles.len() == max_samples {
+                    metrics.sample_limit_reached = true;
+                    shared.stop.0.store(true, Ordering::Release);
+                }
             }
         } else {
             metrics.invalid_samples = metrics.invalid_samples.saturating_add(1);
@@ -1018,7 +1059,7 @@ mod linux {
             let (_, expected_aux) = stamp();
             shared.thread_ready();
             let mut sequence = 0_u64;
-            let mut gaps = GapSchedule::new();
+            let mut gaps = GapSchedule::new(BURSTY_SEED);
             while !shared.stop.0.load(Ordering::Acquire) {
                 wait_for_ack_or_stop(&shared, sequence);
                 if shared.stop.0.load(Ordering::Acquire) {
@@ -1092,37 +1133,6 @@ mod linux {
         }
         while Instant::now() < target {
             std::hint::spin_loop();
-        }
-    }
-
-    struct GapSchedule {
-        state: u64,
-    }
-
-    impl GapSchedule {
-        fn new() -> Self {
-            Self { state: BURSTY_SEED }
-        }
-
-        fn next(&mut self) -> Duration {
-            // xorshift64* is fixed here so every strategy receives the same
-            // versioned weighted schedule.
-            self.state ^= self.state >> 12;
-            self.state ^= self.state << 25;
-            self.state ^= self.state >> 27;
-            let bucket = self.state.wrapping_mul(0x2545_f491_4f6c_dd1d) % 100;
-            let microseconds = match bucket {
-                0..=29 => 0,
-                30..=44 => 1,
-                45..=56 => 5,
-                57..=66 => 10,
-                67..=76 => 25,
-                77..=84 => 50,
-                85..=91 => 100,
-                92..=96 => 250,
-                _ => 1_000,
-            };
-            Duration::from_micros(microseconds)
         }
     }
 
@@ -1241,6 +1251,9 @@ mod linux {
     }
 
     fn validate_sample_set(metrics: &WaiterMetrics) -> AnyResult<()> {
+        if metrics.sample_limit_reached {
+            return Err("latency sample limit reached; partial distributions are not emitted; rerun with a larger --max-samples".into());
+        }
         if metrics.latencies_cycles.is_empty() {
             return Err("timed trial produced no post-warmup latency samples".into());
         }
@@ -1353,11 +1366,6 @@ mod linux {
         Ok((measured as f64 - baseline as f64) / baseline as f64 * 100.0)
     }
 
-    fn correct_latency(raw_cycles: i64, waiter_minus_producer_cycles: i64) -> Option<u64> {
-        let corrected = i128::from(raw_cycles) - i128::from(waiter_minus_producer_cycles);
-        u64::try_from(corrected).ok()
-    }
-
     #[derive(Clone, Debug)]
     struct Summary {
         case: Case,
@@ -1451,11 +1459,6 @@ mod linux {
         percentile_sorted(values, quantile)
     }
 
-    fn percentile_sorted(values: &[u64], quantile: f64) -> u64 {
-        let rank = (quantile * values.len() as f64).ceil() as usize;
-        values[rank.saturating_sub(1).min(values.len() - 1)]
-    }
-
     struct JsonlOutput {
         writer: BufWriter<File>,
     }
@@ -1513,26 +1516,44 @@ mod linux {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
-            let dirty = input
+            let compiled_dirty = input
                 .provenance
-                .working_tree_dirty
+                .compiled_tracked_dirty
+                .map_or_else(|| "null".to_owned(), |value| value.to_string());
+            let checkout_dirty = input
+                .provenance
+                .checkout_tracked_dirty
+                .map_or_else(|| "null".to_owned(), |value| value.to_string());
+            let mwaitx_timer_hz = snoozer::capabilities()
+                .mwaitx_timer_hz
                 .map_or_else(|| "null".to_owned(), |value| value.to_string());
             writeln!(
                 self.writer,
-                "{{\"type\":\"metadata\",\"schema\":\"{}\",\"mode\":\"{}\",\"warning\":\"{}\",\"benchmark_commit\":\"{}\",\"tracked_working_tree_dirty\":{},\"schedule_version\":\"{}\",\"schedule_seed\":\"0x{:016x}\",\"bursty_gap_us_weight_percent\":[[0,30],[1,15],[5,12],[10,10],[25,10],[50,8],[100,7],[250,5],[1000,3]],\"duration_ms\":{},\"repetitions\":{},\"warmup_events\":{},\"max_samples\":{},\"clocksource\":\"tsc\",\"cycles_per_ns\":{:.9},\"calibration_spread_percent\":{:.6},\"tsc_skew\":{{\"producer_offset_cycles\":{},\"waiter_offset_cycles\":{},\"producer_uncertainty_cycles\":{},\"waiter_uncertainty_cycles\":{},\"producer_to_waiter_bound_ns\":{:.6},\"applied_waiter_minus_producer_cycles\":{}}},\"matched_control\":\"victim-only baseline; reported loss conservatively includes producer and waiter activity\",\"cpu_model\":\"{}\",\"microcode\":\"{}\",\"kernel\":\"{}\",\"governor\":\"{}\",\"energy_preference\":\"{}\",\"roles\":{{\"waiter\":{},\"victim\":{},\"producer\":{},\"controller\":{}}},\"topology\":[{}],\"cpuidle\":[{}]}}",
+                "{{\"type\":\"metadata\",\"schema\":\"{}\",\"mode\":\"{}\",\"warning\":\"{}\",\"benchmark_commit\":\"{}\",\"compiled_tracked_working_tree_dirty\":{},\"checkout_commit\":\"{}\",\"checkout_tracked_working_tree_dirty\":{},\"rustc\":\"{}\",\"benchmark_features\":{},\"schedule_version\":\"{}\",\"schedule_seed\":\"0x{:016x}\",\"bursty_gap_us_weight_percent\":[[0,30],[1,15],[5,12],[10,10],[25,10],[50,8],[100,7],[250,5],[1000,3]],\"duration_ms\":{},\"repetitions\":{},\"warmup_events\":{},\"max_samples\":{},\"acceptance_limits\":{{\"max_victim_throughput_loss_percent\":{:.6},\"max_victim_p99_degradation_percent\":{:.6}}},\"clocksource\":\"tsc\",\"cycles_per_ns\":{:.9},\"calibration_spread_percent\":{:.6},\"mwaitx_timer_hz\":{},\"tsc_skew\":{{\"producer_offset_cycles\":{},\"waiter_offset_cycles\":{},\"producer_uncertainty_cycles\":{},\"waiter_uncertainty_cycles\":{},\"producer_to_waiter_bound_ns\":{:.6},\"applied_waiter_minus_producer_cycles\":{}}},\"matched_control\":\"victim-only baseline; reported loss conservatively includes producer and waiter activity\",\"cpu_model\":\"{}\",\"microcode\":\"{}\",\"kernel\":\"{}\",\"governor\":\"{}\",\"energy_preference\":\"{}\",\"roles\":{{\"waiter\":{},\"victim\":{},\"producer\":{},\"controller\":{}}},\"topology\":[{}],\"cpuidle\":[{}]}}",
                 RESULT_SCHEMA_VERSION,
                 input.arguments.mode.as_str(),
                 json_escape(input.cstate_warning),
-                json_escape(&input.provenance.commit),
-                dirty,
+                json_escape(&input.provenance.compiled_commit),
+                compiled_dirty,
+                json_escape(&input.provenance.checkout_commit),
+                checkout_dirty,
+                json_escape(COMPILED_RUSTC.unwrap_or("unknown")),
+                if cfg!(feature = "benchmark-only") {
+                    "[\"benchmark-only\"]"
+                } else {
+                    "[]"
+                },
                 BURSTY_SCHEDULE_VERSION,
                 BURSTY_SEED,
                 input.arguments.trial_duration.as_millis(),
                 input.arguments.repetitions,
                 input.arguments.warmup_events,
                 input.arguments.max_samples,
+                MAX_THROUGHPUT_LOSS_PERCENT,
+                MAX_P99_DEGRADATION_PERCENT,
                 input.clock.cycles_per_ns,
                 input.clock.spread_percent,
+                mwaitx_timer_hz,
                 input.skew.producer_offset_cycles,
                 input.skew.waiter_offset_cycles,
                 input.skew.producer_uncertainty_cycles,
@@ -1666,64 +1687,6 @@ mod linux {
         fn flush(&mut self) -> AnyResult<()> {
             self.writer.flush()?;
             Ok(())
-        }
-    }
-
-    fn json_escape(value: &str) -> String {
-        let mut escaped = String::with_capacity(value.len());
-        for character in value.chars() {
-            match character {
-                '"' => escaped.push_str("\\\""),
-                '\\' => escaped.push_str("\\\\"),
-                '\n' => escaped.push_str("\\n"),
-                '\r' => escaped.push_str("\\r"),
-                '\t' => escaped.push_str("\\t"),
-                character if character.is_control() => {
-                    use std::fmt::Write as _;
-                    let _ignored = write!(escaped, "\\u{:04x}", character as u32);
-                }
-                character => escaped.push(character),
-            }
-        }
-        escaped
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::{GapSchedule, correct_latency, json_escape, percentile_sorted};
-        use std::time::Duration;
-
-        #[test]
-        fn percentile_uses_nearest_rank() {
-            assert_eq!(percentile_sorted(&[1, 2, 3, 4], 0.50), 2);
-            assert_eq!(percentile_sorted(&[1, 2, 3, 4], 0.99), 4);
-        }
-
-        #[test]
-        fn bursty_schedule_is_reproducible_and_bounded() {
-            let mut left = GapSchedule::new();
-            let mut right = GapSchedule::new();
-            for _ in 0..10_000 {
-                let left_value = left.next();
-                assert_eq!(left_value, right.next());
-                assert!(left_value <= Duration::from_micros(1_000));
-            }
-        }
-
-        #[test]
-        fn json_strings_escape_controls() {
-            assert_eq!(json_escape("a\"b\\c\n"), "a\\\"b\\\\c\\n");
-        }
-
-        #[test]
-        fn positive_tsc_offset_is_subtracted() {
-            assert_eq!(correct_latency(120, 20), Some(100));
-            assert_eq!(correct_latency(10, 20), None);
-        }
-
-        #[test]
-        fn negative_tsc_offset_is_added() {
-            assert_eq!(correct_latency(80, -20), Some(100));
         }
     }
 }

@@ -9,7 +9,7 @@ case "$BUILD_TIMEOUT_SECONDS" in
         exit 2
         ;;
 esac
-for required in cargo python3 timeout; do
+for required in cargo git python3 rustc timeout; do
     command -v "$required" >/dev/null 2>&1 || {
         echo "required command is unavailable: $required" >&2
         exit 2
@@ -17,12 +17,33 @@ for required in cargo python3 timeout; do
 done
 
 repository=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+benchmark_commit=$(git -C "$repository" rev-parse --verify HEAD) || {
+    echo "cannot determine the benchmark source commit" >&2
+    exit 2
+}
+[ -n "$benchmark_commit" ] || {
+    echo "the benchmark source commit is empty" >&2
+    exit 2
+}
+if [ -n "$(git -C "$repository" status --porcelain --untracked-files=no)" ]; then
+    benchmark_tracked_dirty=true
+else
+    benchmark_tracked_dirty=false
+fi
+export SNOOZER_BENCHMARK_COMMIT=$benchmark_commit
+export SNOOZER_BENCHMARK_REPOSITORY=$repository
+export SNOOZER_BENCHMARK_TRACKED_DIRTY=$benchmark_tracked_dirty
+SNOOZER_BENCHMARK_RUSTC=$(rustc --version) || {
+    echo "cannot determine the benchmark compiler version" >&2
+    exit 2
+}
+export SNOOZER_BENCHMARK_RUSTC
 build_log=$(mktemp "${TMPDIR:-/tmp}/snoozer-benchmark-build.XXXXXX")
 trap 'rm -f "$build_log"' EXIT HUP INT TERM
 
 if ! timeout --foreground --signal=TERM --kill-after=5s "$BUILD_TIMEOUT_SECONDS" \
     cargo bench --manifest-path "$repository/Cargo.toml" --bench wake_latency \
-    --features benchmark-only --no-run --message-format=json >"$build_log"; then
+    --features benchmark-only --no-run --locked --message-format=json >"$build_log"; then
     echo "optimized benchmark build failed or timed out" >&2
     exit 1
 fi

@@ -1,3 +1,8 @@
+#![allow(
+    unsafe_code,
+    reason = "Linux affinity and RDTSCP intrinsics are isolated in this benchmark-only platform boundary"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
@@ -6,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use crate::pure::parse_cpu_list;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 
@@ -253,23 +260,6 @@ fn cpu_is_online(root: &Path, cpu: usize) -> Result<bool, io::Error> {
         return Ok(true);
     }
     Ok(read_trimmed(online)? == "1")
-}
-
-fn parse_cpu_list(raw: &str) -> Result<BTreeSet<usize>, AnyError> {
-    let mut result = BTreeSet::new();
-    for component in raw.split(',') {
-        if let Some((start, end)) = component.split_once('-') {
-            let start = start.parse::<usize>()?;
-            let end = end.parse::<usize>()?;
-            if start > end {
-                return Err(format!("invalid CPU range {component:?}").into());
-            }
-            result.extend(start..=end);
-        } else {
-            result.insert(component.parse()?);
-        }
-    }
-    Ok(result)
 }
 
 fn read_trimmed(path: impl AsRef<Path>) -> Result<String, io::Error> {
@@ -556,23 +546,4 @@ pub(crate) struct CpuMetadata {
     pub(crate) governor: String,
     pub(crate) energy_preference: String,
     pub(crate) kernel: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_cpu_list;
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn parses_linux_cpu_lists() {
-        assert_eq!(
-            parse_cpu_list("0-2,7,9-10").expect("valid fixture"),
-            BTreeSet::from([0, 1, 2, 7, 9, 10])
-        );
-    }
-
-    #[test]
-    fn rejects_descending_cpu_range() {
-        assert!(parse_cpu_list("4-2").is_err());
-    }
 }
