@@ -3,15 +3,16 @@ test_workspace = true
 all_features = true
 additional_cargo_test_args = ["--profile", "mutants"]
 
-# Only live CPUID/TSC sampling, inline assembly, and the thin native hardware
-# dispatch are host-dependent. The cfg-inactive unsupported-target stubs are
-# equivalent on this host and are cross-compiled in CI instead. Register
-# decoding, calibration arithmetic, and the production arm/recheck/classify
-# protocol remain mutation-tested.
+# Only live CPUID/RDTSCP and wall-clock sample acquisition, inline assembly,
+# and the thin native hardware dispatch are host-dependent. The cfg-inactive
+# unsupported-target stubs are equivalent on this host and are cross-compiled
+# in CI instead. Leaf interpretation, sample collection, TSC reconstruction,
+# calibration arithmetic, and the production arm/recheck/classify protocol
+# remain mutation-tested.
 exclude_re = [
   "src/arch/mod.rs:.*detect_capabilities",
   "src/arch/x86_64/amd.rs:.*detect_capabilities",
-  "src/arch/x86_64/amd.rs:.*sample_tsc_frequencies",
+  "src/arch/x86_64/amd.rs:.*sample_tsc_frequency_once",
   "src/arch/x86_64/amd.rs:.*read_tsc_ordered",
   "src/arch/x86_64/amd.rs:.*monitorx",
   "src/arch/x86_64/amd.rs:.*mwaitx",

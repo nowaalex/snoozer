@@ -36,10 +36,9 @@ struct CapabilityRegisters {
 pub(crate) fn detect_capabilities() -> Capabilities {
     let vendor = __cpuid(0);
     let extended_max = __cpuid(EXTENDED_CPUID_BASE).eax;
-    let extended_features =
-        (extended_max >= EXTENDED_FEATURES_LEAF).then(|| __cpuid_count(EXTENDED_FEATURES_LEAF, 0));
-    let invariant_features =
-        (extended_max >= INVARIANT_TSC_LEAF).then(|| __cpuid_count(INVARIANT_TSC_LEAF, 0));
+    let (has_extended_features, has_invariant_features) = extended_leaf_availability(extended_max);
+    let extended_features = has_extended_features.then(|| __cpuid_count(EXTENDED_FEATURES_LEAF, 0));
+    let invariant_features = has_invariant_features.then(|| __cpuid_count(INVARIANT_TSC_LEAF, 0));
     let registers = CapabilityRegisters {
         vendor_ebx: vendor.ebx,
         vendor_edx: vendor.edx,
@@ -50,11 +49,18 @@ pub(crate) fn detect_capabilities() -> Capabilities {
     };
     let decoded = decode_capabilities(registers, None);
     let timer_hz = if timer_calibration_is_usable(&decoded) {
-        sample_tsc_frequencies().and_then(conservative_timer_hz)
+        collect_tsc_frequencies(sample_tsc_frequency_once).and_then(conservative_timer_hz)
     } else {
         None
     };
     decode_capabilities(registers, timer_hz)
+}
+
+fn extended_leaf_availability(extended_max: u32) -> (bool, bool) {
+    (
+        extended_max >= EXTENDED_FEATURES_LEAF,
+        extended_max >= INVARIANT_TSC_LEAF,
+    )
 }
 
 fn decode_capabilities(
@@ -93,33 +99,51 @@ fn timer_calibration_is_usable(capabilities: &Capabilities) -> bool {
         && capabilities.rdtscp
 }
 
-fn sample_tsc_frequencies() -> Option<[u64; TIMER_CALIBRATION_SAMPLES]> {
+fn collect_tsc_frequencies<F>(mut sample_once: F) -> Option<[u64; TIMER_CALIBRATION_SAMPLES]>
+where
+    F: FnMut() -> Option<u64>,
+{
     let mut samples = [0_u64; TIMER_CALIBRATION_SAMPLES];
     let mut collected = 0;
     for _ in 0..TIMER_CALIBRATION_ATTEMPTS {
-        let started = Instant::now();
-        let (first, first_aux) = read_tsc_ordered();
-        while started.elapsed() < TIMER_CALIBRATION_INTERVAL {
-            std::hint::spin_loop();
-        }
-        let (last, last_aux) = read_tsc_ordered();
-        let elapsed = started.elapsed();
-        if first_aux != last_aux {
-            continue;
-        }
-
-        let ticks = last.saturating_sub(first);
-        samples[collected] = frequency_hz(ticks, elapsed.as_nanos());
-        collected += 1;
-        if collected == TIMER_CALIBRATION_SAMPLES {
-            break;
+        if let Some(sample) = sample_once() {
+            samples[collected] = sample;
+            collected += 1;
+            if collected == TIMER_CALIBRATION_SAMPLES {
+                return Some(samples);
+            }
         }
     }
+    None
+}
 
-    if collected != TIMER_CALIBRATION_SAMPLES {
+fn sample_tsc_frequency_once() -> Option<u64> {
+    let started = Instant::now();
+    let (first, first_aux) = read_tsc_ordered();
+    while started.elapsed() < TIMER_CALIBRATION_INTERVAL {
+        std::hint::spin_loop();
+    }
+    let (last, last_aux) = read_tsc_ordered();
+    tsc_frequency_from_observation(
+        first,
+        first_aux,
+        last,
+        last_aux,
+        started.elapsed().as_nanos(),
+    )
+}
+
+fn tsc_frequency_from_observation(
+    first: u64,
+    first_aux: u32,
+    last: u64,
+    last_aux: u32,
+    elapsed_nanos: u128,
+) -> Option<u64> {
+    if first_aux != last_aux || last <= first || elapsed_nanos == 0 {
         return None;
     }
-    Some(samples)
+    Some(frequency_hz(last - first, elapsed_nanos))
 }
 
 fn frequency_hz(ticks: u64, elapsed_nanos: u128) -> u64 {
@@ -158,7 +182,11 @@ fn read_tsc_ordered() -> (u64, u32) {
             options(nomem, nostack)
         );
     }
-    ((u64::from(high) << 32) | u64::from(low), auxiliary)
+    (tsc_from_halves(high, low), auxiliary)
+}
+
+fn tsc_from_halves(high: u32, low: u32) -> u64 {
+    (u64::from(high) << 32) + u64::from(low)
 }
 
 #[inline]
@@ -283,6 +311,53 @@ mod tests {
             assert_eq!(missing_one.mwaitx_timer_hz, None);
             assert!(!timer_calibration_is_usable(&missing_one));
         }
+    }
+
+    #[test]
+    fn extended_leaf_boundaries_are_interpreted_exactly() {
+        assert_eq!(
+            extended_leaf_availability(EXTENDED_FEATURES_LEAF - 1),
+            (false, false)
+        );
+        assert_eq!(
+            extended_leaf_availability(EXTENDED_FEATURES_LEAF),
+            (true, false)
+        );
+        assert_eq!(extended_leaf_availability(INVARIANT_TSC_LEAF), (true, true));
+    }
+
+    #[test]
+    fn calibration_collection_and_tsc_observations_are_pure_and_exact() {
+        let mut observations = [None, Some(10), None, Some(20), Some(30)].into_iter();
+        assert_eq!(
+            collect_tsc_frequencies(|| observations.next().flatten()),
+            Some([10, 20, 30])
+        );
+
+        let mut attempts = 0_usize;
+        assert_eq!(
+            collect_tsc_frequencies(|| {
+                attempts += 1;
+                (attempts <= 2).then_some(attempts as u64)
+            }),
+            None
+        );
+        assert_eq!(attempts, TIMER_CALIBRATION_ATTEMPTS);
+
+        assert_eq!(
+            tsc_frequency_from_observation(100, 7, 124, 7, 10),
+            Some(2_400_000_000)
+        );
+        assert_eq!(tsc_frequency_from_observation(100, 7, 124, 8, 10), None);
+        assert_eq!(tsc_frequency_from_observation(124, 7, 100, 7, 10), None);
+        assert_eq!(tsc_frequency_from_observation(100, 7, 100, 7, 10), None);
+        assert_eq!(tsc_frequency_from_observation(100, 7, 124, 7, 0), None);
+
+        assert_eq!(
+            tsc_from_halves(0x0123_4567, 0x89ab_cdef),
+            0x0123_4567_89ab_cdef
+        );
+        assert_eq!(tsc_from_halves(0, u32::MAX), u64::from(u32::MAX));
     }
 
     #[test]
