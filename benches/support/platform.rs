@@ -514,22 +514,35 @@ pub(crate) fn stamp() -> (u64, u32) {
     unreachable!("the platform preflight rejects non-x86_64 targets")
 }
 
-pub(crate) fn cpu_metadata(cpu: usize, sysfs_root: &Path) -> CpuMetadata {
+pub(crate) fn cpu_metadata(cpu: usize) -> CpuMetadata {
     let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     let section = cpuinfo
         .split("\n\n")
         .find(|section| field(section, "processor").is_some_and(|value| value == cpu.to_string()))
         .unwrap_or_default();
-    let policy = sysfs_root.join(format!("cpu{cpu}/cpufreq"));
     CpuMetadata {
         model: field(section, "model name").unwrap_or_else(|| "unknown".to_owned()),
         microcode: field(section, "microcode").unwrap_or_else(|| "unknown".to_owned()),
-        governor: read_trimmed(policy.join("scaling_governor"))
-            .unwrap_or_else(|_| "unknown".to_owned()),
-        energy_preference: read_trimmed(policy.join("energy_performance_preference"))
-            .unwrap_or_else(|_| "unknown".to_owned()),
         kernel: read_trimmed("/proc/sys/kernel/osrelease").unwrap_or_else(|_| "unknown".to_owned()),
     }
+}
+
+pub(crate) fn cpu_power_policy(cpu: usize, sysfs_root: &Path) -> Result<CpuPowerPolicy, AnyError> {
+    let policy = sysfs_root.join(format!("cpu{cpu}/cpufreq"));
+    let governor_path = policy.join("scaling_governor");
+    let energy_preference_path = policy.join("energy_performance_preference");
+    let governor = read_trimmed(&governor_path)
+        .map_err(|error| format!("cannot read {}: {error}", governor_path.display()))?;
+    let energy_preference = read_trimmed(&energy_preference_path)
+        .map_err(|error| format!("cannot read {}: {error}", energy_preference_path.display()))?;
+    if governor.is_empty() || energy_preference.is_empty() {
+        return Err(format!("CPU {cpu} exposes an empty governor or energy preference").into());
+    }
+    Ok(CpuPowerPolicy {
+        cpu,
+        governor,
+        energy_preference,
+    })
 }
 
 fn field(section: &str, key: &str) -> Option<String> {
@@ -543,7 +556,12 @@ fn field(section: &str, key: &str) -> Option<String> {
 pub(crate) struct CpuMetadata {
     pub(crate) model: String,
     pub(crate) microcode: String,
+    pub(crate) kernel: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CpuPowerPolicy {
+    pub(crate) cpu: usize,
     pub(crate) governor: String,
     pub(crate) energy_preference: String,
-    pub(crate) kernel: String,
 }

@@ -30,7 +30,8 @@ mod linux {
     use snoozer::{AmdMwaitx, BusySpin, SpinThenAmdMwaitx, SpinThenYield, WaitStrategy, pair};
 
     use crate::platform::{
-        CpuIdleState, Topology, TscClock, TscSkew, cpu_metadata, pin_current, stamp,
+        CpuIdleState, CpuPowerPolicy, Topology, TscClock, TscSkew, cpu_metadata, cpu_power_policy,
+        pin_current, stamp,
     };
     use crate::pure::{GapSchedule, correct_latency, json_escape, percentile_sorted};
     use crate::snoozer_api::{
@@ -53,7 +54,7 @@ mod linux {
     const COMPILED_COMMIT: Option<&str> = option_env!("SNOOZER_BENCHMARK_COMMIT");
     const COMPILED_REPOSITORY: Option<&str> = option_env!("SNOOZER_BENCHMARK_REPOSITORY");
     const COMPILED_RUSTC: Option<&str> = option_env!("SNOOZER_BENCHMARK_RUSTC");
-    const COMPILED_TRACKED_DIRTY: Option<&str> = option_env!("SNOOZER_BENCHMARK_TRACKED_DIRTY");
+    const COMPILED_DIRTY: Option<&str> = option_env!("SNOOZER_BENCHMARK_DIRTY");
 
     pub(crate) fn main() -> AnyResult<()> {
         let arguments = Arguments::parse()?;
@@ -92,12 +93,12 @@ mod linux {
         let provenance = repository_provenance();
         if arguments.mode == Mode::Official
             && (provenance.compiled_commit == "unknown"
-                || provenance.compiled_tracked_dirty != Some(false)
+                || provenance.compiled_dirty != Some(false)
                 || COMPILED_RUSTC.is_none()
                 || provenance.checkout_commit != provenance.compiled_commit
-                || provenance.checkout_tracked_dirty != Some(false))
+                || provenance.checkout_dirty != Some(false))
         {
-            return Err("official mode requires a build stamped by scripts/build_benchmark.sh, the same commit still checked out, and no tracked working-tree changes".into());
+            return Err("official mode requires a build stamped by scripts/build_benchmark.sh, the same commit still checked out, and no working-tree changes (including untracked files)".into());
         }
         if arguments.mode == Mode::Official
             && let Err(error) = AmdMwaitx::new()
@@ -107,7 +108,22 @@ mod linux {
             )
             .into());
         }
-        let metadata = cpu_metadata(topology.waiter, &sysfs_root);
+        let metadata = cpu_metadata(topology.waiter);
+        let power_policies = topology
+            .selected()
+            .into_iter()
+            .map(|cpu| match cpu_power_policy(cpu, &sysfs_root) {
+                Ok(policy) => Ok(policy),
+                Err(_) if arguments.mode == Mode::Smoke => Ok(CpuPowerPolicy {
+                    cpu,
+                    governor: "unknown".to_owned(),
+                    energy_preference: "unknown".to_owned(),
+                }),
+                Err(error) => Err(format!(
+                    "official mode requires readable governor and energy preference for CPU {cpu}: {error}"
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut output = JsonlOutput::create(&arguments.output)?;
         output.metadata(MetadataInput {
             arguments: &arguments,
@@ -116,6 +132,7 @@ mod linux {
             clock,
             skew,
             cpu: &metadata,
+            power_policies: &power_policies,
             provenance: &provenance,
             cstate_warning,
         })?;
@@ -430,9 +447,9 @@ mod linux {
     #[derive(Debug)]
     struct RepositoryProvenance {
         compiled_commit: String,
-        compiled_tracked_dirty: Option<bool>,
+        compiled_dirty: Option<bool>,
         checkout_commit: String,
-        checkout_tracked_dirty: Option<bool>,
+        checkout_dirty: Option<bool>,
     }
 
     fn repository_provenance() -> RepositoryProvenance {
@@ -440,7 +457,7 @@ mod linux {
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| "unknown".to_owned());
-        let compiled_tracked_dirty = match COMPILED_TRACKED_DIRTY {
+        let compiled_dirty = match COMPILED_DIRTY {
             Some("true") => Some(true),
             Some("false") => Some(false),
             _ => None,
@@ -448,14 +465,14 @@ mod linux {
         let checkout_commit = git_in_compiled_repository(&["rev-parse", "--verify", "HEAD"])
             .map(|output| String::from_utf8_lossy(&output).trim().to_owned())
             .unwrap_or_else(|| "unknown".to_owned());
-        let checkout_tracked_dirty =
-            git_in_compiled_repository(&["status", "--porcelain", "--untracked-files=no"])
+        let checkout_dirty =
+            git_in_compiled_repository(&["status", "--porcelain", "--untracked-files=all"])
                 .map(|output| !output.is_empty());
         RepositoryProvenance {
             compiled_commit,
-            compiled_tracked_dirty,
+            compiled_dirty,
             checkout_commit,
-            checkout_tracked_dirty,
+            checkout_dirty,
         }
     }
 
@@ -1503,6 +1520,7 @@ mod linux {
         clock: TscClock,
         skew: TscSkew,
         cpu: &'a crate::platform::CpuMetadata,
+        power_policies: &'a [CpuPowerPolicy],
         provenance: &'a RepositoryProvenance,
         cstate_warning: &'a str,
     }
@@ -1549,20 +1567,33 @@ mod linux {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            let power_policy_json = input
+                .power_policies
+                .iter()
+                .map(|policy| {
+                    format!(
+                        "{{\"cpu\":{},\"governor\":\"{}\",\"energy_preference\":\"{}\"}}",
+                        policy.cpu,
+                        json_escape(&policy.governor),
+                        json_escape(&policy.energy_preference)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             let compiled_dirty = input
                 .provenance
-                .compiled_tracked_dirty
+                .compiled_dirty
                 .map_or_else(|| "null".to_owned(), |value| value.to_string());
             let checkout_dirty = input
                 .provenance
-                .checkout_tracked_dirty
+                .checkout_dirty
                 .map_or_else(|| "null".to_owned(), |value| value.to_string());
             let mwaitx_timer_hz = snoozer::capabilities()
                 .mwaitx_timer_hz
                 .map_or_else(|| "null".to_owned(), |value| value.to_string());
             writeln!(
                 self.writer,
-                "{{\"type\":\"metadata\",\"schema\":\"{}\",\"mode\":\"{}\",\"warning\":\"{}\",\"benchmark_commit\":\"{}\",\"compiled_tracked_working_tree_dirty\":{},\"checkout_commit\":\"{}\",\"checkout_tracked_working_tree_dirty\":{},\"rustc\":\"{}\",\"benchmark_features\":{},\"schedule_version\":\"{}\",\"schedule_seed\":\"0x{:016x}\",\"bursty_gap_us_weight_percent\":[[0,30],[1,15],[5,12],[10,10],[25,10],[50,8],[100,7],[250,5],[1000,3]],\"duration_ms\":{},\"repetitions\":{},\"warmup_events\":{},\"max_samples\":{},\"acceptance_limits\":{{\"max_victim_throughput_loss_percent\":{:.6},\"max_victim_p99_degradation_percent\":{:.6}}},\"clocksource\":\"tsc\",\"cycles_per_ns\":{:.9},\"calibration_spread_percent\":{:.6},\"mwaitx_timer_hz\":{},\"tsc_skew\":{{\"producer_offset_cycles\":{},\"waiter_offset_cycles\":{},\"producer_uncertainty_cycles\":{},\"waiter_uncertainty_cycles\":{},\"producer_to_waiter_bound_ns\":{:.6},\"applied_waiter_minus_producer_cycles\":{}}},\"matched_control\":\"victim-only baseline; reported loss conservatively includes producer and waiter activity\",\"cpu_model\":\"{}\",\"microcode\":\"{}\",\"kernel\":\"{}\",\"governor\":\"{}\",\"energy_preference\":\"{}\",\"roles\":{{\"waiter\":{},\"victim\":{},\"producer\":{},\"controller\":{}}},\"topology\":[{}],\"cpuidle\":[{}]}}",
+                "{{\"type\":\"metadata\",\"schema\":\"{}\",\"mode\":\"{}\",\"warning\":\"{}\",\"benchmark_commit\":\"{}\",\"compiled_working_tree_dirty\":{},\"checkout_commit\":\"{}\",\"checkout_working_tree_dirty\":{},\"rustc\":\"{}\",\"benchmark_features\":{},\"schedule_version\":\"{}\",\"schedule_seed\":\"0x{:016x}\",\"bursty_gap_us_weight_percent\":[[0,30],[1,15],[5,12],[10,10],[25,10],[50,8],[100,7],[250,5],[1000,3]],\"duration_ms\":{},\"repetitions\":{},\"warmup_events\":{},\"max_samples\":{},\"acceptance_limits\":{{\"max_victim_throughput_loss_percent\":{:.6},\"max_victim_p99_degradation_percent\":{:.6}}},\"clocksource\":\"tsc\",\"cycles_per_ns\":{:.9},\"calibration_spread_percent\":{:.6},\"mwaitx_timer_hz\":{},\"tsc_skew\":{{\"producer_offset_cycles\":{},\"waiter_offset_cycles\":{},\"producer_uncertainty_cycles\":{},\"waiter_uncertainty_cycles\":{},\"producer_to_waiter_bound_ns\":{:.6},\"applied_waiter_minus_producer_cycles\":{}}},\"matched_control\":\"victim-only baseline; reported loss conservatively includes producer and waiter activity\",\"cpu_model\":\"{}\",\"microcode\":\"{}\",\"kernel\":\"{}\",\"power_policy\":[{}],\"roles\":{{\"waiter\":{},\"victim\":{},\"producer\":{},\"controller\":{}}},\"topology\":[{}],\"cpuidle\":[{}]}}",
                 RESULT_SCHEMA_VERSION,
                 input.arguments.mode.as_str(),
                 json_escape(input.cstate_warning),
@@ -1596,8 +1627,7 @@ mod linux {
                 json_escape(&input.cpu.model),
                 json_escape(&input.cpu.microcode),
                 json_escape(&input.cpu.kernel),
-                json_escape(&input.cpu.governor),
-                json_escape(&input.cpu.energy_preference),
+                power_policy_json,
                 input.topology.waiter,
                 input.topology.victim,
                 input.topology.producer,

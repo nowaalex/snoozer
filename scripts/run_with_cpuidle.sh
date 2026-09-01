@@ -6,9 +6,10 @@
 #   timeout, sysfs root, and optional write helper. Original disable values are
 #   derived from sysfs immediately before the first write. The manifest version,
 #   process ID, UID, and start time are runner-owned provenance.
-# - The stable command identity is the private state directory plus its exclusive
-#   lock. A dirty marker names the only authoritative manifest. A retry never
-#   reapplies while dirty: `--recover` restores exactly the recorded values first.
+# - The stable command identity is the canonical sysfs CPU tree plus its global
+#   lock. A global dirty-owner record names the canonical private state directory
+#   and authoritative manifest. A retry from any state directory never reapplies
+#   while dirty: `--recover` restores exactly the recorded values first.
 # - Recovery may rewrite only recorded `disable` files below the recorded sysfs
 #   root. Unknown manifest versions, changed paths, bad ownership, and malformed
 #   values fail closed without a write.
@@ -16,10 +17,13 @@
 #   failure, timeout, HUP, INT, and TERM restore synchronously. SIGKILL cannot run
 #   cleanup; the next operator uses `--recover`.
 # - The benchmark has one outer timeout (default 900 seconds) and a five-second
-#   TERM-to-KILL child grace period. There are no hidden intermediary timeouts.
+#   TERM-to-KILL grace period. Its owned process group is drained before cpuidle
+#   restoration, so the benchmark and its descendants cannot survive the run.
+#   There are no hidden intermediary timeouts.
 set -eu
 
 MANIFEST_VERSION=SNOOZER_CPUIDLE_V2
+GLOBAL_DIRTY_VERSION=SNOOZER_GLOBAL_DIRTY_V1
 DEFAULT_TIMEOUT_SECONDS=900
 KILL_GRACE_SECONDS=5
 
@@ -161,7 +165,12 @@ validate_private_file() {
 
 umask 077
 if [ "$sysfs_root" = /sys/devices/system/cpu ]; then
+    command -v sudo >/dev/null 2>&1 \
+        || die "sudo is required for the global real-sysfs recovery record"
     global_lock_file=/run/lock/snoozer-cpuidle.lock
+    global_dirty_marker=/run/lock/snoozer-cpuidle.dirty
+    global_marker_directory=/run/lock
+    global_marker_privileged=1
     if [ ! -e "$global_lock_file" ]; then
         sudo touch "$global_lock_file" || die "cannot create global cpuidle lock"
         sudo chown 0:0 "$global_lock_file" || die "cannot secure global cpuidle lock ownership"
@@ -176,11 +185,97 @@ else
     # Fake/custom sysfs roots use a root-local lock so tests and simulations do
     # not contend with the host, while distinct state directories still share it.
     global_lock_file=$sysfs_root/.snoozer-cpuidle.lock
+    global_dirty_marker=$sysfs_root/.snoozer-cpuidle.dirty
+    global_marker_directory=$sysfs_root
+    global_marker_privileged=0
     reject_symlink "$global_lock_file" "custom-root cpuidle lock"
 fi
 exec 8>>"$global_lock_file"
 reject_symlink "$global_lock_file" "global cpuidle lock"
 flock -n 8 || die "another cpuidle runner is mutating this sysfs CPU tree"
+
+boot_id=$(tr -d '[:space:]' </proc/sys/kernel/random/boot_id) \
+    || die "cannot read the Linux boot identity"
+case "$boot_id" in
+    ''|*[!0-9a-fA-F-]*) die "Linux boot identity is malformed" ;;
+esac
+
+validate_global_dirty_file() {
+    reject_symlink "$global_dirty_marker" "global dirty-owner record"
+    [ -f "$global_dirty_marker" ] \
+        || die "global dirty-owner record is not a regular file"
+    marker_owner=$(stat -c '%u' "$global_dirty_marker") \
+        || die "cannot inspect global dirty-owner record ownership"
+    marker_mode=$(stat -c '%a' "$global_dirty_marker") \
+        || die "cannot inspect global dirty-owner record mode"
+    if [ "$global_marker_privileged" -eq 1 ]; then
+        [ "$marker_owner" = 0 ] && [ "$marker_mode" = 600 ] \
+            || die "global dirty-owner record must be root-owned with mode 600"
+    else
+        [ "$marker_owner" = "$current_uid" ] && [ "$marker_mode" = 600 ] \
+            || die "global dirty-owner record must be owned by uid $current_uid with mode 600"
+    fi
+}
+
+read_global_dirty_record() {
+    validate_global_dirty_file
+    if [ "$global_marker_privileged" -eq 1 ]; then
+        sudo cat "$global_dirty_marker"
+    else
+        cat "$global_dirty_marker"
+    fi
+}
+
+validate_global_dirty_record() {
+    global_record=$1
+    if ! printf '%s\n' "$global_record" | awk '
+        NR == 1 && $0 !~ /^version=/ { exit 1 }
+        NR == 2 && $0 !~ /^sysfs_root=/ { exit 1 }
+        NR == 3 && $0 !~ /^state_root=/ { exit 1 }
+        NR == 4 && $0 !~ /^manifest=/ { exit 1 }
+        NR == 5 && $0 !~ /^uid=/ { exit 1 }
+        NR == 6 && $0 !~ /^boot_id=/ { exit 1 }
+        END { if (NR != 6) exit 1 }
+    '; then
+        die "global dirty-owner record is malformed"
+    fi
+    recorded_global_version=$(printf '%s\n' "$global_record" | sed -n '1s/^version=//p')
+    recorded_global_sysfs=$(printf '%s\n' "$global_record" | sed -n '2s/^sysfs_root=//p')
+    recorded_global_state=$(printf '%s\n' "$global_record" | sed -n '3s/^state_root=//p')
+    recorded_global_manifest=$(printf '%s\n' "$global_record" | sed -n '4s/^manifest=//p')
+    recorded_global_uid=$(printf '%s\n' "$global_record" | sed -n '5s/^uid=//p')
+    recorded_global_boot=$(printf '%s\n' "$global_record" | sed -n '6s/^boot_id=//p')
+    [ "$recorded_global_version" = "$GLOBAL_DIRTY_VERSION" ] \
+        || die "unsupported global dirty-owner version: ${recorded_global_version:-missing}"
+    [ "$recorded_global_sysfs" = "$sysfs_root" ] \
+        || die "global dirty-owner sysfs root differs from the selected root"
+    [ "$recorded_global_uid" = "$current_uid" ] \
+        || die "global dirty run must be recovered as uid $recorded_global_uid"
+    [ "$recorded_global_boot" = "$boot_id" ] \
+        || die "global dirty-owner record belongs to a different Linux boot"
+    case "$recorded_global_state$recorded_global_manifest" in
+        ''|*'|'*|*"$newline"*) die "global dirty-owner paths are malformed" ;;
+    esac
+    [ "${recorded_global_state#/}" != "$recorded_global_state" ] \
+        || die "global dirty-owner state directory is not absolute"
+    [ "${recorded_global_manifest#/}" != "$recorded_global_manifest" ] \
+        || die "global dirty-owner manifest is not absolute"
+}
+
+global_record=
+global_marker_candidate=
+if [ -e "$global_dirty_marker" ]; then
+    global_record=$(read_global_dirty_record) \
+        || die "cannot read global dirty-owner record"
+    validate_global_dirty_record "$global_record"
+    if [ "$recover" -eq 0 ]; then
+        echo "cpuidle runner: unfinished global run detected; no write was attempted" >&2
+        echo "cpuidle runner: recover as uid $recorded_global_uid with SNOOZER_SYSFS_ROOT='$sysfs_root' $0 --recover" >&2
+        echo "cpuidle runner: authoritative manifest: $recorded_global_manifest" >&2
+        exit 2
+    fi
+    state_root=$recorded_global_state
+fi
 
 reject_symlink "$state_root" "state directory"
 if [ -e "$state_root" ]; then
@@ -192,6 +287,12 @@ reject_symlink "$state_root" "state directory"
 [ "$(stat -c '%u' "$state_root")" = "$current_uid" ] \
     && [ "$(stat -c '%a' "$state_root")" = 700 ] \
     || die "state directory must be owned by uid $current_uid with mode 700: $state_root"
+state_root=$(realpath "$state_root") || die "cannot canonicalize state directory"
+[ "$state_root" != / ] || die "state directory must not be root"
+if [ -n "$global_record" ]; then
+    [ "$state_root" = "$recorded_global_state" ] \
+        || die "global dirty-owner state directory is not canonical"
+fi
 
 lock_file=$state_root/runner.lock
 dirty_marker=$state_root/dirty
@@ -244,15 +345,28 @@ validate_manifest_entry() {
     [ "$current_name" = "$entry_name" ]
 }
 
+validate_manifest_location() {
+    inspected_manifest=$1
+    manifest_directory=${inspected_manifest%/*}
+    manifest_name=${inspected_manifest##*/}
+    [ "$manifest_directory" = "$state_root" ] \
+        || die "recovery manifest is not a direct child of the private state directory"
+    case "$manifest_name" in
+        manifest.*) ;;
+        *) die "recovery manifest has an invalid name" ;;
+    esac
+    manifest_suffix=${manifest_name#manifest.}
+    case "$manifest_suffix" in
+        ''|*[!0-9A-Za-z]*) die "recovery manifest has an invalid name" ;;
+    esac
+}
+
 manifest_from_marker() {
     reject_symlink "$dirty_marker" "dirty marker"
     validate_private_file "$dirty_marker" "dirty marker"
     manifest=$(tr -d '\r\n' <"$dirty_marker") || die "cannot read dirty marker"
     [ -n "$manifest" ] || die "dirty marker is empty"
-    case "$manifest" in
-        "$state_root"/manifest.*) ;;
-        *) die "dirty marker points outside the private state directory" ;;
-    esac
+    validate_manifest_location "$manifest"
     validate_private_file "$manifest" "recovery manifest"
     printf '%s\n' "$manifest"
 }
@@ -344,20 +458,109 @@ restore_manifest() {
     [ "$restore_failed" -eq 0 ]
 }
 
+remove_global_marker_candidate() {
+    [ -n "$global_marker_candidate" ] || return 0
+    if [ "$global_marker_privileged" -eq 1 ]; then
+        sudo rm -f "$global_marker_candidate" || return 1
+    else
+        rm -f "$global_marker_candidate" || return 1
+    fi
+    global_marker_candidate=
+}
+
+publish_global_dirty_record() {
+    published_manifest=$1
+    validate_manifest_location "$published_manifest"
+    [ ! -e "$global_dirty_marker" ] \
+        || die "global dirty-owner record appeared while the lock was held"
+    published_record="version=$GLOBAL_DIRTY_VERSION
+sysfs_root=$sysfs_root
+state_root=$state_root
+manifest=$published_manifest
+uid=$current_uid
+boot_id=$boot_id"
+    if [ "$global_marker_privileged" -eq 1 ]; then
+        global_marker_candidate=$(sudo mktemp \
+            "$global_marker_directory/snoozer-cpuidle.dirty.XXXXXX") || return 1
+        printf '%s\n' "$published_record" | sudo tee "$global_marker_candidate" >/dev/null \
+            || return 1
+        sudo chown 0:0 "$global_marker_candidate" || return 1
+        sudo chmod 0600 "$global_marker_candidate" || return 1
+        sudo sync -f "$global_marker_candidate" || return 1
+        sudo ln "$global_marker_candidate" "$global_dirty_marker" || return 1
+    else
+        global_marker_candidate=$(mktemp \
+            "$global_marker_directory/.snoozer-cpuidle.dirty.XXXXXX") || return 1
+        printf '%s\n' "$published_record" >"$global_marker_candidate" || return 1
+        sync -f "$global_marker_candidate" || return 1
+        ln "$global_marker_candidate" "$global_dirty_marker" || return 1
+    fi
+    remove_global_marker_candidate || return 1
+    if [ "$global_marker_privileged" -eq 1 ]; then
+        sudo sync -f "$global_marker_directory" || return 1
+    else
+        sync -f "$global_marker_directory" || return 1
+    fi
+    global_record=$(read_global_dirty_record) || return 1
+    [ "$global_record" = "$published_record" ] || return 1
+    validate_global_dirty_record "$global_record"
+}
+
+clear_global_dirty_record() {
+    [ -e "$global_dirty_marker" ] || die "global dirty-owner record disappeared"
+    current_global_record=$(read_global_dirty_record) \
+        || die "cannot read global dirty-owner record before removal"
+    [ "$current_global_record" = "$global_record" ] \
+        || die "global dirty-owner record changed; refusing removal"
+    if [ "$global_marker_privileged" -eq 1 ]; then
+        sudo rm "$global_dirty_marker" \
+            || die "restored state but could not remove global dirty-owner record"
+        sudo sync -f "$global_marker_directory" \
+            || die "restored state but could not persist global marker removal"
+    else
+        rm "$global_dirty_marker" \
+            || die "restored state but could not remove global dirty-owner record"
+        sync -f "$global_marker_directory" \
+            || die "restored state but could not persist global marker removal"
+    fi
+    global_record=
+}
+
 finish_recovery() {
     recovered_manifest=$1
-    current_manifest=$(manifest_from_marker)
-    [ "$current_manifest" = "$recovered_manifest" ] || die "dirty marker changed during recovery"
-    rm -f "$dirty_marker" || die "restored state but could not remove dirty marker"
-    sync -f "$state_root" || die "restored state but could not persist marker removal"
+    if [ -e "$dirty_marker" ]; then
+        current_manifest=$(manifest_from_marker)
+        [ "$current_manifest" = "$recovered_manifest" ] \
+            || die "dirty marker changed during recovery"
+        rm -f "$dirty_marker" || die "restored state but could not remove dirty marker"
+        sync -f "$state_root" || die "restored state but could not persist marker removal"
+    elif [ -z "$global_record" ]; then
+        die "local dirty marker disappeared"
+    fi
+    if [ -n "$global_record" ]; then
+        [ "$recorded_global_manifest" = "$recovered_manifest" ] \
+            || die "global dirty-owner manifest changed during recovery"
+        clear_global_dirty_record
+    fi
     rm -f "$recovered_manifest" || die "restored state but could not remove manifest"
 }
 
 reject_symlink "$dirty_marker" "dirty marker"
 if [ "$recover" -eq 1 ]; then
     [ -z "$binary$waiter_cpu$victim_cpu$producer_cpu$controller_cpu" ] && [ "$#" -eq 0 ] || usage
-    [ -e "$dirty_marker" ] || die "there is no dirty cpuidle run to recover"
-    recovery_manifest=$(manifest_from_marker)
+    if [ -n "$global_record" ]; then
+        recovery_manifest=$recorded_global_manifest
+        validate_manifest_location "$recovery_manifest"
+        validate_private_file "$recovery_manifest" "recovery manifest"
+        if [ -e "$dirty_marker" ]; then
+            local_manifest=$(manifest_from_marker)
+            [ "$local_manifest" = "$recovery_manifest" ] \
+                || die "local and global dirty-owner records disagree"
+        fi
+    else
+        [ -e "$dirty_marker" ] || die "there is no dirty cpuidle run to recover"
+        recovery_manifest=$(manifest_from_marker)
+    fi
     validate_manifest "$recovery_manifest"
     if ! restore_manifest "$recovery_manifest"; then
         echo "cpuidle runner: RECOVERY FAILED; marker and manifest are retained" >&2
@@ -398,15 +601,35 @@ manifest=$(mktemp "$state_root/manifest.XXXXXX")
 cleanup_manifest=1
 restored=0
 child_pid=
+supervisor_status_file=
 signal_status=
 
 cleanup() {
     original_status=$?
     trap - EXIT HUP INT TERM
-    if [ -e "$dirty_marker" ]; then
-        current_manifest=$(manifest_from_marker)
-        if [ "$current_manifest" != "$manifest" ]; then
-            echo "cpuidle runner: dirty marker changed; refusing automatic restore" >&2
+    if [ -n "$child_pid" ]; then
+        terminate_child "$child_pid"
+        child_pid=
+    fi
+    if [ -n "$supervisor_status_file" ]; then
+        rm -f "$supervisor_status_file"
+        supervisor_status_file=
+    fi
+    if [ -n "$global_marker_candidate" ]; then
+        remove_global_marker_candidate \
+            || echo "cpuidle runner: could not remove abandoned global marker candidate" >&2
+    fi
+    if [ -e "$dirty_marker" ] || [ -n "$global_record" ]; then
+        if [ -e "$dirty_marker" ]; then
+            current_manifest=$(manifest_from_marker)
+            if [ "$current_manifest" != "$manifest" ]; then
+                echo "cpuidle runner: dirty marker changed; refusing automatic restore" >&2
+                exit 1
+            fi
+        fi
+        if [ -n "$global_record" ] \
+            && [ "$recorded_global_manifest" != "$manifest" ]; then
+            echo "cpuidle runner: global dirty-owner record changed; refusing automatic restore" >&2
             exit 1
         fi
         if ! restore_manifest "$manifest"; then
@@ -435,9 +658,16 @@ handle_signal() {
     exit "$signal_status"
 }
 
-child_tree_alive() {
-    inspected_pid=$1
-    kill -0 "$inspected_pid" 2>/dev/null || kill -0 -- "-$inspected_pid" 2>/dev/null
+process_group_has_live_descendants() {
+    inspected_group=$1
+    # The live supervisor owns the PGID until the runner releases it. Exclude
+    # only that known leader; every non-zombie descendant must leave first.
+    # Inspection failure is treated as live and therefore takes the KILL path.
+    group_processes=$(ps -eo pid=,pgid=,stat= 2>/dev/null) || return 0
+    printf '%s\n' "$group_processes" | awk -v expected_group="$inspected_group" '
+        $2 == expected_group && $1 != expected_group && $3 !~ /^Z/ { found = 1 }
+        END { exit !found }
+    '
 }
 
 signal_child_tree() {
@@ -452,12 +682,14 @@ terminate_child() {
     inspected_pid=$1
     signal_child_tree TERM "$inspected_pid"
     termination_deadline=$(($(date +%s) + KILL_GRACE_SECONDS))
-    while child_tree_alive "$inspected_pid" \
+    while process_group_has_live_descendants "$inspected_pid" \
         && [ "$(date +%s)" -lt "$termination_deadline" ]; do
         sleep 0.05
     done
-    if child_tree_alive "$inspected_pid"; then
+    if process_group_has_live_descendants "$inspected_pid"; then
         signal_child_tree KILL "$inspected_pid"
+    else
+        kill -CONT "$inspected_pid" 2>/dev/null || true
     fi
     wait "$inspected_pid" 2>/dev/null || true
 }
@@ -533,6 +765,10 @@ sync -f "$marker_candidate" || die "cannot persist dirty marker candidate"
 ln "$marker_candidate" "$dirty_marker" || die "cannot atomically publish dirty marker"
 rm -f "$marker_candidate"
 sync -f "$state_root" || die "cannot persist dirty marker"
+if ! publish_global_dirty_record "$manifest"; then
+    echo "cpuidle runner: failed to publish the global dirty-owner record" >&2
+    exit 1
+fi
 echo "cpuidle runner: recovery manifest $manifest"
 
 while IFS='|' read -r kind path original desired name cpu state; do
@@ -545,15 +781,38 @@ while IFS='|' read -r kind path original desired name cpu state; do
     fi
 done <"$manifest"
 
-if [ "${SNOOZER_TEST_SIGNAL_AFTER_APPLY:-}" = TERM ]; then
-    kill -TERM "$$"
-fi
+case "${SNOOZER_TEST_SIGNAL_AFTER_APPLY:-}" in
+    '') ;;
+    TERM) kill -TERM "$$" ;;
+    KILL) kill -KILL "$$" ;;
+    *) die "unsupported test signal after apply" ;;
+esac
 
 echo "C2/C3 and every deeper CPU idle state are disabled because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration."
 
 set +e
-setsid timeout --foreground --signal=TERM --kill-after="${KILL_GRACE_SECONDS}s" "$timeout_seconds" \
-    "$binary" \
+# The supervisor remains the process-group leader after timeout exits and until
+# the runner drains the group. Keeping that PID owned prevents a recycled PID
+# or process-group ID from becoming a signal target between status collection
+# and cleanup.
+supervisor_status_file=$(mktemp "$state_root/supervisor-status.XXXXXX")
+setsid sh -c '
+    status_file=$1
+    kill_grace=$2
+    duration=$3
+    shift 3
+    trap "" TERM
+    trap "exit 0" CONT
+    (
+        trap - TERM
+        exec timeout --foreground --signal=TERM --kill-after="${kill_grace}s" "$duration" "$@"
+    )
+    command_status=$?
+    printf "%s\n" "$command_status" >"$status_file" || exit 125
+    kill -STOP "$$"
+    exit 125
+' snoozer-benchmark-supervisor "$supervisor_status_file" "$KILL_GRACE_SECONDS" \
+    "$timeout_seconds" "$binary" \
     --waiter-cpu "$waiter_cpu" \
     --victim-cpu "$victim_cpu" \
     --producer-cpu "$producer_cpu" \
@@ -561,8 +820,33 @@ setsid timeout --foreground --signal=TERM --kill-after="${KILL_GRACE_SECONDS}s" 
     "$@" &
 child_pid=$!
 verify_child_process_group "$child_pid"
-wait "$child_pid"
-command_status=$?
+while [ ! -s "$supervisor_status_file" ]; do
+    if ! kill -0 "$child_pid" 2>/dev/null; then
+        terminate_child "$child_pid"
+        child_pid=
+        die "benchmark supervisor exited without reporting benchmark status"
+    fi
+    sleep 0.01
+done
+command_status=$(tr -d '[:space:]' <"$supervisor_status_file")
+case "$command_status" in
+    ''|*[!0-9]*)
+        terminate_child "$child_pid"
+        child_pid=
+        die "benchmark supervisor reported an invalid status"
+        ;;
+esac
+if [ "$command_status" -gt 255 ]; then
+    terminate_child "$child_pid"
+    child_pid=
+    die "benchmark supervisor reported an invalid status"
+fi
+# GNU timeout --foreground signals only the direct benchmark process. Drain the
+# still-owned process group before restoring cpuidle so no benchmark descendant
+# can outlive the measured run, including on the timeout path.
+terminate_child "$child_pid"
 child_pid=
+rm -f "$supervisor_status_file"
+supervisor_status_file=
 set -e
 exit "$command_status"

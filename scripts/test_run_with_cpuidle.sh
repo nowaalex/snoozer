@@ -9,6 +9,9 @@ write_helper=$test_root/write-helper
 benchmark=$test_root/benchmark
 runner=$(CDPATH= cd -- "$(dirname "$0")" && pwd)/run_with_cpuidle.sh
 write_log=$test_root/writes
+MAX_NORMAL_RUN_SECONDS=3
+MIN_KILL_PATH_SECONDS=4
+MAX_KILL_PATH_SECONDS=8
 
 for cpu in 0 1 2 3; do
     for specification in 0:POLL:1 1:C1:1 2:C1E:0 3:C2:0 4:C3:0; do
@@ -56,15 +59,16 @@ if [ -n "${SNOOZER_TEST_READY:-}" ]; then
         printf '%s\n' "$$" >"$SNOOZER_TEST_BENCHMARK_PID"
     fi
     : >"$SNOOZER_TEST_READY"
+    if [ -n "${SNOOZER_TEST_DESCENDANT_PID:-}" ]; then
+        sh -c '
+            if [ "$2" = 1 ]; then trap "" TERM; fi
+            printf "%s\n" "$$" >"$1"
+            while :; do sleep 1; done
+        ' sh "$SNOOZER_TEST_DESCENDANT_PID" \
+            "${SNOOZER_TEST_DESCENDANT_IGNORE_TERM:-0}" &
+    fi
     if [ "${SNOOZER_TEST_IGNORE_TERM:-}" = 1 ]; then
         trap '' TERM
-        if [ -n "${SNOOZER_TEST_DESCENDANT_PID:-}" ]; then
-            sh -c '
-                trap "" TERM
-                printf "%s\n" "$$" >"$1"
-                while :; do sleep 1; done
-            ' sh "$SNOOZER_TEST_DESCENDANT_PID" &
-        fi
     fi
     while [ ! -e "$SNOOZER_TEST_RELEASE" ]; do sleep 0.01; done
 fi
@@ -97,14 +101,21 @@ assert_original() {
 
 assert_clean() {
     [ ! -e "$state_root/dirty" ]
-    for manifest in "$state_root"/manifest.*; do
-        [ ! -e "$manifest" ] || return 1
+    [ ! -e "$sysfs_root/.snoozer-cpuidle.dirty" ]
+    for candidate_manifest in "$state_root"/manifest.*; do
+        [ ! -e "$candidate_manifest" ] || return 1
+    done
+    for supervisor_status in "$state_root"/supervisor-status.*; do
+        [ ! -e "$supervisor_status" ] || return 1
     done
 }
 
 # First apply enables exact POLL/C1, disables every other state, then restores.
 : >"$write_log"
+normal_start_epoch=$(date +%s)
 run_benchmark >/dev/null
+normal_elapsed_seconds=$(($(date +%s) - normal_start_epoch))
+[ "$normal_elapsed_seconds" -le "$MAX_NORMAL_RUN_SECONDS" ]
 assert_original
 assert_clean
 grep -q '|.*/state0/disable$' "$write_log"
@@ -130,11 +141,13 @@ ready=$test_root/signal-ready
 never_release=$test_root/signal-never-release
 benchmark_pid_file=$test_root/signal-benchmark-pid
 descendant_pid_file=$test_root/signal-descendant-pid
+signal_start_epoch=$(date +%s)
 env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$state_root" \
     SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
     SNOOZER_TEST_READY="$ready" SNOOZER_TEST_RELEASE="$never_release" \
     SNOOZER_TEST_IGNORE_TERM=1 SNOOZER_TEST_BENCHMARK_PID="$benchmark_pid_file" \
     SNOOZER_TEST_DESCENDANT_PID="$descendant_pid_file" \
+    SNOOZER_TEST_DESCENDANT_IGNORE_TERM=1 \
     "$runner" --binary "$benchmark" \
     --waiter-cpu 0 --victim-cpu 1 --producer-cpu 2 --controller-cpu 3 \
     --timeout-seconds 5 >"$test_root/signal.out" 2>&1 &
@@ -167,7 +180,10 @@ set +e
 wait "$signal_runner_pid"
 signal_status=$?
 set -e
+signal_elapsed_seconds=$(($(date +%s) - signal_start_epoch))
 [ "$signal_status" -eq 143 ]
+[ "$signal_elapsed_seconds" -ge "$MIN_KILL_PATH_SECONDS" ]
+[ "$signal_elapsed_seconds" -le "$MAX_KILL_PATH_SECONDS" ]
 ! kill -0 "$benchmark_pid" 2>/dev/null
 ! kill -0 "$descendant_pid" 2>/dev/null
 assert_original
@@ -219,13 +235,53 @@ done
 # The outer timeout terminates the workload and still restores exact state.
 ready=$test_root/timeout-ready
 never_release=$test_root/timeout-never-release
+timeout_benchmark_pid_file=$test_root/timeout-benchmark-pid
+timeout_descendant_pid_file=$test_root/timeout-descendant-pid
 set +e
-SNOOZER_TEST_READY=$ready SNOOZER_TEST_RELEASE=$never_release runner_env "$runner" \
+SNOOZER_TEST_READY=$ready SNOOZER_TEST_RELEASE=$never_release \
+    SNOOZER_TEST_BENCHMARK_PID=$timeout_benchmark_pid_file \
+    SNOOZER_TEST_DESCENDANT_PID=$timeout_descendant_pid_file runner_env "$runner" \
     --binary "$benchmark" --waiter-cpu 0 --victim-cpu 1 --producer-cpu 2 \
     --controller-cpu 3 --timeout-seconds 1 >/dev/null 2>&1
 timeout_status=$?
 set -e
 [ "$timeout_status" -eq 124 ]
+[ -e "$timeout_benchmark_pid_file" ]
+[ -e "$timeout_descendant_pid_file" ]
+timeout_benchmark_pid=$(tr -d '[:space:]' <"$timeout_benchmark_pid_file")
+timeout_descendant_pid=$(tr -d '[:space:]' <"$timeout_descendant_pid_file")
+! kill -0 "$timeout_benchmark_pid" 2>/dev/null
+! kill -0 "$timeout_descendant_pid" 2>/dev/null
+assert_original
+assert_clean
+
+# SIGKILL leaves a global dirty-owner record. A retry using a different private
+# state directory fails before writing, and --recover follows the global owner.
+: >"$write_log"
+set +e
+SNOOZER_TEST_SIGNAL_AFTER_APPLY=KILL run_benchmark >"$test_root/kill.out" 2>&1
+kill_status=$?
+set -e
+[ "$kill_status" -eq 137 ]
+[ -f "$state_root/dirty" ]
+[ -f "$sysfs_root/.snoozer-cpuidle.dirty" ]
+killed_writes=$(wc -l <"$write_log")
+killed_retry_state=$test_root/killed-retry-state
+set +e
+killed_retry_output=$(env SNOOZER_SYSFS_ROOT="$sysfs_root" \
+    SNOOZER_STATE_DIR="$killed_retry_state" SNOOZER_WRITE_HELPER="$write_helper" \
+    SNOOZER_TEST_WRITE_LOG="$write_log" "$runner" --binary "$benchmark" \
+    --waiter-cpu 0 --victim-cpu 1 --producer-cpu 2 --controller-cpu 3 \
+    --timeout-seconds 5 2>&1)
+killed_retry_status=$?
+set -e
+[ "$killed_retry_status" -ne 0 ]
+printf '%s\n' "$killed_retry_output" | grep -q 'unfinished global run detected'
+[ ! -e "$killed_retry_state" ]
+[ "$(wc -l <"$write_log")" -eq "$killed_writes" ]
+env SNOOZER_SYSFS_ROOT="$sysfs_root" SNOOZER_STATE_DIR="$killed_retry_state" \
+    SNOOZER_WRITE_HELPER="$write_helper" SNOOZER_TEST_WRITE_LOG="$write_log" \
+    "$runner" --recover >/dev/null
 assert_original
 assert_clean
 
@@ -257,6 +313,19 @@ chmod 600 "$manifest"
 printf '%s\n' "$manifest" >"$state_root/dirty"
 chmod 600 "$state_root/dirty"
 : >"$write_log"
+
+# A lexical traversal cannot pass as a direct-child recovery manifest, even if
+# it starts with the canonical state-root prefix.
+printf '%s\n' "$state_root/manifest.safe/../outside" >"$state_root/dirty"
+set +e
+traversal_output=$(runner_env "$runner" --recover 2>&1)
+traversal_status=$?
+set -e
+[ "$traversal_status" -ne 0 ]
+printf '%s\n' "$traversal_output" | grep -q 'not a direct child'
+[ ! -s "$write_log" ]
+printf '%s\n' "$manifest" >"$state_root/dirty"
+
 set +e
 retry_output=$(run_benchmark 2>&1)
 retry_status=$?
