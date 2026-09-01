@@ -39,21 +39,20 @@ contract. It reads and reports the current CPU-idle configuration, leaves it unc
 a distinct `NON-OFFICIAL` warning that deeper states may be enabled. Smoke mode is suitable for
 checking output shape and detecting obvious regressions, not for publishing a winner.
 
-Use the commands in [Contributing](../CONTRIBUTING.md). The
-[runner](../scripts/run_with_cpuidle.sh) and
-[benchmark binary](../benches/wake_latency.rs) own their current flags and numeric defaults. The
-runner accepts the compiled binary, the four CPU roles, and benchmark arguments after `--`;
-the benchmark's `--help` output is the option reference. The
-[build helper](../scripts/build_benchmark.sh) enables the repository-only feature required for the
-C1 diagnostic and prints the exact official-run artifact path.
+Use the commands in [Contributing](../CONTRIBUTING.md). [`benchctl`](benchctl.md) owns the official
+build receipt, CPU-idle lifecycle, and recovery interface; the
+[benchmark binary](../benches/wake_latency.rs) owns arguments after `--` and its `--help` output is
+the option reference. Benchctl builds with the pinned toolchain and locked dependency graph, rejects
+a dirty checkout, and writes a versioned receipt for the exact benchmark executable. It verifies
+that receipt and the checkout before starting an official run. `wake_latency --official` then
+requires the accepted receipt JSON passed by Benchctl, checks that it matches its compile-time
+stamps and executable, and embeds its identity in the JSONL metadata. It never repeats Git or Cargo
+provenance checks itself. Smoke mode does not require a receipt and records `unknown` checkout
+provenance rather than claiming official evidence.
 
-The build helper fails unless tracked files and non-ignored untracked files are clean. It uses the
-repository-pinned Rust toolchain and a locked dependency graph, and stamps the artifact with its
-commit, compiler, and toolchain provenance. At startup, official mode verifies that the stamped
-commit is still checked out with the same clean-tree conditions. It also requires readable CPU
-governor and energy-performance preference values for the waiter, victim, producer, and controller
-CPUs. Any failed check rejects the official run. Smoke mode records `unknown` for an unreadable
-power-policy value instead of claiming official evidence.
+Official mode also requires readable CPU governor and energy-performance preference values for the
+waiter, victim, producer, and controller CPUs. Any failed check rejects the run. Smoke mode records
+`unknown` for an unreadable power-policy value instead of claiming official evidence.
 
 ## Compared strategies
 
@@ -134,8 +133,16 @@ sample is also emitted in observation order as a machine-readable latency record
 
 ## CPU-idle state lifecycle
 
-The library never changes CPU idle states. The official runner is a separate operational boundary
-with these obligations:
+Benchctl is the current lifecycle owner. It journals the exact original values before mutation,
+uses one privileged coordinator and a crash guardian to drain the workload process group, and
+performs conditional restoration. `status` and `recover` operate on the durable journal; a
+conflicting external CPU-idle change is retained for explicit resolution rather than overwritten.
+The complete operational contract, including timeouts and recovery semantics, is in
+[Benchctl](benchctl.md). The legacy shell helpers below remain compatibility evidence during the
+migration; do not use them for new official runs.
+
+The library never changes CPU idle states. Benchctl implements the operational boundary with these
+obligations:
 
 1. Acquire an exclusive lock so two official runs cannot modify the same state.
 2. Discover all idle states on every assigned logical CPU.
@@ -153,68 +160,44 @@ refuses official timing if any state other than exact POLL/C1 is enabled on an a
 it was launched without the runner. `SNOOZER_SYSFS_ROOT` is accepted only by non-official smoke
 runs; official mode rejects the override instead of trusting a custom tree.
 
-Before authorizing the benchmark, the runner starts a separate crash guardian that inherits the
-private `active-run.lock`. The benchmark process group does not inherit that lock or the mutation
-locks. The runner writes and synchronizes the verified PGID in a private candidate, validates the
-complete value, and then publishes a separate ready marker with a shell builtin before GO. Marker
-creation cannot outlive a killed runner, and the guardian reads the candidate only after the marker
-exists. A crash before publication therefore exposes no partial or guessed PGID to the guardian,
-sends no group signal, and cannot launch the benchmark. The same atomic marker arms the supervisor.
-After marker creation, an unreadable or malformed candidate is ambiguous, never unpublished: the
-guardian retains the active lock and retries, while the supervisor and anchor preserve the PGID.
-If the runner dies after publication but before GO, the supervisor does not apply the
-pre-publication startup timeout, the anchor's self-held FIFO remains blocked, and no benchmark
-launches. Supervisor and anchor preserve the original PGID until guardian `SIGKILL` and drain proof.
-Once publication succeeds, the guardian sends that group `SIGKILL` if the runner disappears,
-including after `SIGKILL`. It repeatedly inspects the group until it proves that no live non-zombie
-process remains and only then releases the active lock. If process inspection fails or the group
-cannot be proved empty, the guardian keeps the active lock and waits instead of allowing recovery
-to write while a benchmark process may still be running.
+For real sysfs, the normal-user client starts the same Benchctl executable once through `sudo`.
+The root coordinator owns the fixed state directory, journal and sysfs writes. It launches the
+receipt-authorized executable under the invoking UID/GID in a new process group; setting the UID
+also clears supplementary groups. A Linux pidfd represents client liveness, so client exit is
+cancellation even if the client itself was killed, without reserving the workload's standard input.
 
-Normal and handled-signal teardown use the same ownership rule. After the workload has stopped, the
-runner leaves the supervisor and anchor in the verified group and publishes a guardian drain
-request. The guardian performs the final group `SIGKILL`, proves the group empty, and acknowledges
-the request before the runner explicitly reaps the supervisor. Runner death on either side of that
-request therefore cannot leave an armed guardian that may send another signal to a reused numeric
-PGID. A missing, unreadable, malformed, or mismatched proof request after release publication also
-retains the active lock and PGID owners until the exact request can be validated.
+Before workload authorization, the coordinator starts a separate guardian outside that process
+group. The guardian owns `active.lock`, receives the verified PGID and reports ready before the
+coordinator publishes GO. Normal exit, timeout, cancellation and workload failure all request a
+TERM/grace/KILL drain. The guardian reports success only after `killpg(..., 0)` proves the group
+absent; the coordinator reaps the supervisor concurrently so a zombie group leader cannot block
+that proof. CPU-idle restoration starts only after the proof.
 
-The guardian does not restore CPU-idle policy. After runner `SIGKILL`, the assigned CPUs may remain
-in the benchmark policy and the local and global dirty-owner records remain authoritative. Before
-another run, use the runner's explicit recovery command. Recovery first makes a bounded wait for
-the prior mutation lock, including a transient inherited descriptor, and then makes a separate
-bounded wait for the guardian-owned active lock. Either timeout fails before restoration and leaves
-the recovery records authoritative; the exact budgets are owned by the
-[`run_with_cpuidle.sh`](../scripts/run_with_cpuidle.sh) constants. After both locks are acquired,
-recovery validates the global dirty-owner record and its private manifest and restores only the
-recorded values. The global record identifies the authoritative private state directory even when
-recovery starts with a different `SNOOZER_STATE_DIR`; recovery still requires the recorded user and
-selected sysfs root. Power loss and a kernel crash cannot run either in-process cleanup or the
-guardian, so never infer restoration or guess original values when a recovery record remains.
+If the coordinator dies, the guardian still drains the group and releases `active.lock`, but it
+does not restore CPU-idle policy. The versioned Benchctl journal remains authoritative and
+`recover` performs the later conditional restore. Recovery waits a bounded interval for the
+guardian lock, validates the boot and complete current inventory, and writes an original value only
+when the current value is either the recorded desired value or already the original. A third value
+is an external conflict: it is retained and never overwritten.
 
-The runner's mode-`0700` state directory and mode-`0600` metadata protect against other UIDs; they
-are not an isolation boundary against hostile processes running as the same UID. The benchmark
-binary, the state directory contents, and other same-UID processes are trusted not to rewrite
-guardian metadata or signal the runner, supervisor, anchor, or guardian. Run an untrusted benchmark
-under a separately privileged supervisor and a distinct UID with an independently protected
-control channel; this shell runner does not provide that adversarial isolation.
+This is trusted process-group supervision, not containment of hostile code. A workload that calls
+`setsid` or otherwise escapes its group is outside the contract. Production path assumptions are
+limited to the fixed kernel-owned CPU sysfs tree and fixed root-owned state directory; alternate
+roots are hidden integration-test seams.
 
-The path checks assume the real CPU sysfs tree remains kernel-owned and cannot be renamed by an
-unprivileged process while the runner is operating. `SNOOZER_SYSFS_ROOT` exists for smoke tests and
-`SNOOZER_WRITE_HELPER` exists for runner tests and controlled integrations; POSIX-shell `realpath`
-checks cannot make a concurrently modified custom tree safe against time-of-check/time-of-use
-attacks. Do not use an untrusted or concurrently mutable tree for an official run. A custom
-privileged helper that must support that threat model needs to open every component with
-kernel-enforced containment, for example Linux `openat2` with
-`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, and perform the write and readback through those retained
-descriptors.
+During migration Benchctl uses the same global lock as the shell runner. It rejects new work while
+an old `SNOOZER_GLOBAL_DIRTY_V1` record exists and can recover its referenced
+`SNOOZER_CPUIDLE_V2` manifest after validating ownership, mode, boot, paths, names, values and exact
+inventory. Unknown formats fail closed. The legacy scripts and their fixture tests remain in CI as
+compatibility evidence, not as the official command path.
 
 ## Result provenance
 
 Machine-readable output records at least:
 
 - result schema and workload versions;
-- benchmark commit and dirty-worktree provenance;
+- receipt-backed benchmark commit, locked dependency, compiler, toolchain, executable, and
+  dirty-worktree provenance for official runs;
 - CPU model, microcode, kernel, and logical/physical topology;
 - governor, energy-performance preference, active clocksource, and observed idle-state table;
 - strategy, API contract, spin settings, timer calibration, and sample counts;
@@ -245,9 +228,14 @@ reports every assigned CPU through `power_policy` entries containing `cpu`, `gov
 in both corrected TSC cycles and calibrated nanoseconds. The cycle fields are the authoritative
 ranking values; nanoseconds are the rounded reporting view.
 
-A reader supporting both versions must preserve these different meanings. In particular, it must
-not present a v1 tracked-only flag as proof of a completely clean working tree. Writers emit only
-their current schema and do not duplicate deprecated fields as aliases.
+A reader supporting both versions must preserve these different meanings. In official v2 output,
+`provenance_source` is `benchctl_build_receipt`, `build_receipt` carries the versioned receipt
+identity, including Cargo package and Benchctl versions, and the checkout fields mean the receipt
+was accepted by Benchctl before launch; they are
+not a second Git query from the benchmark process. Smoke output has `provenance_source` set to
+`compile_stamps`, a null receipt, and unknown checkout fields. In particular, a reader must not
+present a v1 tracked-only flag as proof of a completely clean working tree. Writers emit only their
+current schema and do not duplicate deprecated fields as aliases.
 
 Console output begins with the mode-appropriate CPU-idle warning.
 

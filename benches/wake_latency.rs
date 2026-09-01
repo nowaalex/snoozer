@@ -5,6 +5,9 @@ fn main() {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "support/control_proof.rs"]
+mod control_proof;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[path = "support/output.rs"]
 mod output;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -20,15 +23,16 @@ mod snoozer_api;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux {
     use std::error::Error;
+    use std::fs;
     use std::hint::black_box;
     use std::io::Write;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use sha2::{Digest, Sha256};
     use snoozer::{
         AmdMwaitx, BusySpin, SpinThenAmdMwaitx, SpinThenYield, WaitStrategy, multi_pair,
         single_pair,
@@ -104,17 +108,7 @@ mod linux {
             topology.controller,
             clock,
         )?;
-        let provenance = repository_provenance();
-        if arguments.mode == Mode::Official
-            && (provenance.compiled_commit == "unknown"
-                || provenance.compiled_dirty != Some(false)
-                || COMPILED_RUSTC.is_none()
-                || COMPILED_RUSTUP_TOOLCHAIN.is_none()
-                || provenance.checkout_commit != provenance.compiled_commit
-                || provenance.checkout_dirty != Some(false))
-        {
-            return Err("official mode requires a build stamped by scripts/build_benchmark.sh, the same commit still checked out, and no working-tree changes (including untracked files)".into());
-        }
+        let provenance = repository_provenance(arguments.mode)?;
         if arguments.mode == Mode::Official
             && let Err(error) = AmdMwaitx::new()
         {
@@ -467,9 +461,30 @@ mod linux {
         compiled_dirty: Option<bool>,
         checkout_commit: String,
         checkout_dirty: Option<bool>,
+        receipt: Option<BuildReceiptProvenance>,
     }
 
-    fn repository_provenance() -> RepositoryProvenance {
+    #[derive(Debug)]
+    struct BuildReceiptProvenance {
+        version: String,
+        build_id: String,
+        repository: String,
+        source_commit: String,
+        lockfile_path: String,
+        lockfile_sha256: String,
+        package_id: String,
+        bench: String,
+        features: Vec<String>,
+        profile: String,
+        rustc: String,
+        rustup_toolchain: String,
+        target_triple: String,
+        benchctl_version: String,
+        benchctl_executable_sha256: String,
+        executable_sha256: String,
+    }
+
+    fn repository_provenance(mode: Mode) -> AnyResult<RepositoryProvenance> {
         let compiled_commit = COMPILED_COMMIT
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
@@ -479,29 +494,134 @@ mod linux {
             Some("false") => Some(false),
             _ => None,
         };
-        let checkout_commit = git_in_compiled_repository(&["rev-parse", "--verify", "HEAD"])
-            .map(|output| String::from_utf8_lossy(&output).trim().to_owned())
-            .unwrap_or_else(|| "unknown".to_owned());
-        let checkout_dirty =
-            git_in_compiled_repository(&["status", "--porcelain", "--untracked-files=all"])
-                .map(|output| !output.is_empty());
-        RepositoryProvenance {
-            compiled_commit,
-            compiled_dirty,
-            checkout_commit,
-            checkout_dirty,
+        match mode {
+            Mode::Smoke => Ok(RepositoryProvenance {
+                compiled_commit,
+                compiled_dirty,
+                checkout_commit: "unknown".to_owned(),
+                checkout_dirty: None,
+                receipt: None,
+            }),
+            Mode::Official => {
+                let receipt = official_build_receipt()?;
+                Ok(RepositoryProvenance {
+                    compiled_commit: receipt.source_commit.clone(),
+                    compiled_dirty: Some(false),
+                    checkout_commit: receipt.source_commit.clone(),
+                    checkout_dirty: Some(false),
+                    receipt: Some(receipt),
+                })
+            }
         }
     }
 
-    fn git_in_compiled_repository(arguments: &[&str]) -> Option<Vec<u8>> {
-        let repository = COMPILED_REPOSITORY.filter(|value| !value.is_empty())?;
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repository)
-            .args(arguments)
-            .output()
-            .ok()?;
-        output.status.success().then_some(output.stdout)
+    fn official_build_receipt() -> AnyResult<BuildReceiptProvenance> {
+        let encoded = std::env::var("BENCHCTL_BUILD_RECEIPT_JSON")
+            .map_err(|_| "official mode requires an accepted build receipt from Benchctl")?;
+        let value: serde_json::Value = serde_json::from_str(&encoded)
+            .map_err(|error| format!("parsing accepted Benchctl build receipt: {error}"))?;
+        let receipt = validate_official_receipt(&value)?;
+        crate::control_proof::validate_from_environment(&receipt.build_id)
+            .map_err(|error| -> AnyError { error.into() })?;
+        Ok(receipt)
+    }
+
+    fn validate_official_receipt(value: &serde_json::Value) -> AnyResult<BuildReceiptProvenance> {
+        const RECEIPT_VERSION: &str = "benchctl-build-receipt-v1";
+        let object = value
+            .as_object()
+            .ok_or("BENCHCTL_BUILD_RECEIPT must contain a JSON object")?;
+        let string = |name: &str| -> AnyResult<String> {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!("BENCHCTL_BUILD_RECEIPT requires non-empty string {name}").into()
+                })
+        };
+        let version = string("version")?;
+        if version != RECEIPT_VERSION {
+            return Err(format!("unsupported BENCHCTL_BUILD_RECEIPT version: {version}").into());
+        }
+        if object
+            .get("source_clean")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Err("official BENCHCTL_BUILD_RECEIPT must record a clean source tree".into());
+        }
+        let receipt = BuildReceiptProvenance {
+            version,
+            build_id: string("build_id")?,
+            repository: string("repository")?,
+            source_commit: string("source_commit")?,
+            lockfile_path: string("lockfile_path")?,
+            lockfile_sha256: string("lockfile_sha256")?,
+            package_id: string("package_id")?,
+            bench: string("bench")?,
+            features: object
+                .get("features")
+                .and_then(serde_json::Value::as_array)
+                .ok_or("BENCHCTL_BUILD_RECEIPT requires features array")?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            "BENCHCTL_BUILD_RECEIPT features must be non-empty strings".into()
+                        })
+                })
+                .collect::<AnyResult<Vec<_>>>()?,
+            profile: string("profile")?,
+            rustc: string("rustc")?,
+            rustup_toolchain: string("rustup_toolchain")?,
+            target_triple: string("target_triple")?,
+            benchctl_version: string("benchctl_version")?,
+            benchctl_executable_sha256: string("benchctl_executable_sha256")?,
+            executable_sha256: string("executable_sha256")?,
+        };
+        let compiled_commit = COMPILED_COMMIT
+            .filter(|value| !value.is_empty())
+            .ok_or("official mode requires a Benchctl-stamped benchmark executable")?;
+        let compiled_repository = COMPILED_REPOSITORY
+            .filter(|value| !value.is_empty())
+            .ok_or("official mode requires a Benchctl-stamped benchmark repository")?;
+        let compiled_rustc = COMPILED_RUSTC
+            .filter(|value| !value.is_empty())
+            .ok_or("official mode requires a Benchctl-stamped Rust compiler")?;
+        let compiled_toolchain = COMPILED_RUSTUP_TOOLCHAIN
+            .filter(|value| !value.is_empty())
+            .ok_or("official mode requires a Benchctl-stamped Rust toolchain")?;
+        if COMPILED_DIRTY != Some("false")
+            || receipt.source_commit != compiled_commit
+            || receipt.rustc != compiled_rustc
+            || receipt.rustup_toolchain != compiled_toolchain
+            || receipt.repository != compiled_repository
+            || receipt.bench != "wake_latency"
+            || receipt.profile != "bench"
+            || !receipt
+                .features
+                .iter()
+                .any(|feature| feature == "benchmark-only")
+        {
+            return Err(
+                "BENCHCTL_BUILD_RECEIPT does not match this official benchmark executable".into(),
+            );
+        }
+        let _original_executable = string("executable")?;
+        let current_executable = fs::read("/proc/self/exe")
+            .map_err(|error| format!("reading current benchmark executable: {error}"))?;
+        let current_digest = format!("{:x}", Sha256::digest(current_executable));
+        if current_digest != receipt.executable_sha256 {
+            return Err(
+                "BENCHCTL_BUILD_RECEIPT digest names a different benchmark executable".into(),
+            );
+        }
+        Ok(receipt)
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1621,12 +1741,37 @@ mod linux {
                 .provenance
                 .checkout_dirty
                 .map_or_else(|| "null".to_owned(), |value| value.to_string());
+            let (provenance_source, receipt_json) = match &input.provenance.receipt {
+                Some(receipt) => (
+                    "benchctl_build_receipt",
+                    format!(
+                        "{{\"version\":\"{}\",\"build_id\":\"{}\",\"repository\":\"{}\",\"source_commit\":\"{}\",\"lockfile_path\":\"{}\",\"lockfile_sha256\":\"{}\",\"package_id\":\"{}\",\"bench\":\"{}\",\"features\":{},\"profile\":\"{}\",\"rustc\":\"{}\",\"rustup_toolchain\":\"{}\",\"target_triple\":\"{}\",\"benchctl_version\":\"{}\",\"benchctl_executable_sha256\":\"{}\",\"executable_sha256\":\"{}\"}}",
+                        json_escape(&receipt.version),
+                        json_escape(&receipt.build_id),
+                        json_escape(&receipt.repository),
+                        json_escape(&receipt.source_commit),
+                        json_escape(&receipt.lockfile_path),
+                        json_escape(&receipt.lockfile_sha256),
+                        json_escape(&receipt.package_id),
+                        json_escape(&receipt.bench),
+                        serde_json::to_string(&receipt.features)?,
+                        json_escape(&receipt.profile),
+                        json_escape(&receipt.rustc),
+                        json_escape(&receipt.rustup_toolchain),
+                        json_escape(&receipt.target_triple),
+                        json_escape(&receipt.benchctl_version),
+                        json_escape(&receipt.benchctl_executable_sha256),
+                        json_escape(&receipt.executable_sha256),
+                    ),
+                ),
+                None => ("compile_stamps", "null".to_owned()),
+            };
             let mwaitx_timer_hz = snoozer::capabilities()
                 .mwaitx_timer_hz
                 .map_or_else(|| "null".to_owned(), |value| value.to_string());
             writeln!(
                 self.writer,
-                "{{\"type\":\"metadata\",\"schema\":\"{}\",\"mode\":\"{}\",\"warning\":\"{}\",\"benchmark_commit\":\"{}\",\"compiled_working_tree_dirty\":{},\"checkout_commit\":\"{}\",\"checkout_working_tree_dirty\":{},\"rustc\":\"{}\",\"rustup_toolchain\":\"{}\",\"benchmark_features\":{},\"schedule_version\":\"{}\",\"schedule_seed\":\"0x{:016x}\",\"bursty_gap_us_weight_percent\":[[0,30],[1,15],[5,12],[10,10],[25,10],[50,8],[100,7],[250,5],[1000,3]],\"duration_ms\":{},\"repetitions\":{},\"warmup_events\":{},\"max_samples\":{},\"acceptance_limits\":{{\"max_victim_throughput_loss_percent\":{:.6},\"max_victim_p99_degradation_percent\":{:.6}}},\"clocksource\":\"tsc\",\"cycles_per_ns\":{:.9},\"calibration_spread_percent\":{:.6},\"mwaitx_timer_hz\":{},\"tsc_skew\":{{\"producer_offset_cycles\":{},\"waiter_offset_cycles\":{},\"producer_uncertainty_cycles\":{},\"waiter_uncertainty_cycles\":{},\"producer_to_waiter_bound_ns\":{:.6},\"applied_waiter_minus_producer_cycles\":{}}},\"matched_control\":\"victim-only baseline; reported loss conservatively includes producer and waiter activity\",\"cpu_model\":\"{}\",\"microcode\":\"{}\",\"kernel\":\"{}\",\"power_policy\":[{}],\"roles\":{{\"waiter\":{},\"victim\":{},\"producer\":{},\"controller\":{}}},\"topology\":[{}],\"cpuidle\":[{}]}}",
+                "{{\"type\":\"metadata\",\"schema\":\"{}\",\"mode\":\"{}\",\"warning\":\"{}\",\"benchmark_commit\":\"{}\",\"compiled_working_tree_dirty\":{},\"checkout_commit\":\"{}\",\"checkout_working_tree_dirty\":{},\"rustc\":\"{}\",\"rustup_toolchain\":\"{}\",\"provenance_source\":\"{}\",\"build_receipt\":{},\"benchmark_features\":{},\"schedule_version\":\"{}\",\"schedule_seed\":\"0x{:016x}\",\"bursty_gap_us_weight_percent\":[[0,30],[1,15],[5,12],[10,10],[25,10],[50,8],[100,7],[250,5],[1000,3]],\"duration_ms\":{},\"repetitions\":{},\"warmup_events\":{},\"max_samples\":{},\"acceptance_limits\":{{\"max_victim_throughput_loss_percent\":{:.6},\"max_victim_p99_degradation_percent\":{:.6}}},\"clocksource\":\"tsc\",\"cycles_per_ns\":{:.9},\"calibration_spread_percent\":{:.6},\"mwaitx_timer_hz\":{},\"tsc_skew\":{{\"producer_offset_cycles\":{},\"waiter_offset_cycles\":{},\"producer_uncertainty_cycles\":{},\"waiter_uncertainty_cycles\":{},\"producer_to_waiter_bound_ns\":{:.6},\"applied_waiter_minus_producer_cycles\":{}}},\"matched_control\":\"victim-only baseline; reported loss conservatively includes producer and waiter activity\",\"cpu_model\":\"{}\",\"microcode\":\"{}\",\"kernel\":\"{}\",\"power_policy\":[{}],\"roles\":{{\"waiter\":{},\"victim\":{},\"producer\":{},\"controller\":{}}},\"topology\":[{}],\"cpuidle\":[{}]}}",
                 RESULT_SCHEMA_VERSION,
                 input.arguments.mode.as_str(),
                 json_escape(input.cstate_warning),
@@ -1636,6 +1781,8 @@ mod linux {
                 checkout_dirty,
                 json_escape(COMPILED_RUSTC.unwrap_or("unknown")),
                 json_escape(COMPILED_RUSTUP_TOOLCHAIN.unwrap_or("unknown")),
+                provenance_source,
+                receipt_json,
                 if cfg!(feature = "benchmark-only") {
                     "[\"benchmark-only\"]"
                 } else {

@@ -91,44 +91,34 @@ cargo bench --bench wake_latency --features benchmark-only -- --smoke
 Smoke mode reads and reports the current CPU-idle configuration and prints a `NON-OFFICIAL`
 warning. It does not change CPU-idle policy and cannot produce a publishable result.
 
-For an official run, build the exact feature-enabled artifact, select four logical CPUs that
-satisfy the topology contract in [Benchmarking](docs/benchmarking.md), and use the
-state-preserving runner. Run the script as your normal user; it invokes `sudo` only for the
-required sysfs writes and for the root-owned global lock and dirty-owner recovery metadata under
-`/run/lock`.
+For an official run, select four logical CPUs that satisfy the topology contract in
+[Benchmarking](docs/benchmarking.md), then use Benchctl. Run it as your normal user; it invokes
+`sudo` once to start its privileged coordinator. Benchctl owns the locked clean build receipt,
+exact sysfs state journal, process-group guardian, and recovery record.
 
 ```sh
-SNOOZER_BENCH_BINARY=$(scripts/build_benchmark.sh)
 SNOOZER_WAITER_CPU=CPU
 SNOOZER_VICTIM_CPU=CPU
 SNOOZER_PRODUCER_CPU=CPU
 SNOOZER_CONTROLLER_CPU=CPU
 
-scripts/run_with_cpuidle.sh \
-  --binary "$SNOOZER_BENCH_BINARY" \
-  --waiter-cpu "$SNOOZER_WAITER_CPU" \
-  --victim-cpu "$SNOOZER_VICTIM_CPU" \
-  --producer-cpu "$SNOOZER_PRODUCER_CPU" \
-  --controller-cpu "$SNOOZER_CONTROLLER_CPU" \
-  -- --official
+just benchmark-official
 ```
 
-`scripts/build_benchmark.sh` enables the repository-only `benchmark-only` feature so the
-C1 diagnostic comparison is present and prints the exact executable path. The runner's
-`--help` output owns its current command-line interface.
+`just benchmark-build` creates a receipt without changing CPU-idle state. `just
+benchmark-official` creates or replaces that receipt and uses it for the run. The `benchctl --help`
+output and [Benchctl documentation](docs/benchctl.md) own the exact control-plane interface.
 
-Official results are valid only when the runner and benchmark complete topology checks, permit
+Official results are valid only when Benchctl and the benchmark complete topology checks, permit
 only POLL and exact C1 on assigned CPUs, disable C1E and every other state including C2/C3+, verify
 the new state, and restore the original state.
 
-If a prior process was killed before restoration, do not start another run. Recover as the same
-user and with the same `SNOOZER_SYSFS_ROOT` value if you overrode it. The global dirty-owner record
-selects the authoritative private state directory, even when recovery is invoked with a different
-`SNOOZER_STATE_DIR`. A custom integration must also provide the trusted write helper needed to
-restore its selected sysfs tree if the original run set `SNOOZER_WRITE_HELPER`:
+If a prior process was killed before restoration, do not start another run. Inspect its durable
+operation record and recover it as the same user:
 
 ```console
-scripts/run_with_cpuidle.sh --recover
+just benchmark-status
+just benchmark-recover
 ```
 
 ## Documentation ownership

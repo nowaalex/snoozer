@@ -26,15 +26,22 @@ clippy:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Run the ordinary nextest suite for both feature sets.
-test:
-    cargo nextest run --workspace
-    cargo nextest run --workspace --all-features
+# Run Benchctl's isolated fake-sysfs and fixture-workload suite.
+benchctl-test:
+    cargo test --package benchctl
+
+# Run only Snoozer API and benchmark-scenario tests for both feature sets.
+test-benchmark-scenarios:
+    cargo nextest run --package snoozer
+    cargo nextest run --package snoozer --all-features
+
+# Run both independently owned suites.
+test: benchctl-test test-benchmark-scenarios
 
 # Run both nextest feature sets with the bounded CI profile.
 test-ci:
-    cargo nextest run --workspace --profile ci
-    cargo nextest run --workspace --all-features --profile ci
+    cargo nextest run --package snoozer --profile ci
+    cargo nextest run --package snoozer --all-features --profile ci
 
 # Run Rust documentation tests for both feature sets.
 doctest:
@@ -65,7 +72,7 @@ shell-test: shell-check
     timeout --kill-after=5s 240s sh scripts/test_run_with_cpuidle.sh
 
 # Run the complete unprivileged pull-request gate.
-ci: fmt-check check check-arm clippy shell-test test-ci doctest docs
+ci: fmt-check check check-arm clippy shell-test benchctl-test test-ci doctest docs
 
 # Run cargo-mutants with the checked-in nextest policy.
 mutants:
@@ -85,11 +92,17 @@ benchmark-smoke:
 
 # Build the clean, provenance-stamped official benchmark artifact.
 benchmark-build:
-    scripts/build_benchmark.sh
+    cargo run --locked --package benchctl -- build cargo-bench \
+        --manifest-path Cargo.toml --bench wake_latency --feature benchmark-only \
+        --receipt "${SNOOZER_BENCH_RECEIPT:-target/snoozer-bench/receipt.json}"
+
+# Inspect an interrupted official operation by ID, or list known operations.
+benchmark-status:
+    cargo run --locked --package benchctl -- status ${SNOOZER_BENCH_OPERATION_ID:-}
 
 # Recover an interrupted official run from its durable ownership record.
 benchmark-recover:
-    scripts/run_with_cpuidle.sh --recover
+    cargo run --locked --package benchctl -- recover ${SNOOZER_BENCH_OPERATION_ID:-}
 
 # Run officially with only POLL/exact C1; disables C1E and all other states, including C2/C3+.
 benchmark-official:
@@ -99,11 +112,15 @@ benchmark-official:
     : "${SNOOZER_VICTIM_CPU:?set SNOOZER_VICTIM_CPU}"
     : "${SNOOZER_PRODUCER_CPU:?set SNOOZER_PRODUCER_CPU}"
     : "${SNOOZER_CONTROLLER_CPU:?set SNOOZER_CONTROLLER_CPU}"
-    benchmark_binary=$(scripts/build_benchmark.sh)
-    scripts/run_with_cpuidle.sh \
-        --binary "$benchmark_binary" \
-        --waiter-cpu "$SNOOZER_WAITER_CPU" \
+    receipt=${SNOOZER_BENCH_RECEIPT:-target/snoozer-bench/receipt.json}
+    cargo run --locked --package benchctl -- build cargo-bench \
+        --manifest-path Cargo.toml --bench wake_latency --feature benchmark-only \
+        --receipt "$receipt"
+    cargo run --locked --package benchctl -- run \
+        --receipt "$receipt" --cpuidle poll-c1 \
+        --cpu "$SNOOZER_WAITER_CPU" --cpu "$SNOOZER_VICTIM_CPU" \
+        --cpu "$SNOOZER_PRODUCER_CPU" --cpu "$SNOOZER_CONTROLLER_CPU" -- \
+        --official --waiter-cpu "$SNOOZER_WAITER_CPU" \
         --victim-cpu "$SNOOZER_VICTIM_CPU" \
         --producer-cpu "$SNOOZER_PRODUCER_CPU" \
-        --controller-cpu "$SNOOZER_CONTROLLER_CPU" \
-        -- --official
+        --controller-cpu "$SNOOZER_CONTROLLER_CPU"

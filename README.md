@@ -92,6 +92,7 @@ and selection rules live in [Waiting API](docs/waiting-api.md).
 - [Architecture](docs/architecture.md) — understand the token protocol and backend boundaries.
 - [Safety](docs/safety.md) — review atomic, lifetime, assembly, and platform invariants.
 - [Benchmarking](docs/benchmarking.md) — reproduce latency and SMT-neighbor measurements safely.
+- [Benchctl](docs/benchctl.md) — build receipts, official-run control, status, and recovery.
 - [Decisions](docs/decisions/README.md) — see why the API and benchmark harness have this shape.
 - [Contributing](CONTRIBUTING.md) — run repository checks and prepare changes.
 
