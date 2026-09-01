@@ -5,6 +5,9 @@ fn main() {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "support/output.rs"]
+mod output;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[path = "support/platform.rs"]
 mod platform;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -17,10 +20,9 @@ mod snoozer_api;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux {
     use std::error::Error;
-    use std::fs::{self, File};
     use std::hint::black_box;
-    use std::io::{BufWriter, Write};
-    use std::path::PathBuf;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
@@ -29,12 +31,14 @@ mod linux {
 
     use snoozer::{AmdMwaitx, BusySpin, SpinThenAmdMwaitx, SpinThenYield, WaitStrategy, pair};
 
+    use crate::output::AtomicOutput;
     use crate::platform::{
         CpuIdleState, CpuPowerPolicy, Topology, TscClock, TscSkew, cpu_metadata, cpu_power_policy,
         pin_current, stamp,
     };
     use crate::pure::{
-        GapSchedule, RESULT_SCHEMA_VERSION, correct_latency, json_escape, percentile_sorted,
+        GapSchedule, RESULT_SCHEMA_VERSION, capture_generation_before_start, correct_latency,
+        json_escape, latency_rank_key, percentile_sorted, resolve_cpu_sysfs_root,
     };
     use crate::snoozer_api::{
         Observation, wait_direct_filtered, wait_direct_raw, wait_parker_filtered, wait_parker_raw,
@@ -43,8 +47,8 @@ mod linux {
     type AnyError = Box<dyn Error + Send + Sync>;
     type AnyResult<T> = Result<T, AnyError>;
 
-    const CSTATE_WARNING: &str = "C2/C3 and every deeper CPU idle state are disabled because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration.";
-    const SMOKE_CSTATE_WARNING: &str = "NON-OFFICIAL SMOKE: C2/C3 and deeper CPU idle states may be enabled. Official runs disable them because their exit latency conflicts with the minimum-wake-latency objective.";
+    const CSTATE_WARNING: &str = "C2/C3 and every deeper CPU idle state are disabled on the assigned CPUs because their exit latency conflicts with the minimum-wake-latency objective. These results do not represent the default power-saving configuration.";
+    const SMOKE_CSTATE_WARNING: &str = "NON-OFFICIAL SMOKE: C2/C3 and deeper CPU idle states may be enabled on the assigned CPUs. Official runs disable them on the assigned CPUs because their exit latency conflicts with the minimum-wake-latency objective.";
     const BURSTY_SCHEDULE_VERSION: &str = "bursty-v1";
     const BURSTY_SEED: u64 = 0x5a17_9d3c_e821_4b6f;
     const SPIN_SWEEP: [usize; 4] = [32, 128, 512, 2_048];
@@ -71,9 +75,10 @@ mod linux {
         println!("{cstate_warning}");
         println!("Benchmark mode: {}", arguments.mode.as_str());
 
-        let sysfs_root = std::env::var_os("SNOOZER_SYSFS_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/sys/devices/system/cpu"));
+        let sysfs_root = resolve_cpu_sysfs_root(
+            std::env::var_os("SNOOZER_SYSFS_ROOT").map(PathBuf::from),
+            arguments.mode == Mode::Smoke,
+        )?;
         let topology = Topology::discover(arguments.cpu_overrides(), sysfs_root.clone())?;
         let cpuidle = match arguments.mode {
             Mode::Official => topology.validate_cpuidle()?,
@@ -151,7 +156,7 @@ mod linux {
             clock.spread_percent
         );
         if arguments.preflight_only {
-            output.flush()?;
+            output.finish()?;
             return Ok(());
         }
 
@@ -252,7 +257,7 @@ mod linux {
                 eprintln!("no eligible winner for {}", workload.as_str());
             }
         }
-        output.flush()?;
+        output.finish()?;
         black_box(summaries);
         Ok(())
     }
@@ -645,6 +650,10 @@ mod linux {
             }
         }
 
+        fn waiter_ready(&self) -> u64 {
+            capture_generation_before_start(&self.generation.0, &self.ready.0, &self.go.0)
+        }
+
         fn abort_startup(&self) {
             self.stop.0.store(true, Ordering::Release);
             self.go.0.store(true, Ordering::Release);
@@ -834,8 +843,7 @@ mod linux {
                 return Err(error.into());
             }
             let (_, expected_aux) = stamp();
-            waiter_shared.thread_ready();
-            let mut observed = waiter_shared.generation.0.load(Ordering::Acquire);
+            let mut observed = waiter_shared.waiter_ready();
             let mut metrics = WaiterMetrics {
                 latencies_cycles: Vec::with_capacity(max_samples.min(1_000_000)),
                 unclassified_wakes: (filtering == Filtering::Raw).then_some(0),
@@ -922,8 +930,7 @@ mod linux {
                 return Err(error.into());
             }
             let (_, expected_aux) = stamp();
-            waiter_shared.thread_ready();
-            let mut observed = waiter_shared.generation.0.load(Ordering::Acquire);
+            let mut observed = waiter_shared.waiter_ready();
             let mut metrics = WaiterMetrics {
                 latencies_cycles: Vec::with_capacity(max_samples.min(1_000_000)),
                 unclassified_wakes: (filtering == Filtering::Raw).then_some(0),
@@ -1008,8 +1015,7 @@ mod linux {
             }
             let (_, expected_aux) = stamp();
             handle_sender.send(thread::current())?;
-            waiter_shared.thread_ready();
-            let mut observed = waiter_shared.generation.0.load(Ordering::Acquire);
+            let mut observed = waiter_shared.waiter_ready();
             let mut metrics = WaiterMetrics {
                 latencies_cycles: Vec::with_capacity(max_samples.min(1_000_000)),
                 unclassified_wakes: Some(0),
@@ -1425,6 +1431,9 @@ mod linux {
         case: Case,
         workload: Workload,
         repetitions: usize,
+        p50_cycles: u64,
+        p99_cycles: u64,
+        p999_cycles: u64,
         p50_ns: u64,
         p99_ns: u64,
         p999_ns: u64,
@@ -1445,6 +1454,9 @@ mod linux {
             if repetitions.is_empty() {
                 return Err("cannot summarize an empty repetition set".into());
             }
+            let p50_cycles = median_u64(repetitions.iter().map(|value| value.p50_cycles));
+            let p99_cycles = median_u64(repetitions.iter().map(|value| value.p99_cycles));
+            let p999_cycles = median_u64(repetitions.iter().map(|value| value.p999_cycles));
             let p50_ns = median_u64(repetitions.iter().map(|value| value.p50_ns));
             let p99_ns = median_u64(repetitions.iter().map(|value| value.p99_ns));
             let p999_ns = median_u64(repetitions.iter().map(|value| value.p999_ns));
@@ -1470,6 +1482,9 @@ mod linux {
                 case,
                 workload,
                 repetitions: repetitions.len(),
+                p50_cycles,
+                p99_cycles,
+                p999_cycles,
                 p50_ns,
                 p99_ns,
                 p999_ns,
@@ -1487,12 +1502,8 @@ mod linux {
         summaries
             .iter()
             .filter(|summary| summary.eligible)
-            .min_by(|left, right| {
-                (left.p99_ns, left.p999_ns, left.p50_ns).cmp(&(
-                    right.p99_ns,
-                    right.p999_ns,
-                    right.p50_ns,
-                ))
+            .min_by_key(|summary| {
+                latency_rank_key(summary.p50_cycles, summary.p99_cycles, summary.p999_cycles)
             })
     }
 
@@ -1514,7 +1525,7 @@ mod linux {
     }
 
     struct JsonlOutput {
-        writer: BufWriter<File>,
+        writer: AtomicOutput,
     }
 
     struct MetadataInput<'a> {
@@ -1530,12 +1541,9 @@ mod linux {
     }
 
     impl JsonlOutput {
-        fn create(path: &PathBuf) -> AnyResult<Self> {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+        fn create(path: &Path) -> AnyResult<Self> {
             Ok(Self {
-                writer: BufWriter::new(File::create(path)?),
+                writer: AtomicOutput::create(path)?,
             })
         }
 
@@ -1752,8 +1760,8 @@ mod linux {
             Ok(())
         }
 
-        fn flush(&mut self) -> AnyResult<()> {
-            self.writer.flush()?;
+        fn finish(self) -> AnyResult<()> {
+            self.writer.finish()?;
             Ok(())
         }
     }

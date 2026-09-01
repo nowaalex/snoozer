@@ -135,21 +135,24 @@ with these obligations:
 8. Preserve a dirty marker when restoration is incomplete so the next run fails closed and gives
    a recovery path.
 
-The benchmark binary performs its own read-only sysfs verification. It refuses official timing if
-a deeper state is enabled, even if it was launched without the runner.
+The benchmark binary performs its own read-only verification against the kernel CPU sysfs tree. It
+refuses official timing if a deeper state is enabled on an assigned CPU, even if it was launched
+without the runner. `SNOOZER_SYSFS_ROOT` is accepted only by non-official smoke runs; official mode
+rejects the override instead of trusting a custom tree.
 
 `SIGKILL`, power loss, and a kernel crash cannot be handled in-process. Before another run,
 inspect the recorded manifest and use the runner's explicit recovery command. Never guess the
 original values.
 
 The path checks assume the real CPU sysfs tree remains kernel-owned and cannot be renamed by an
-unprivileged process while the runner is operating. `SNOOZER_SYSFS_ROOT` and
-`SNOOZER_WRITE_HELPER` exist for tests and controlled integrations; POSIX-shell `realpath` checks
-cannot make a concurrently modified custom tree safe against time-of-check/time-of-use attacks.
-Do not use an untrusted or concurrently mutable tree for an official run. A custom privileged
-helper that must support that threat model needs to open every component with kernel-enforced
-containment, for example Linux `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, and perform
-the write and readback through those retained descriptors.
+unprivileged process while the runner is operating. `SNOOZER_SYSFS_ROOT` exists for smoke tests and
+`SNOOZER_WRITE_HELPER` exists for runner tests and controlled integrations; POSIX-shell `realpath`
+checks cannot make a concurrently modified custom tree safe against time-of-check/time-of-use
+attacks. Do not use an untrusted or concurrently mutable tree for an official run. A custom
+privileged helper that must support that threat model needs to open every component with
+kernel-enforced containment, for example Linux `openat2` with
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, and perform the write and readback through those retained
+descriptors.
 
 ## Result provenance
 
@@ -170,7 +173,11 @@ Machine-readable output records at least:
 The first JSONL line is the `metadata` record. Its `schema` value applies to the entire file.
 Readers must select a version-specific decoder before interpreting later records and must reject
 unknown values; inferring a version from field presence is not supported. The
-[`RESULT_SCHEMA_VERSION`](../benches/wake_latency.rs) constant owns the current writer version.
+[`RESULT_SCHEMA_VERSION`](../benches/support/pure.rs) constant owns the current writer version.
+
+The writer builds each result in a unique same-directory partial file. Only a complete successful
+run, including `--preflight-only`, flushes and synchronizes that file and atomically renames it to
+the requested output path. A failed run leaves any existing published result untouched.
 
 `snoozer-wake-latency-v1` reports tracked-only changes through
 `compiled_tracked_working_tree_dirty` and `checkout_tracked_working_tree_dirty`. Its top-level

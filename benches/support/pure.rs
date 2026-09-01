@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub(crate) const RESULT_SCHEMA_VERSION: &str = "snoozer-wake-latency-v2";
+pub(crate) const CPU_SYSFS_ROOT: &str = "/sys/devices/system/cpu";
 
 pub(crate) struct GapSchedule {
     state: u64,
@@ -37,6 +40,38 @@ impl GapSchedule {
 pub(crate) fn correct_latency(raw_cycles: i64, waiter_minus_producer_cycles: i64) -> Option<u64> {
     let corrected = i128::from(raw_cycles) - i128::from(waiter_minus_producer_cycles);
     u64::try_from(corrected).ok()
+}
+
+pub(crate) fn capture_generation_before_start(
+    generation: &AtomicU64,
+    ready: &AtomicUsize,
+    go: &AtomicBool,
+) -> u64 {
+    let observed = generation.load(Ordering::Acquire);
+    ready.fetch_add(1, Ordering::Release);
+    while !go.load(Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
+    observed
+}
+
+pub(crate) fn resolve_cpu_sysfs_root(
+    custom_root: Option<PathBuf>,
+    allow_custom_root: bool,
+) -> Result<PathBuf, &'static str> {
+    match (custom_root, allow_custom_root) {
+        (Some(root), true) => Ok(root),
+        (Some(_), false) => Err("official mode does not allow SNOOZER_SYSFS_ROOT"),
+        (None, _) => Ok(PathBuf::from(CPU_SYSFS_ROOT)),
+    }
+}
+
+pub(crate) fn latency_rank_key(
+    p50_cycles: u64,
+    p99_cycles: u64,
+    p999_cycles: u64,
+) -> (u64, u64, u64) {
+    (p99_cycles, p999_cycles, p50_cycles)
 }
 
 pub(crate) fn percentile_sorted(values: &[u64], quantile: f64) -> u64 {
