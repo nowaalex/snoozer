@@ -126,6 +126,12 @@ trait StrategyImpl: Send + Sync {
 /// virtual dispatch is added to a wait hot path.
 pub trait WaitStrategy: sealed::Sealed + Send + Sync {
     /// Identifies this built-in strategy.
+    ///
+    /// ```
+    /// use snoozer::{BusySpin, Strategy, WaitStrategy as _};
+    ///
+    /// assert_eq!(BusySpin.strategy(), Strategy::BusySpin);
+    /// ```
     #[must_use]
     fn strategy(&self) -> Strategy;
 
@@ -135,6 +141,14 @@ pub trait WaitStrategy: sealed::Sealed + Send + Sync {
     /// [`WaitResult::Unclassified`] does not prove that work is available and
     /// does not synchronize with a producer. The caller must recheck its
     /// published state with an Acquire operation.
+    ///
+    /// ```
+    /// use snoozer::{BusySpin, WaitResult, WaitStrategy as _};
+    /// use std::sync::atomic::AtomicU32;
+    ///
+    /// let state = AtomicU32::new(1);
+    /// assert_eq!(BusySpin.wait_if_equal(&state, 0), WaitResult::Changed(1));
+    /// ```
     #[must_use]
     fn wait_if_equal<A: WaitableAtomic>(
         &self,
@@ -144,10 +158,28 @@ pub trait WaitStrategy: sealed::Sealed + Send + Sync {
 
     /// Absorbs unclassified wakes until an Acquire load observes a value
     /// different from `expected`.
+    ///
+    /// ```
+    /// use snoozer::{BusySpin, WaitStrategy as _};
+    /// use std::sync::atomic::AtomicU32;
+    ///
+    /// assert_eq!(BusySpin.wait_until_different(&AtomicU32::new(1), 0), 1);
+    /// ```
     #[must_use]
     fn wait_until_different<A: WaitableAtomic>(&self, atomic: &A, expected: A::Value) -> A::Value;
 
     /// Performs one wait attempt bounded by `timeout`.
+    ///
+    /// ```
+    /// use snoozer::{BusySpin, WaitStrategy as _, WaitTimeoutResult};
+    /// use std::sync::atomic::AtomicU32;
+    /// use std::time::Duration;
+    ///
+    /// assert_eq!(
+    ///     BusySpin.wait_if_equal_timeout(&AtomicU32::new(1), 0, Duration::ZERO),
+    ///     WaitTimeoutResult::Changed(1),
+    /// );
+    /// ```
     #[must_use]
     fn wait_if_equal_timeout<A: WaitableAtomic>(
         &self,
@@ -158,6 +190,17 @@ pub trait WaitStrategy: sealed::Sealed + Send + Sync {
 
     /// Absorbs unclassified wakes until the value changes or `timeout`
     /// expires.
+    ///
+    /// ```
+    /// use snoozer::{BusySpin, WaitStrategy as _, WaitUntilTimeoutResult};
+    /// use std::sync::atomic::AtomicU32;
+    /// use std::time::Duration;
+    ///
+    /// assert_eq!(
+    ///     BusySpin.wait_until_different_timeout(&AtomicU32::new(1), 0, Duration::ZERO),
+    ///     WaitUntilTimeoutResult::Changed(1),
+    /// );
+    /// ```
     #[must_use]
     fn wait_until_different_timeout<A: WaitableAtomic>(
         &self,
@@ -279,12 +322,25 @@ pub struct SpinThenYield {
 
 impl SpinThenYield {
     /// Creates a strategy with the requested spin prefix.
+    ///
+    /// ```
+    /// use snoozer::SpinThenYield;
+    ///
+    /// let strategy = SpinThenYield::new(32);
+    /// assert_eq!(strategy.spin_iterations(), 32);
+    /// ```
     #[must_use]
     pub const fn new(spin_iterations: usize) -> Self {
         Self { spin_iterations }
     }
 
     /// Returns the configured spin prefix length.
+    ///
+    /// ```
+    /// use snoozer::SpinThenYield;
+    ///
+    /// assert_eq!(SpinThenYield::new(32).spin_iterations(), 32);
+    /// ```
     #[must_use]
     pub const fn spin_iterations(self) -> usize {
         self.spin_iterations
@@ -393,25 +449,53 @@ pub struct PreflightReport {
 }
 
 impl PreflightReport {
-    /// Backend selected for this process.
+    /// Returns the backend selected for this process.
+    ///
+    /// ```no_run
+    /// # use snoozer::HardwareWait;
+    /// let report = HardwareWait::preflight()?;
+    /// let backend = report.backend();
+    /// # Ok::<(), snoozer::HardwareWaitError>(())
+    /// ```
     #[must_use]
     pub const fn backend(self) -> HardwareBackend {
         self.backend
     }
 
-    /// Number of bounded store-wake trials performed.
+    /// Returns the number of bounded store-wake trials performed.
+    ///
+    /// ```no_run
+    /// # use snoozer::HardwareWait;
+    /// let report = HardwareWait::preflight()?;
+    /// assert!(report.attempts() > 0);
+    /// # Ok::<(), snoozer::HardwareWaitError>(())
+    /// ```
     #[must_use]
     pub const fn attempts(self) -> u32 {
         self.attempts
     }
 
-    /// Trials that observed the published value before the baseline deadline.
+    /// Returns trials that observed the published value before the baseline deadline.
+    ///
+    /// ```no_run
+    /// # use snoozer::HardwareWait;
+    /// let report = HardwareWait::preflight()?;
+    /// let wakes = report.verified_store_wakes();
+    /// # Ok::<(), snoozer::HardwareWaitError>(())
+    /// ```
     #[must_use]
     pub const fn verified_store_wakes(self) -> u32 {
         self.verified_store_wakes
     }
 
-    /// Median no-store wait measured by preflight.
+    /// Returns the median no-store wait measured by preflight.
+    ///
+    /// ```no_run
+    /// # use snoozer::HardwareWait;
+    /// let report = HardwareWait::preflight()?;
+    /// let baseline = report.baseline_wait();
+    /// # Ok::<(), snoozer::HardwareWaitError>(())
+    /// ```
     #[must_use]
     pub const fn baseline_wait(self) -> Duration {
         self.baseline_wait
@@ -450,6 +534,13 @@ impl HardwareWait {
     /// Call this after establishing the final allowed CPU domain and power
     /// policy, while its helper can still run concurrently on another logical
     /// CPU. Repeated or concurrent calls return the cached result.
+    ///
+    /// ```no_run
+    /// use snoozer::HardwareWait;
+    ///
+    /// let report = HardwareWait::preflight()?;
+    /// # Ok::<(), snoozer::HardwareWaitError>(())
+    /// ```
     pub fn preflight() -> Result<PreflightReport, HardwareWaitError> {
         initialize_once(&HARDWARE_PREFLIGHT, run_hardware_preflight).map(|prepared| prepared.report)
     }
@@ -457,6 +548,14 @@ impl HardwareWait {
     /// Cheaply constructs a strategy from the cached successful preflight.
     ///
     /// This method performs no CPUID, calibration, thread creation, or probe.
+    ///
+    /// ```no_run
+    /// use snoozer::HardwareWait;
+    ///
+    /// HardwareWait::preflight()?;
+    /// let strategy = HardwareWait::new()?;
+    /// # Ok::<(), snoozer::HardwareWaitError>(())
+    /// ```
     pub fn new() -> Result<Self, HardwareWaitError> {
         match HARDWARE_PREFLIGHT.get() {
             None => Err(HardwareWaitError::PreflightRequired),
@@ -468,6 +567,13 @@ impl HardwareWait {
     }
 
     /// Returns the backend selected by preflight.
+    ///
+    /// ```no_run
+    /// # use snoozer::HardwareWait;
+    /// HardwareWait::preflight()?;
+    /// let backend = HardwareWait::new()?.backend();
+    /// # Ok::<(), snoozer::HardwareWaitError>(())
+    /// ```
     #[must_use]
     pub const fn backend(self) -> HardwareBackend {
         self.config.backend()
@@ -510,6 +616,14 @@ pub struct SpinThenHardwareWait {
 
 impl SpinThenHardwareWait {
     /// Cheaply constructs a hybrid strategy from cached successful preflight.
+    ///
+    /// ```no_run
+    /// use snoozer::{HardwareWait, SpinThenHardwareWait};
+    ///
+    /// HardwareWait::preflight()?;
+    /// let strategy = SpinThenHardwareWait::new(32)?;
+    /// # Ok::<(), snoozer::HardwareWaitError>(())
+    /// ```
     pub fn new(spin_iterations: usize) -> Result<Self, HardwareWaitError> {
         HardwareWait::new().map(|hardware| Self {
             spin_iterations,
@@ -518,6 +632,14 @@ impl SpinThenHardwareWait {
     }
 
     /// Returns the configured spin prefix length.
+    ///
+    /// ```no_run
+    /// use snoozer::{HardwareWait, SpinThenHardwareWait};
+    ///
+    /// HardwareWait::preflight()?;
+    /// assert_eq!(SpinThenHardwareWait::new(32)?.spin_iterations(), 32);
+    /// # Ok::<(), snoozer::HardwareWaitError>(())
+    /// ```
     #[must_use]
     pub const fn spin_iterations(self) -> usize {
         self.spin_iterations

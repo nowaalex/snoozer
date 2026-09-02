@@ -1,0 +1,9 @@
+[workspace]
+# A package is released only from a merged release-plz PR, never from an
+# ordinary main-branch commit.
+release_always = false
+git_tag_name = "v{{ version }}"
+git_release_enable = true
+publish = true
+publish_all_features = true
+publish_timeout = "10m"

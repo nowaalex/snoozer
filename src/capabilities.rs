@@ -29,7 +29,14 @@ pub struct Capabilities {
 
 static CAPABILITIES: OnceLock<Capabilities> = OnceLock::new();
 
-/// Returns the process-wide cached hardware capability snapshot.
+/// Returns cached CPUID hardware facts without running a hardware wait.
+///
+/// ```
+/// let facts = snoozer::capabilities();
+/// if facts.amd_vendor {
+///     assert!(!facts.intel_vendor);
+/// }
+/// ```
 #[must_use]
 pub fn capabilities() -> &'static Capabilities {
     CAPABILITIES.get_or_init(arch::detect_capabilities)

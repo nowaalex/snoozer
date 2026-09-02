@@ -52,6 +52,13 @@ doctest:
 docs:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
+# Render the editable D2 documentation diagrams with the pinned renderer.
+doc-diagrams:
+    mise install
+    mise exec -- d2 --layout elk --theme 0 --pad 20 --scale 0.95 docs/diagrams/api-choice.d2 docs/diagrams/api-choice.svg
+    mise exec -- d2 --layout elk --theme 0 --pad 20 --scale 0.90 docs/diagrams/direct-wait.d2 docs/diagrams/direct-wait.svg
+    mise exec -- d2 --layout elk --theme 0 --pad 20 --scale 0.95 docs/diagrams/parker-token.d2 docs/diagrams/parker-token.svg
+
 # Run the complete unprivileged pull-request gate.
 ci: fmt-check check check-arm clippy benchctl-test test-ci doctest docs
 

@@ -60,13 +60,27 @@ pub struct UnsupportedStrategy {
 }
 
 impl UnsupportedStrategy {
-    /// The strategy whose construction failed.
+    /// Returns the strategy whose construction failed.
+    ///
+    /// ```no_run
+    /// # use snoozer::{HardwareWait, HardwareWaitError};
+    /// if let Err(HardwareWaitError::Unsupported(error)) = HardwareWait::preflight() {
+    ///     let strategy = error.strategy();
+    /// }
+    /// ```
     #[must_use]
     pub const fn strategy(self) -> Strategy {
         self.strategy
     }
 
-    /// The guard that rejected the strategy.
+    /// Returns the guard that rejected the strategy.
+    ///
+    /// ```no_run
+    /// # use snoozer::{HardwareWait, HardwareWaitError};
+    /// if let Err(HardwareWaitError::Unsupported(error)) = HardwareWait::preflight() {
+    ///     let reason = error.reason();
+    /// }
+    /// ```
     #[must_use]
     pub const fn reason(self) -> UnsupportedReason {
         self.reason
