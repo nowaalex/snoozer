@@ -1,0 +1,22 @@
+direction: down
+
+producer: Producer
+single: SingleUnparker
+multi: MultiUnparker clones
+token: One notification token
+consumer: Single Parker consumer
+
+producer -> single: one owner
+producer -> multi: many owners
+single -> token: Release store
+multi -> token: Release RMW
+token -> consumer: Acquire consume
+
+classes: {
+  shape: rectangle
+  style: {
+    fill: "#fff7ed"
+    stroke: "#ea580c"
+    font-color: "#111827"
+  }
+}

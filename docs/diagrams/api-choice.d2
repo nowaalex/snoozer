@@ -1,0 +1,21 @@
+direction: down
+
+caller: Caller-owned state
+direct: Direct wait
+token: Notification token
+single: single_pair
+multi: multi_pair
+
+caller -> direct: owns AtomicU32 or AtomicU64
+caller -> token: needs a wake handle
+token -> single: one producer
+token -> multi: cloned or concurrent producers
+
+classes: {
+  shape: rectangle
+  style: {
+    fill: "#eef4ff"
+    stroke: "#3b82f6"
+    font-color: "#111827"
+  }
+}

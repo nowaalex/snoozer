@@ -1,0 +1,22 @@
+direction: down
+
+load: Acquire load
+arm: Arm monitor
+recheck: Acquire recheck
+wait: One bounded wait
+raw: "Raw result\nFiltered retries"
+
+load -> arm: equal
+arm -> recheck
+recheck -> wait: equal
+wait -> raw
+raw -> load: filtered retry
+
+classes: {
+  shape: rectangle
+  style: {
+    fill: "#effaf3"
+    stroke: "#22a06b"
+    font-color: "#111827"
+  }
+}

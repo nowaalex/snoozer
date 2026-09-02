@@ -5,6 +5,7 @@
 //! observed atomic changes or the requested timeout expires.
 
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 
 mod arch;
 mod atomic;

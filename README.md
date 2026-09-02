@@ -1,128 +1,93 @@
 # snoozer
 
-Snoozer explores the shortest practical path from a published state change to a running
-consumer thread. It exposes both the raw hardware-wake boundary and stronger filtered operations,
-so callers can choose whether an extra wake matters.
-
-The hardware strategy supports AMD `MONITORX/MWAITX` and Intel `UMONITOR/UMWAIT` on Linux
-x86-64. Before either instruction path can be constructed, `HardwareWait::preflight()` runs the
-native backend's bounded operational probe and caches its result for the process. Passing this
-startup gate establishes only that the controlled publication/wait trials completed; it neither
-proves the exact reason each wait returned nor makes a latency, power, or universal-performance
-claim.
-
-Intel `UMWAIT` uses the architectural C0.1 hint. The name is an instruction hint, not Linux's CPU
-idle-state naming: Intel C0.1 is distinct from CPU C1, C2, C3, and deeper package or core states.
-
-> [!WARNING]
-> Official benchmarks enable only POLL and exact CPU C1 on the assigned CPUs. C1E and every other
-> CPU idle state, including CPU C2, CPU C3, and deeper states, are disabled because their exit
-> latency conflicts with the minimum-wake-latency objective. Intel UMWAIT's C0.1 hint is separate
-> from that sysfs policy. Results therefore do not represent the machine's default power-saving
-> configuration.
-
-## Choose an interface
-
-Use a direct atomic wait when the state change itself can wake the consumer:
-
-```rust
-use snoozer::{SpinThenYield, WaitResult, WaitStrategy as _};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-let generation = AtomicU64::new(1);
-let observed = 0;
-let strategy = SpinThenYield::new(0);
-
-// One raw strategy attempt may finish while the value is still equal.
-let next = match strategy.wait_if_equal(&generation, observed) {
-    WaitResult::Changed(next) => next,
-    WaitResult::Unclassified => generation.load(Ordering::Acquire),
-};
-assert_eq!(next, 1);
-
-// Filters unclassified wakes and returns the newly observed value.
-assert_eq!(strategy.wait_until_different(&generation, observed), 1);
-```
+Low-latency waiting primitives for a dedicated consumer thread.
 
 ## Change Contract
 
-- **Responsibility:** provide explicit, low-latency userspace waiting primitives and
-  park/unpark-style wrappers. `HardwareWait` selects the native AMD `MONITORX/MWAITX` or Intel
-  `UMONITOR/UMWAIT` backend on Linux x86-64 only after a successful process-wide preflight.
-- **Prohibitions and boundaries:** the library does not change CPU affinity, scheduler policy,
-  power policy, or CPU idle settings; it does not silently replace an unsupported or failed
-  hardware strategy with a scheduler-based wait. Arm support is outside the current contract.
-- **Critical invariants:** arm-then-recheck closes the lost-wake window; the watched atomic
-  remains alive and suitably aligned throughout a wait; filtered operations return only after an
-  Acquire load observes their stated condition; raw operations may return after an unclassified
-  wake; `Single*` notification handles have one producer, while `Multi*` handles preserve every
-  coalesced producer publication; hardware preflight runs after the final allowed CPU domain and
-  power policy are established, while its helper can still run concurrently; a `fork` child must
-  `exec` before using an inherited hardware-wait cache.
-- **Configuration owners:** crate metadata and build profiles live in
-  [`Cargo.toml`](Cargo.toml), the compiler version in
-  [`rust-toolchain.toml`](rust-toolchain.toml), test policy in
-  [`.config/nextest.toml`](.config/nextest.toml), mutation policy in
-  [`.cargo/mutants.toml`](.cargo/mutants.toml), and measurement parameters in the
-  [benchmark source](benches/wake_latency.rs).
-- **Targeted check:** run `just ci`. Hardware-specific and official benchmark checks are separate
-  because ordinary CI must not depend on privileged CPU configuration or a particular processor.
+- **Responsibility:** wait for a caller-owned atomic value or a coalescing notification token.
+- **Boundary:** Snoozer does not change affinity, scheduling, power policy, or CPU idle states.
+- **Invariant:** raw waits can return without confirming work; filtered waits return only after an
+  Acquire load observes the requested state. Hardware waiting requires a successful preflight and
+  never silently falls back to another strategy.
+- **Configuration:** crate metadata lives in [`Cargo.toml`](Cargo.toml); benchmark settings live
+  in [`benches/wake_latency.rs`](benches/wake_latency.rs).
+- **Check:** run `just ci`.
 
-Use `single_pair` when one producer owns the wake handle. This is the lowest-overhead Parker path:
+## Start here
+
+Choose one of two shapes:
+
+- **Direct wait:** you already have an `AtomicU32` or `AtomicU64` that says whether work is ready.
+- **Parker pair:** you want a small notification handle in addition to your work queue.
+
+Diagram contract
+Purpose: choose the public waiting shape.
+Nodes: caller-owned state, direct wait, Parker pair, producer count.
+Relations: state ownership selects the API; producer count selects the Parker constructor.
+Invariant: `multi` means multiple producers, never multiple consumers.
+Source: [`docs/diagrams/api-choice.d2`](docs/diagrams/api-choice.d2)
+
+![Choose a Snoozer API: caller-owned state uses direct waits; a notification token uses a Parker pair, with single or multi selected by producer count.](docs/diagrams/api-choice.svg)
+
+### Direct wait
+
+Use a filtered wait when returning early would not help:
 
 ```rust
-use snoozer::{BusySpin, ParkResult, single_pair};
+use snoozer::{SpinThenYield, WaitStrategy as _};
+use std::sync::atomic::AtomicU64;
+
+let state = AtomicU64::new(1);
+let strategy = SpinThenYield::new(32);
+assert_eq!(strategy.wait_until_different(&state, 0), 1);
+```
+
+Use `wait_if_equal` only when an `Unclassified` result is safe to recheck in your own loop.
+
+### Parker pair
+
+Use `single_pair` for one producer. It is the cheaper option:
+
+```rust
+use snoozer::{BusySpin, single_pair};
 
 let (mut parker, mut unparker) = single_pair(BusySpin);
-
-// Another thread publishes work, then calls:
-unparker.unpark();
-
-// Raw: returning does not prove that work is available.
-let outcome = parker.park();
-assert!(matches!(outcome, ParkResult::Notified));
-
-// Filtered: returns only after consuming the notification token.
 unparker.unpark();
 parker.park_until_notified();
 ```
 
-Use `multi_pair` when multiple producers must clone or concurrently share the wake handle. It uses
-a more expensive atomic read-modify-write so one consumed token acquires every coalesced producer
-publication. Both forms have exactly one consumer; `multi` describes producers, not parkers.
+Use `multi_pair` only when producers must clone or concurrently share the wake handle. Both Parker
+types always have one consumer.
 
-The exact exported constructors and strategy types are documented in the crate API. The behavior
-and selection rules live in [Waiting API](docs/waiting-api.md).
+### Hardware wait
 
-For the native hardware path, preflight once before constructing the strategy:
+On supported Linux x86-64 hardware, run preflight once during startup before constructing the
+hardware strategy:
 
-```rust
+```no_run
 use snoozer::{HardwareWait, WaitStrategy as _};
-use std::sync::atomic::AtomicU32;
 
-let report = HardwareWait::preflight()?;
+HardwareWait::preflight()?;
 let strategy = HardwareWait::new()?;
-let state = AtomicU32::new(0);
-let _outcome = strategy.wait_if_equal(&state, 0);
-
-println!("using {:?} after {} preflight attempts", report.backend(), report.attempts());
 # Ok::<(), snoozer::HardwareWaitError>(())
 ```
 
-## Documentation
+Preflight proves only that bounded probe trials worked in this process. It is not a latency or
+power claim.
 
-- [Waiting API](docs/waiting-api.md) — choose raw or filtered direct waits and Parker wrappers.
-- [Architecture](docs/architecture.md) — understand the token protocol and backend boundaries.
-- [Safety](docs/safety.md) — review atomic, lifetime, assembly, and platform invariants.
-- [Benchmarking](docs/benchmarking.md) — reproduce latency and SMT-neighbor measurements safely.
-- [Benchctl](docs/benchctl.md) — build receipts, official-run control, status, and recovery.
-- [Decisions](docs/decisions/README.md) — see why the API and benchmark harness have this shape.
-- [Contributing](CONTRIBUTING.md) — run repository checks and prepare changes.
+## Learn more
+
+- [Waiting API](docs/waiting-api.md) — pick raw vs filtered operations and Parker ownership.
+- [Architecture](docs/architecture.md) — protocol layers and the lost-wake guard.
+- [Safety](docs/safety.md) — memory ordering, lifetime, and hardware boundaries.
+- [Benchmarking](docs/benchmarking.md) — controlled latency measurements.
+- [Release process](docs/releasing.md) — bootstrap and automated releases with release-plz.
+- [Benchctl](docs/benchctl.md) — official benchmark build and host-state lifecycle.
+- [Decisions](docs/decisions/README.md) — design rationale.
 
 ## Status
 
-This repository is experimental systems software. Benchmark results are specific to the processor,
-firmware, kernel, topology, and power configuration recorded with each run. No strategy is claimed
-to be universally fastest.
+This is experimental systems software. Results depend on the processor, firmware, kernel,
+topology, and power configuration of a specific run; no strategy is universally fastest.
 
 Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.

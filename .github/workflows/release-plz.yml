@@ -1,0 +1,164 @@
+name: Release-plz
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Publish release
+    if: >-
+      github.repository == 'nowaalex/snoozer' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: crates-io
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: clippy, rustfmt
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.140
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.57.0
+
+      - name: Verify release commit
+        run: just ci
+
+      - name: Publish the merged release PR
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-pr:
+    name: Update release PR
+    if: github.repository == 'nowaalex/snoozer' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_pr: ${{ steps.release-plz.outputs.pr }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+
+      - name: Create or update the release PR
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-pr-ci:
+    name: Verify release PR
+    needs: release-pr
+    if: >-
+      needs.release-pr.outputs.release_pr != '' &&
+      needs.release-pr.outputs.release_pr != '{}'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Check out the release PR
+        id: checkout-release-pr
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ fromJSON(needs.release-pr.outputs.release_pr).head_branch }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: clippy, rustfmt
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.140
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.57.0
+
+      - name: Verify release PR
+        id: verify
+        continue-on-error: true
+        run: just ci
+
+      - name: Publish the required CI result
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.checkout-release-pr.outputs.commit }}
+          CONCLUSION: ${{ steps.verify.outcome == 'success' && 'success' || 'failure' }}
+        run: >-
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs"
+          -f 'name=Format, lint, and test'
+          -f "head_sha=${HEAD_SHA}"
+          -f 'status=completed'
+          -f "conclusion=${CONCLUSION}"
+
+      - name: Fail when verification failed
+        if: steps.verify.outcome != 'success'
+        run: exit 1

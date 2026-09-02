@@ -140,6 +140,14 @@ pub struct MultiUnparker {
 ///
 /// The producer handle is deliberately not clonable or shareable. Use
 /// [`multi_pair`] when more than one producer must publish notifications.
+///
+/// ```
+/// use snoozer::{BusySpin, single_pair};
+///
+/// let (mut parker, mut unparker) = single_pair(BusySpin);
+/// unparker.unpark();
+/// parker.park_until_notified();
+/// ```
 #[must_use]
 pub fn single_pair<S: WaitStrategy>(strategy: S) -> (SingleParker<S>, SingleUnparker) {
     let shared = Arc::new(Shared {
@@ -165,6 +173,15 @@ pub fn single_pair<S: WaitStrategy>(strategy: S) -> (SingleParker<S>, SingleUnpa
 /// `Multi` refers only to producers. Cloning the returned [`MultiUnparker`]
 /// adds producers; it does not make [`MultiParker`] safe for multiple
 /// consumers.
+///
+/// ```
+/// use snoozer::{BusySpin, multi_pair};
+///
+/// let (mut parker, unparker) = multi_pair(BusySpin);
+/// let another_producer = unparker.clone();
+/// another_producer.unpark();
+/// parker.park_until_notified();
+/// ```
 #[must_use]
 pub fn multi_pair<S: WaitStrategy>(strategy: S) -> (MultiParker<S>, MultiUnparker) {
     let shared = Arc::new(Shared {
@@ -282,6 +299,13 @@ macro_rules! impl_parker {
     ($parker:ident) => {
         impl<S: WaitStrategy> $parker<S> {
             /// Returns the configured strategy.
+            ///
+            /// ```
+            /// use snoozer::{BusySpin, single_pair};
+            ///
+            /// let (parker, _) = single_pair(BusySpin);
+            /// assert_eq!(*parker.strategy(), BusySpin);
+            /// ```
             #[must_use]
             pub const fn strategy(&self) -> &S {
                 &self.core.strategy
@@ -292,6 +316,14 @@ macro_rules! impl_parker {
             /// [`ParkResult::Unclassified`] does not prove that work is
             /// available and does not synchronize with a producer.
             /// Application state must be rechecked with an Acquire operation.
+            ///
+            /// ```
+            /// use snoozer::{BusySpin, ParkResult, single_pair};
+            ///
+            /// let (mut parker, mut unparker) = single_pair(BusySpin);
+            /// unparker.unpark();
+            /// assert_eq!(parker.park(), ParkResult::Notified);
+            /// ```
             #[must_use]
             pub fn park(&mut self) -> ParkResult {
                 self.core.park()
@@ -299,12 +331,29 @@ macro_rules! impl_parker {
 
             /// Absorbs unclassified wakes and returns only after consuming a
             /// notification token.
+            ///
+            /// ```
+            /// use snoozer::{BusySpin, single_pair};
+            ///
+            /// let (mut parker, mut unparker) = single_pair(BusySpin);
+            /// unparker.unpark();
+            /// parker.park_until_notified();
+            /// ```
             pub fn park_until_notified(&mut self) {
                 self.core.park_until_notified();
             }
 
             /// Consumes a ready token or performs one raw wait attempt bounded
             /// by `timeout`.
+            ///
+            /// ```
+            /// use snoozer::{BusySpin, ParkTimeoutResult, single_pair};
+            /// use std::time::Duration;
+            ///
+            /// let (mut parker, mut unparker) = single_pair(BusySpin);
+            /// unparker.unpark();
+            /// assert_eq!(parker.park_timeout(Duration::ZERO), ParkTimeoutResult::Notified);
+            /// ```
             #[must_use]
             pub fn park_timeout(&mut self, timeout: Duration) -> ParkTimeoutResult {
                 self.core.park_timeout(timeout)
@@ -316,6 +365,18 @@ macro_rules! impl_parker {
             /// A token already present at entry wins over a zero timeout. If a
             /// producer publishes at the timeout boundary, one final token
             /// check decides the result without losing that notification.
+            ///
+            /// ```
+            /// use snoozer::{BusySpin, NotificationTimeoutResult, single_pair};
+            /// use std::time::Duration;
+            ///
+            /// let (mut parker, mut unparker) = single_pair(BusySpin);
+            /// unparker.unpark();
+            /// assert_eq!(
+            ///     parker.park_until_notified_timeout(Duration::ZERO),
+            ///     NotificationTimeoutResult::Notified,
+            /// );
+            /// ```
             #[must_use]
             pub fn park_until_notified_timeout(
                 &mut self,
@@ -334,6 +395,13 @@ impl SingleUnparker {
     /// Publishes one notification token with Release ordering.
     ///
     /// Multiple calls before the consumer takes the token coalesce into one.
+    ///
+    /// ```
+    /// use snoozer::{BusySpin, single_pair};
+    ///
+    /// let (_, mut unparker) = single_pair(BusySpin);
+    /// unparker.unpark();
+    /// ```
     #[inline]
     pub fn unpark(&mut self) {
         self.shared.token.0.store(NOTIFIED_TOKEN, Ordering::Release);
@@ -347,6 +415,13 @@ impl MultiUnparker {
     /// atomic read-modify-write operations form a release sequence, so the
     /// consumer's Acquire operation observes state published by every
     /// producer whose notification has coalesced into that token.
+    ///
+    /// ```
+    /// use snoozer::{BusySpin, multi_pair};
+    ///
+    /// let (_, unparker) = multi_pair(BusySpin);
+    /// unparker.unpark();
+    /// ```
     #[inline]
     pub fn unpark(&self) {
         // Every producer performs an RMW even when the token is already set.
